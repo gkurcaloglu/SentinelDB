@@ -1,0 +1,124 @@
+package metrics
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+)
+
+func TestNew_RegistersBothCounters(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("unexpected error gathering metrics: %v", err)
+	}
+
+	names := make(map[string]bool, len(families))
+	for _, f := range families {
+		names[f.GetName()] = true
+	}
+
+	for _, want := range []string{"sentineldb_connections_total", "sentineldb_blocked_queries_total"} {
+		if !names[want] {
+			t.Errorf("expected registry to contain metric %q, got families %v", want, names)
+		}
+	}
+
+	if m.ConnectionsTotal == nil || m.BlockedQueriesTotal == nil {
+		t.Fatal("expected both counters to be non-nil")
+	}
+}
+
+func TestMetrics_CountersIncrementIndependently(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.ConnectionsTotal.Inc()
+	m.ConnectionsTotal.Inc()
+	m.ConnectionsTotal.Inc()
+	m.BlockedQueriesTotal.Inc()
+
+	if got := testutil.ToFloat64(m.ConnectionsTotal); got != 3 {
+		t.Errorf("ConnectionsTotal = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(m.BlockedQueriesTotal); got != 1 {
+		t.Errorf("BlockedQueriesTotal = %v, want 1", got)
+	}
+}
+
+func TestMetrics_Snapshot(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.ConnectionsTotal.Add(7)
+	m.BlockedQueriesTotal.Add(2)
+
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if snap.ConnectionsTotal != 7 {
+		t.Errorf("Snapshot().ConnectionsTotal = %v, want 7", snap.ConnectionsTotal)
+	}
+	if snap.BlockedQueriesTotal != 2 {
+		t.Errorf("Snapshot().BlockedQueriesTotal = %v, want 2", snap.BlockedQueriesTotal)
+	}
+}
+
+func TestMetrics_SnapshotBeforeAnyIncrementIsZero(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if snap.ConnectionsTotal != 0 || snap.BlockedQueriesTotal != 0 {
+		t.Errorf("expected zero-value snapshot, got %+v", snap)
+	}
+}
+
+// TestMetrics_ExposedOverHTTP, gercek promhttp.Handler uzerinden /metrics
+// cikti formatinin beklenen sayac isimlerini ve degerlerini icerdigini
+// dogrular (uc-uca, Gate/main.go'nun kuracagi ile ayni yol).
+func TestMetrics_ExposedOverHTTP(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.ConnectionsTotal.Add(2)
+	m.BlockedQueriesTotal.Add(5)
+
+	srv := httptest.NewServer(promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("unexpected error fetching /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("unexpected error reading body: %v", err)
+	}
+	text := string(body)
+
+	if !strings.Contains(text, "sentineldb_connections_total 2") {
+		t.Errorf("expected body to contain 'sentineldb_connections_total 2', got:\n%s", text)
+	}
+	if !strings.Contains(text, "sentineldb_blocked_queries_total 5") {
+		t.Errorf("expected body to contain 'sentineldb_blocked_queries_total 5', got:\n%s", text)
+	}
+}

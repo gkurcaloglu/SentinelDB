@@ -1,0 +1,16 @@
+# SentinelDB gateway config.
+# firewall.blocked_phrases: Simple Query metninde (buyuk/kucuk harf ve
+# bosluk duyarsiz) gecen ifadelerden biri eslesirse sorgu, gercek
+# veritabanina hic gonderilmeden engellenir.
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+    - "DROP DATABASE"
+    - "DELETE FROM"
+    - "TRUNCATE"
+
+# wasm.plugin_path: Karar mantigini calistiran, GOOS=wasip1 GOARCH=wasm ile
+# derlenmis firewall eklentisinin yolu (bkz. plugins/firewall). Eklentiyi
+# yeniden derlemek icin: scripts/build-wasm-plugins.ps1
+wasm:
+  plugin_path: "plugins/firewall/v2.wasm"

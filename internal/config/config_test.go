@@ -1,0 +1,88 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeTempConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+	return path
+}
+
+func TestLoad_ParsesBlockedPhrases(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+    - "DELETE FROM"
+    - "TRUNCATE"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{"DROP TABLE", "DELETE FROM", "TRUNCATE"}
+	got := cfg.Firewall.BlockedPhrases
+	if len(got) != len(want) {
+		t.Fatalf("expected %d phrases, got %d: %+v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("phrase %d: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestLoad_ParsesWasmPluginPath(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+wasm:
+  plugin_path: "plugins/firewall/v2.wasm"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "plugins/firewall/v2.wasm"; cfg.Wasm.PluginPath != want {
+		t.Fatalf("Wasm.PluginPath = %q, want %q", cfg.Wasm.PluginPath, want)
+	}
+}
+
+func TestLoad_MissingFileReturnsError(t *testing.T) {
+	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
+	if err == nil {
+		t.Fatal("expected an error for a missing config file, got nil")
+	}
+}
+
+func TestLoad_MalformedYAMLReturnsError(t *testing.T) {
+	path := writeTempConfig(t, "firewall: [this is not: a valid map")
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for malformed YAML, got nil")
+	}
+}
+
+func TestLoad_EmptyBlockedPhrasesIsValid(t *testing.T) {
+	path := writeTempConfig(t, "firewall:\n  blocked_phrases: []\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Firewall.BlockedPhrases) != 0 {
+		t.Fatalf("expected no blocked phrases, got %+v", cfg.Firewall.BlockedPhrases)
+	}
+}

@@ -59,6 +59,40 @@ wasm:
 	}
 }
 
+func TestLoad_LogFullQueriesDefaultsToFalse(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Logging.LogFullQueries {
+		t.Fatal("expected LogFullQueries to default to false when logging section is absent")
+	}
+}
+
+func TestLoad_ParsesLogFullQueriesWhenExplicitlyEnabled(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+logging:
+  log_full_queries: true
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Logging.LogFullQueries {
+		t.Fatal("expected LogFullQueries to be true when explicitly enabled")
+	}
+}
+
 func TestLoad_MissingFileReturnsError(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err == nil {

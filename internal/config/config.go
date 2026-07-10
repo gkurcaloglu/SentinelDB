@@ -13,6 +13,7 @@ import (
 type Config struct {
 	Firewall FirewallConfig `yaml:"firewall"`
 	Wasm     WasmConfig     `yaml:"wasm"`
+	Logging  LoggingConfig  `yaml:"logging"`
 }
 
 // FirewallConfig, firewall politikasını besleyen ayarlardır. BlockedPhrases
@@ -30,6 +31,17 @@ type WasmConfig struct {
 	// PluginPath, GOOS=wasip1 GOARCH=wasm ile derlenmiş .wasm dosyasının
 	// yoludur (bkz. plugins/firewall).
 	PluginPath string `yaml:"plugin_path"`
+}
+
+// LoggingConfig, gateway'in logladığı bilginin kapsamını kontrol eder.
+type LoggingConfig struct {
+	// LogFullQueries, true ise Simple Query mesajlarının tam SQL metnini
+	// (potansiyel olarak PII/hassas veri içerebilir) loglara yazar.
+	// Varsayılan olarak false'tur: SentinelDB üretimde sorgu metnini
+	// loglamaz, yalnızca verdict/mesaj tipi/süre/bağlantı kimliği gibi
+	// güvenli metadata loglar. Yalnızca lokal geliştirme/hata ayıklama
+	// için açıkça etkinleştirilmelidir.
+	LogFullQueries bool `yaml:"log_full_queries"`
 }
 
 // Load, path'teki YAML dosyasını okuyup bir Config'e ayrıştırır.

@@ -1,0 +1,30 @@
+# Derlenmiş ikili dosyalar
+*.exe
+*.exe~
+*.test
+
+# Node / dashboard
+node_modules/
+dist/
+
+# Kapsam (coverage) ciktilari
+*.out
+coverage/
+coverage.*
+*.cover
+
+# Ortam degiskenleri
+.env
+.env.*
+
+# IDE / editor gecici dosyalari
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

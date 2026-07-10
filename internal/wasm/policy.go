@@ -44,15 +44,33 @@ func (p *Policy) Evaluate(m protocol.Message) (firewall.Verdict, string) {
 
 	verdict, reason, err := p.rt.Evaluate(context.Background(), m.Query, p.blockedPhrases)
 	if err != nil {
-		if p.onError != nil {
-			p.onError(fmt.Errorf("wasm politika degerlendirmesi basarisiz: %w", err))
-		}
-		// Politika motorunun kendisi calismiyorsa guvenli taraf: engelle.
-		return firewall.Block, "SentinelDB policy: wasm degerlendirme hatasi, sorgu guvenlik icin engellendi"
+		return p.failClosed(fmt.Errorf("wasm politika degerlendirmesi basarisiz: %w", err))
 	}
 
-	if verdict == wasmproto.VerdictBlock {
+	// Yalnizca tam olarak "ALLOW" ve "BLOCK" gecerli kararlardir. Eksik,
+	// hatali yazilmis (ör. "BLOKC") ya da beklenmeyen herhangi bir deger
+	// bir eklenti protokolu hatasi sayilir ve ayni calisma zamani hatasi
+	// gibi guvenli tarafta kalinip sorgu engellenir (fail-closed). Onceki
+	// implementasyon yalnizca "BLOCK" ile esitligi kontrol edip her sey
+	// digerini sessizce Allow sayiyordu; bu, eklentinin bozuk/beklenmedik
+	// bir cikti uretmesi durumunda politika denetimini fiilen devre disi
+	// birakabilirdi.
+	switch verdict {
+	case wasmproto.VerdictAllow:
+		return firewall.Allow, ""
+	case wasmproto.VerdictBlock:
 		return firewall.Block, reason
+	default:
+		return p.failClosed(fmt.Errorf("eklenti gecersiz verdict dondurdu: %q", verdict))
 	}
-	return firewall.Allow, ""
+}
+
+// failClosed, wasm calisma zamani hatasi ya da eklenti sozlesmesine
+// uymayan bir verdict oldugunda ortak guvenli-taraf davranisini uygular:
+// hatayi (varsa) onError'a bildirir ve sorguyu engeller.
+func (p *Policy) failClosed(err error) (firewall.Verdict, string) {
+	if p.onError != nil {
+		p.onError(err)
+	}
+	return firewall.Block, "SentinelDB policy: wasm degerlendirme hatasi, sorgu guvenlik icin engellendi"
 }

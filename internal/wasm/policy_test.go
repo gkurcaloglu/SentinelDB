@@ -100,3 +100,47 @@ func TestPolicy_FailsClosedOnEvaluatorError(t *testing.T) {
 		t.Fatal("expected onError to be called with the underlying error")
 	}
 }
+
+// TestPolicy_FailsClosedOnUnknownVerdict gorev F'yi dogrular: eklenti tam
+// olarak "ALLOW" ya da "BLOCK" disinda bir sey dondurdugunde (ör. yazim
+// hatasi "BLOKC", yanlis buyuk/kucuk harf, ya da bos deger), bu bir
+// eklenti protokolu hatasi sayilmali ve guvenli tarafta kalinip sorgu
+// engellenmelidir (fail-closed) - sessizce Allow'a dusmemelidir.
+func TestPolicy_FailsClosedOnUnknownVerdict(t *testing.T) {
+	cases := []string{"BLOKC", "allow", "block", "", "ALLOWED", "TRUE"}
+
+	for _, verdict := range cases {
+		t.Run(verdict, func(t *testing.T) {
+			fe := &fakeEvaluator{verdict: verdict, reason: "eklentiden gelen sebep"}
+			var loggedErr error
+			p := &Policy{
+				rt:             fe,
+				blockedPhrases: nil,
+				onError:        func(err error) { loggedErr = err },
+			}
+
+			v, reason := p.Evaluate(protocol.Message{Type: protocol.MsgQuery, Query: "SELECT 1;"})
+
+			if v != firewall.Block {
+				t.Fatalf("verdict %q: expected fail-closed Block for an invalid verdict, got %v", verdict, v)
+			}
+			if reason == "" {
+				t.Fatalf("verdict %q: expected a non-empty reason when failing closed", verdict)
+			}
+			if loggedErr == nil {
+				t.Fatalf("verdict %q: expected onError to be called for the invalid verdict", verdict)
+			}
+		})
+	}
+}
+
+func TestPolicy_ExactAllowVerdictIsAllowed(t *testing.T) {
+	fe := &fakeEvaluator{verdict: "ALLOW"}
+	p := &Policy{rt: fe, blockedPhrases: nil}
+
+	v, reason := p.Evaluate(protocol.Message{Type: protocol.MsgQuery, Query: "SELECT 1;"})
+
+	if v != firewall.Allow {
+		t.Fatalf("expected exact 'ALLOW' verdict to be allowed, got %v (reason=%q)", v, reason)
+	}
+}

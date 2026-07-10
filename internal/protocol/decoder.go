@@ -22,20 +22,27 @@ const (
 	// bunların hiçbirinde standart tag+length çerçevesi yoktur.
 	phaseStartup phase = iota
 	phaseNormal
-	// phasePendingSSLReply: Frontend tarafı SSLRequest/GSSENCRequest
-	// gönderdikten sonra sunucunun tek baytlık kararını bekler. Protokole
-	// göre client bu sırada başka veri göndermez; yine de temkinli
-	// davranıp bu aşamada gelen baytları ayrıştırmaya çalışmadan atlarız.
-	phasePendingSSLReply
-	// phaseSSLReply: Backend tarafı, karşı taraf SSLRequest/GSSENCRequest
-	// gönderdiğinde peer Decoder tarafından bu duruma geçirilir. Sıradaki
-	// tek bayt standart tag+length çerçevesine uymaz ('S'/'N'/'G').
-	phaseSSLReply
 	// phasePassthrough: mesaj sınırları artık güvenilir şekilde takip
-	// edilemiyor (ör. TLS müzakeresi kabul edildi, bozuk/parçalanmış veri).
-	// Bu noktadan sonra Decoder hiçbir şey ayrıştırmaz; SniffReader
-	// baytları olduğu gibi akıtmaya devam eder, sadece gözlem durur.
+	// edilemiyor (ör. bozuk/parçalanmış veri sonrası fail hali). Bu
+	// noktadan sonra Decoder hiçbir şey ayrıştırmaz; SniffReader baytları
+	// olduğu gibi akıtmaya devam eder (salt gözlemci, genuine raw
+	// forwarding), sadece gözlem durur. firewall.Gate gibi aktif
+	// müdahale eden bileşenler bu duruma geçişi kendi onError
+	// callback'lerinde yakalayıp bağlantıyı güvenli şekilde kapatır
+	// (bkz. firewall.NewGate) — bu Decoder seviyesinde baytları asla
+	// sessizce yutup unutmaz.
 	phasePassthrough
+)
+
+// SentinelDB V1 sınırlaması: SSLRequest/GSSENCRequest ve StartupMessage
+// standart tag+length çerçevesine uymadığından (bkz. consumeStartup), bu
+// mesajların MessageType tag'i yoktur (Message.Type == 0). Bunları
+// birbirinden ayırmak için Name alanı kullanılır; firewall.Gate bu
+// sabitlerle karşılaştırma yapar.
+const (
+	NameStartupMessage = "StartupMessage"
+	NameSSLRequest     = "SSLRequest"
+	NameGSSENCRequest  = "GSSENCRequest"
 )
 
 // maxMessageLength, tek bir mesaj için kabul edilen üst sınırdır. Bunun
@@ -73,16 +80,16 @@ type Handler func(Message)
 // Trafiği değiştirmez ya da geciktirmez: SniffReader tarafından yalnızca
 // gözlem amacıyla beslenir.
 //
-// buf yalnızca bu Decoder'ı besleyen goroutine tarafından dokunulur (SniffReader
-// tek bir okuma döngüsünden çağrılır). phase ise SSL/GSS müzakeresi sırasında
-// peer Decoder tarafından da yazılabildiği için atomic tutulur.
+// buf yalnızca bu Decoder'ı besleyen goroutine tarafından dokunulur
+// (SniffReader/Gate tek bir okuma döngüsünden çağrılır). phase yine de
+// atomic tutulur: gelecekte birden fazla goroutine'in aynı Decoder'ı
+// gözlemlemesi (ör. metrik/debug amaçlı) durumunda veri yarışını önler.
 type Decoder struct {
 	dir     Direction
 	phase   atomic.Int32
 	buf     []byte
 	handler Handler
 	onError func(error)
-	peer    *Decoder
 }
 
 // NewClientDecoder, client -> server yönü için bir Decoder oluşturur.
@@ -103,13 +110,6 @@ func NewServerDecoder(h Handler, onError func(error)) *Decoder {
 	return d
 }
 
-// SetPeer, aynı bağlantının karşı yönündeki Decoder'ı bağlar. SSLRequest/
-// GSSENCRequest gibi tek yönde başlayıp karşı yöndeki tek baytlık bir
-// cevapla sonuçlanan müzakereleri doğru ayrıştırmak için gereklidir.
-func (d *Decoder) SetPeer(peer *Decoder) {
-	d.peer = peer
-}
-
 func (d *Decoder) getPhase() phase {
 	return phase(d.phase.Load())
 }
@@ -122,11 +122,10 @@ func (d *Decoder) setPhase(p phase) {
 // mesajları ayrıştırıp handler'a iletir. Eksik mesajlar bir sonraki
 // Write çağrısını bekler.
 func (d *Decoder) Write(p []byte) {
-	switch d.getPhase() {
-	case phasePassthrough, phasePendingSSLReply:
-		// phasePassthrough: artik hicbir sey ayristirilmiyor.
-		// phasePendingSSLReply: protokole gore bu yonde veri beklenmez;
-		// yine de gelirse (beklenmedik durum) ayristirmaya calismadan atlariz.
+	if d.getPhase() == phasePassthrough {
+		// Artik hicbir sey ayristirilmiyor (bkz. fail). Cagiran taraf
+		// (SniffReader) baytlari kendi Read() dönüşünde zaten oldugu gibi
+		// akitmaya devam eder; burada sadece ayristirma/gozlem durur.
 		return
 	}
 	d.buf = append(d.buf, p...)
@@ -141,11 +140,7 @@ func (d *Decoder) Write(p []byte) {
 			if !d.consumeNormal() {
 				return
 			}
-		case phaseSSLReply:
-			if !d.consumeSSLReply() {
-				return
-			}
-		default: // phasePassthrough ya da phasePendingSSLReply'a gecilmis olabilir
+		default: // phasePassthrough
 			return
 		}
 	}
@@ -180,19 +175,19 @@ func (d *Decoder) consumeStartup() bool {
 
 	switch code {
 	case 80877103, 80877104: // SSLRequest, GSSENCRequest
-		name := "SSLRequest"
+		name := NameSSLRequest
 		if code == 80877104 {
-			name = "GSSENCRequest"
+			name = NameGSSENCRequest
 		}
 		d.emit(Message{Direction: d.dir, Name: name, Length: length, Raw: raw})
-		// Sunucu tek baytlık bir kabul/red cevabı verecek; bu standart
-		// tag+length çerçevesine uymaz. Karşı yöndeki (server) Decoder'ı
-		// bu tek baytı bekleyecek şekilde işaretliyoruz, kendimiz de
-		// sonucu öğrenene kadar bekliyoruz (bkz. consumeSSLReply).
-		if d.peer != nil {
-			d.peer.setPhase(phaseSSLReply)
-		}
-		d.setPhase(phasePendingSSLReply)
+		// SentinelDB V1 sınırlaması: sifreleme/GSS müzakeresi hiçbir zaman
+		// gerçek sunucuya iletilmez ve hiçbir zaman kabul edilmez. Bu,
+		// firewall.Gate'in trafiği her zaman düz metin olarak inceleyebilmesi
+		// için kasıtlı bir tasarım kararıdır (bkz. firewall.Gate.handle).
+		// Gate, bu mesajı gördüğünde istemciye doğrudan 'N' yazıp gerçek
+		// sunucuya hiç dokunmaz; Decoder de -sanki cevap zaten alınmış gibi-
+		// doğrudan bir sonraki StartupMessage'ı (düz metin) beklemeye döner.
+		d.setPhase(phaseStartup)
 	case 80877102: // CancelRequest
 		if len(body) >= 12 {
 			pid := binary.BigEndian.Uint32(body[4:8])
@@ -206,7 +201,7 @@ func (d *Decoder) consumeStartup() bool {
 		minor := int(code & 0xFFFF)
 		d.emit(Message{
 			Direction:     d.dir,
-			Name:          "StartupMessage",
+			Name:          NameStartupMessage,
 			Length:        length,
 			ProtocolMajor: major,
 			ProtocolMinor: minor,
@@ -217,40 +212,6 @@ func (d *Decoder) consumeStartup() bool {
 	}
 
 	d.buf = d.buf[length:]
-	return true
-}
-
-// consumeSSLReply, peer Decoder'ın SSLRequest/GSSENCRequest gönderdiğini
-// bildirmesinin ardından beklenen tek baytlık kabul/red cevabını okur.
-// 'S' (SSL) ya da 'G' (GSS) kabul anlamına gelir ve ardından şifreli
-// handshake başlar; bu noktadan sonra ayrıştırma imkansız hale gelir.
-// 'N' ise reddedildiği ve client'ın düz metin StartupMessage'ı tekrar
-// göndereceği anlamına gelir.
-func (d *Decoder) consumeSSLReply() bool {
-	if len(d.buf) < 1 {
-		return false
-	}
-	b := d.buf[0]
-	d.buf = d.buf[1:]
-
-	accepted := b == 'S' || b == 'G'
-	status := "reddedildi (duz metinle devam)"
-	if accepted {
-		status = "kabul edildi (sifreleme baslayacak)"
-	}
-	d.emit(Message{Direction: d.dir, Name: fmt.Sprintf("EncryptionReply(%q): %s", b, status), Length: 1, Raw: []byte{b}})
-
-	if accepted {
-		d.setPhase(phasePassthrough)
-		if d.peer != nil {
-			d.peer.setPhase(phasePassthrough)
-		}
-	} else {
-		d.setPhase(phaseNormal)
-		if d.peer != nil {
-			d.peer.setPhase(phaseStartup)
-		}
-	}
 	return true
 }
 

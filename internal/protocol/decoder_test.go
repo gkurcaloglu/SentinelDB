@@ -58,7 +58,13 @@ func TestDecoder_StartupThenQuery(t *testing.T) {
 	}
 }
 
-func TestDecoder_SSLRequestWithoutPeerWaitsForReply(t *testing.T) {
+// TestDecoder_SSLRequest_ReturnsDirectlyToStartup dogrular: SentinelDB V1
+// sifrelemeyi hicbir zaman desteklemez (bkz. firewall.Gate, istemciye
+// dogrudan 'N' yazan taraf). Decoder, SSLRequest'i emit ettikten sonra
+// gercek bir sunucu cevabi beklemeden dogrudan phaseStartup'a doner ve
+// hemen ardindan gelen duz metin StartupMessage'i ayni Write cagrisinda
+// bile ayristirabilir.
+func TestDecoder_SSLRequest_ReturnsDirectlyToStartup(t *testing.T) {
 	var got []Message
 	dec := NewClientDecoder(func(m Message) { got = append(got, m) }, func(err error) {
 		t.Fatalf("unexpected decode error: %v", err)
@@ -69,11 +75,39 @@ func TestDecoder_SSLRequestWithoutPeerWaitsForReply(t *testing.T) {
 	binary.BigEndian.PutUint32(sslRequest[4:8], 80877103)
 	dec.Write(sslRequest)
 
-	if len(got) != 1 || got[0].Name != "SSLRequest" {
+	if len(got) != 1 || got[0].Name != NameSSLRequest {
 		t.Fatalf("expected SSLRequest message, got %+v", got)
 	}
-	if dec.getPhase() != phasePendingSSLReply {
-		t.Fatalf("expected phasePendingSSLReply after SSLRequest, got %v", dec.getPhase())
+	if dec.getPhase() != phaseStartup {
+		t.Fatalf("expected phaseStartup immediately after SSLRequest, got %v", dec.getPhase())
+	}
+
+	startup := encodeStartupMessage(map[string]string{"user": "sentinel"})
+	dec.Write(startup)
+
+	if len(got) != 2 || got[1].Name != NameStartupMessage || got[1].StartupParams["user"] != "sentinel" {
+		t.Fatalf("expected plaintext StartupMessage to be parsed right after SSLRequest, got %+v", got)
+	}
+}
+
+// TestDecoder_GSSENCRequest_ReturnsDirectlyToStartup, GSSENCRequest icin
+// ayni "her zaman duz metin" davranisini dogrular.
+func TestDecoder_GSSENCRequest_ReturnsDirectlyToStartup(t *testing.T) {
+	var got []Message
+	dec := NewClientDecoder(func(m Message) { got = append(got, m) }, func(err error) {
+		t.Fatalf("unexpected decode error: %v", err)
+	})
+
+	gssRequest := make([]byte, 8)
+	binary.BigEndian.PutUint32(gssRequest[0:4], 8)
+	binary.BigEndian.PutUint32(gssRequest[4:8], 80877104)
+	dec.Write(gssRequest)
+
+	if len(got) != 1 || got[0].Name != NameGSSENCRequest {
+		t.Fatalf("expected GSSENCRequest message, got %+v", got)
+	}
+	if dec.getPhase() != phaseStartup {
+		t.Fatalf("expected phaseStartup immediately after GSSENCRequest, got %v", dec.getPhase())
 	}
 }
 
@@ -89,89 +123,5 @@ func TestDecoder_InvalidLengthStopsParsingWithoutPanicking(t *testing.T) {
 	}
 	if dec.getPhase() != phasePassthrough {
 		t.Fatalf("expected passthrough phase after invalid length, got %v", dec.getPhase())
-	}
-}
-
-// TestDecoder_SSLNegotiation_Rejected, gercek psql/postgres davranisini
-// dogrular: client SSLRequest gonderir, sunucu 'N' ile reddeder, client
-// duz metin StartupMessage'i tekrar gonderir ve normal akis devam eder.
-func TestDecoder_SSLNegotiation_Rejected(t *testing.T) {
-	var clientMsgs, serverMsgs []Message
-	clientDec := NewClientDecoder(func(m Message) { clientMsgs = append(clientMsgs, m) }, func(err error) {
-		t.Fatalf("unexpected client decode error: %v", err)
-	})
-	serverDec := NewServerDecoder(func(m Message) { serverMsgs = append(serverMsgs, m) }, func(err error) {
-		t.Fatalf("unexpected server decode error: %v", err)
-	})
-	clientDec.SetPeer(serverDec)
-	serverDec.SetPeer(clientDec)
-
-	sslRequest := make([]byte, 8)
-	binary.BigEndian.PutUint32(sslRequest[0:4], 8)
-	binary.BigEndian.PutUint32(sslRequest[4:8], 80877103)
-	clientDec.Write(sslRequest)
-
-	if clientDec.getPhase() != phasePendingSSLReply {
-		t.Fatalf("expected client phasePendingSSLReply, got %v", clientDec.getPhase())
-	}
-	if serverDec.getPhase() != phaseSSLReply {
-		t.Fatalf("expected server phaseSSLReply, got %v", serverDec.getPhase())
-	}
-
-	serverDec.Write([]byte{'N'})
-
-	if clientDec.getPhase() != phaseStartup {
-		t.Fatalf("expected client back to phaseStartup after 'N', got %v", clientDec.getPhase())
-	}
-	if serverDec.getPhase() != phaseNormal {
-		t.Fatalf("expected server phaseNormal after 'N', got %v", serverDec.getPhase())
-	}
-
-	// Client artik duz metin StartupMessage'i tekrar gonderir.
-	startup := encodeStartupMessage(map[string]string{"user": "sentinel"})
-	clientDec.Write(startup)
-
-	found := false
-	for _, m := range clientMsgs {
-		if m.Name == "StartupMessage" && m.StartupParams["user"] == "sentinel" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected retried StartupMessage to be parsed, got %+v", clientMsgs)
-	}
-
-	// Sunucu artik normal cerceveli mesajlar gonderebilir (ör. Authentication).
-	auth := []byte{byte(MsgAuthentication), 0, 0, 0, 8, 0, 0, 0, 0}
-	serverDec.Write(auth)
-	if len(serverMsgs) < 2 || serverMsgs[len(serverMsgs)-1].Name != "Authentication" {
-		t.Fatalf("expected Authentication message to be parsed after negotiation, got %+v", serverMsgs)
-	}
-}
-
-// TestDecoder_SSLNegotiation_Accepted, sunucunun sifrelemeyi kabul ettigi
-// durumda her iki yonun de passthrough'a gectigini dogrular (TLS
-// handshake'i ayristirmaya calismiyoruz).
-func TestDecoder_SSLNegotiation_Accepted(t *testing.T) {
-	clientDec := NewClientDecoder(func(Message) {}, func(err error) {
-		t.Fatalf("unexpected client decode error: %v", err)
-	})
-	serverDec := NewServerDecoder(func(Message) {}, func(err error) {
-		t.Fatalf("unexpected server decode error: %v", err)
-	})
-	clientDec.SetPeer(serverDec)
-	serverDec.SetPeer(clientDec)
-
-	sslRequest := make([]byte, 8)
-	binary.BigEndian.PutUint32(sslRequest[0:4], 8)
-	binary.BigEndian.PutUint32(sslRequest[4:8], 80877103)
-	clientDec.Write(sslRequest)
-	serverDec.Write([]byte{'S'})
-
-	if clientDec.getPhase() != phasePassthrough {
-		t.Fatalf("expected client passthrough after 'S', got %v", clientDec.getPhase())
-	}
-	if serverDec.getPhase() != phasePassthrough {
-		t.Fatalf("expected server passthrough after 'S', got %v", serverDec.getPhase())
 	}
 }

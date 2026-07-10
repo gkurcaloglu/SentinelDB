@@ -14,3 +14,11 @@ firewall:
 # yeniden derlemek icin: scripts/build-wasm-plugins.ps1
 wasm:
   plugin_path: "plugins/firewall/v2.wasm"
+
+# logging.log_full_queries: varsayilan olarak KAPALI. Acilirsa, Simple
+# Query mesajlarinin tam SQL metni loglara yazilir - PII/hassas veri
+# icerebilecegi icin yalnizca lokal gelistirme/hata ayiklamada
+# kullanilmalidir. Kapaliyken loglar yalnizca verdict, mesaj tipi, sure ve
+# baglanti kimligi gibi guvenli metadata icerir.
+logging:
+  log_full_queries: false

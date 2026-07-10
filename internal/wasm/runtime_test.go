@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gkurcaloglu/sentineldb/internal/wasmproto"
 )
@@ -113,5 +114,60 @@ func TestRuntime_NewRuntimeErrorsOnMissingFile(t *testing.T) {
 	_, err := NewRuntime(ctx, filepath.Join(t.TempDir(), "does-not-exist.wasm"))
 	if err == nil {
 		t.Fatal("expected an error for a missing wasm file")
+	}
+}
+
+// TestRuntime_TimeoutFailsClosed, gorev I'nin "plugin timeout ... fail
+// closed" gereksinimini dogrular: eklenti cagrisina tanınan sure
+// (rt.timeout) pratikte imkansiz derecede kisa tutuldugunda, cagri hata
+// ile doner (sonsuza kadar bloke olmaz), boylece cagiran taraf (ör.
+// wasm.Policy/wasm.Masker) fail-closed davranabilir.
+func TestRuntime_TimeoutFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	wasmPath := buildTestPlugin(t)
+
+	rt, err := NewRuntime(ctx, wasmPath)
+	if err != nil {
+		t.Fatalf("unexpected error creating runtime: %v", err)
+	}
+	defer rt.Close(ctx)
+
+	rt.timeout = 1 * time.Nanosecond // hicbir calistirmayi bitiremeyecek kadar kisa
+
+	if _, _, err := rt.Evaluate(ctx, "SELECT 1;", nil); err == nil {
+		t.Fatal("expected an error when the plugin call times out")
+	}
+	if _, err := rt.Mask(ctx, "email", "email", "john@example.com"); err == nil {
+		t.Fatal("expected an error when the plugin call times out")
+	}
+}
+
+// TestValidateResult_MalformedResponsesFailClosed, gorev I'nin "malformed
+// plugin response fails closed" gereksinimini validateResult uzerinde
+// dogrudan (sahte bir eklenti derlemeye gerek kalmadan) dogrular: eklenti
+// sozlesmesine uymayan hicbir yanit sessizce basarili sayilmaz.
+func TestValidateResult_MalformedResponsesFailClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		resp wasmproto.Result
+	}{
+		{"error alani dolu", wasmproto.Result{Version: wasmproto.ProtocolVersion, Op: wasmproto.OpEvaluateQuery, Error: "bir seyler ters gitti"}},
+		{"versiyon uyusmuyor", wasmproto.Result{Version: 999, Op: wasmproto.OpEvaluateQuery, Verdict: "ALLOW"}},
+		{"op uyusmuyor", wasmproto.Result{Version: wasmproto.ProtocolVersion, Op: wasmproto.OpMaskValue, Verdict: "ALLOW"}},
+		{"bos zarf", wasmproto.Result{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateResult(tc.resp, wasmproto.OpEvaluateQuery); err == nil {
+				t.Fatalf("expected validateResult to reject %+v", tc.resp)
+			}
+		})
+	}
+}
+
+func TestValidateResult_ValidResponseAccepted(t *testing.T) {
+	resp := wasmproto.Result{Version: wasmproto.ProtocolVersion, Op: wasmproto.OpEvaluateQuery, Verdict: "ALLOW"}
+	if err := validateResult(resp, wasmproto.OpEvaluateQuery); err != nil {
+		t.Fatalf("unexpected error for a valid response: %v", err)
 	}
 }

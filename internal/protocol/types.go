@@ -42,6 +42,13 @@ const (
 	MsgCloseComplete      MessageType = '3'
 	MsgNoData             MessageType = 'n'
 	MsgPortalSuspended    MessageType = 's'
+	// COPY protokolünü başlatan backend mesajları. SentinelDB V1, COPY
+	// protokolünü desteklemez (bkz. internal/masking.Transformer); bu
+	// sabitler yalnızca bu mesajları tanıyıp güvenli şekilde
+	// reddedebilmek için tanımlanmıştır.
+	MsgCopyInResponse   MessageType = 'G'
+	MsgCopyOutResponse  MessageType = 'H'
+	MsgCopyBothResponse MessageType = 'W'
 )
 
 var frontendNames = map[MessageType]string{
@@ -60,6 +67,7 @@ var backendNames = map[MessageType]string{
 	MsgParseComplete: "ParseComplete", MsgBindComplete: "BindComplete",
 	MsgCloseComplete: "CloseComplete", MsgNoData: "NoData", MsgPortalSuspended: "PortalSuspended",
 	MsgCopyData: "CopyData", MsgCopyDone: "CopyDone",
+	MsgCopyInResponse: "CopyInResponse", MsgCopyOutResponse: "CopyOutResponse", MsgCopyBothResponse: "CopyBothResponse",
 }
 
 func messageName(dir Direction, t MessageType) string {

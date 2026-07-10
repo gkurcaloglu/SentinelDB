@@ -93,6 +93,90 @@ logging:
 	}
 }
 
+func TestLoad_MaskingDisabledByDefault(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Masking.Enabled {
+		t.Fatal("expected Masking.Enabled to default to false when masking section is absent")
+	}
+}
+
+func TestLoad_ParsesMaskingConfig(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+masking:
+  enabled: true
+  columns:
+    - email
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Masking.Enabled {
+		t.Fatal("expected Masking.Enabled to be true")
+	}
+	if len(cfg.Masking.Columns) != 1 || cfg.Masking.Columns[0] != "email" {
+		t.Fatalf("expected Masking.Columns = [email], got %+v", cfg.Masking.Columns)
+	}
+}
+
+func TestLoad_MaskingEnabledWithNoColumnsIsInvalid(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+masking:
+  enabled: true
+  columns: []
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error when masking is enabled with an empty column list")
+	}
+}
+
+func TestLoad_MaskingEnabledWithOnlyBlankColumnsIsInvalid(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+masking:
+  enabled: true
+  columns:
+    - "   "
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error when masking is enabled with only blank column names")
+	}
+}
+
+func TestLoad_MaskingDisabledWithNoColumnsIsValid(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+masking:
+  enabled: false
+`)
+
+	if _, err := Load(path); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestLoad_MissingFileReturnsError(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err == nil {

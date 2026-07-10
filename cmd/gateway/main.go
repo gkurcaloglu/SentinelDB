@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,6 +18,7 @@ import (
 	"github.com/gkurcaloglu/sentineldb/internal/api"
 	"github.com/gkurcaloglu/sentineldb/internal/config"
 	"github.com/gkurcaloglu/sentineldb/internal/firewall"
+	"github.com/gkurcaloglu/sentineldb/internal/masking"
 	"github.com/gkurcaloglu/sentineldb/internal/metrics"
 	"github.com/gkurcaloglu/sentineldb/internal/protocol"
 	"github.com/gkurcaloglu/sentineldb/internal/wasm"
@@ -101,11 +101,11 @@ func main() {
 		log.Println("UYARI: logging.log_full_queries=true - tam SQL sorgu metni loglara yaziliyor. Bu yalnizca lokal gelistirme icin kullanilmalidir.")
 	}
 
-	// Firewall karar mantigi artik native Go kodu (firewall.DenyKeywords)
-	// olarak degil, calisma zamaninda yuklenen sandbox'li bir Wasm eklentisi
-	// (bkz. plugins/firewall) icinde calisiyor. wasm.Policy, mevcut
-	// firewall.Policy arayuzunu bu eklentiden besler; firewall.Gate hic
-	// degismedi.
+	// Firewall karar mantigi VE PII maskeleme mantigi, calisma zamaninda
+	// yuklenen TEK bir sandbox'li Wasm eklentisi (bkz. plugins/firewall)
+	// icinde calisir - ikinci bir runtime ya da ikinci bir ayrica yuklenen
+	// eklenti yoktur (bkz. internal/wasm.Runtime.Evaluate/Mask, ayni
+	// CompiledModule'u paylasir).
 	wasmRuntime, err := wasm.NewRuntime(ctx, cfg.Wasm.PluginPath)
 	if err != nil {
 		log.Fatalf("wasm eklentisi yuklenemedi: %v", err)
@@ -116,6 +116,14 @@ func main() {
 		log.Printf("wasm politika hatasi: %v", err)
 	})
 	log.Printf("firewall politikasi yuklendi (eklenti: %s): %d yasakli ifade %v", cfg.Wasm.PluginPath, len(cfg.Firewall.BlockedPhrases), cfg.Firewall.BlockedPhrases)
+
+	masker := wasm.NewMasker(wasmRuntime)
+	maskCfg := masking.NewConfig(cfg.Masking.Enabled, cfg.Masking.Columns)
+	if maskCfg.Enabled {
+		log.Printf("PII maskeleme aktif: sutunlar=%v", cfg.Masking.Columns)
+	} else {
+		log.Println("PII maskeleme kapali (masking.enabled=false)")
+	}
 
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
@@ -160,9 +168,9 @@ func main() {
 
 		// Yeni baglanti kabul etmeyi durdur.
 		listener.Close()
-		// Aktif baglantilari zorla kapat: gate.Run/io.Copy icindeki bloklu
-		// Read cagrilari boylece hata ile doner ve handleConn goroutine'leri
-		// sonlanip wg.Wait()'in altta ilerlemesine izin verir.
+		// Aktif baglantilari zorla kapat: gate.Run/transformer.Run icindeki
+		// bloklu Read cagrilari boylece hata ile doner ve handleConn
+		// goroutine'leri sonlanip wg.Wait()'in altta ilerlemesine izin verir.
 		conns.closeAll()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
@@ -203,12 +211,12 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConn(ctx, conn, policy, m, conns)
+			handleConn(ctx, conn, policy, masker, maskCfg, m, conns)
 		}()
 	}
 }
 
-func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, m *metrics.Metrics, conns *activeConns) {
+func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, masker masking.Masker, maskCfg masking.Config, m *metrics.Metrics, conns *activeConns) {
 	defer client.Close()
 
 	connID := connCounter.Add(1)
@@ -226,13 +234,26 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, m 
 	conns.add(connID, client, target)
 	defer conns.remove(connID)
 
-	// client -> server yonu artik salt gozlemci degil: Gate, her mesaji
-	// politikaya gore degerlendirip izin verilenleri target'a oldugu gibi
-	// iletir, engellenenleri ise target'a hic ulastirmadan dogrudan
-	// client'a sentetik bir ErrorResponse+ReadyForQuery ile yanitlar. Ayrica
-	// V1 sinirlarini da uygular: SSLRequest'i hic iletmeden 'N' ile yanitlar
-	// ve genisletilmis sorgu protokolu mesajlarini reddeder (bkz. Gate doc).
-	gate := firewall.NewGate(policy, target, client,
+	// Butun client yazmalari (gercek backend yanitlarinin/maskelenmis
+	// DataRow'larin iletilmesi, SSL red baytı, sentetik firewall
+	// ErrorResponse/ReadyForQuery) TEK bir mutex korumali yazici uzerinden
+	// gecer; boylece iki farkli goroutine PostgreSQL protokol baytlarini
+	// asla ic ice yazamaz (bkz. gorev F).
+	clientWriter := protocol.NewSerializedWriter(client)
+
+	// Baglantinin en son bilinen ReadyForQuery islem durumu (I/T/E).
+	// Sunucudan gelen gercek ReadyForQuery'ler bunu gunceller
+	// (masking.Transformer); firewall.Gate sentetik ReadyForQuery
+	// uretirken bunu okur (bkz. gorev G).
+	txState := protocol.NewTxState()
+
+	// client -> server yonu: Gate, her mesaji politikaya gore
+	// degerlendirip izin verilenleri target'a oldugu gibi iletir,
+	// engellenenleri ise target'a hic ulastirmadan dogrudan client'a
+	// sentetik bir ErrorResponse+ReadyForQuery ile yanitlar. Ayrica V1
+	// sinirlarini da uygular: SSLRequest'i hic iletmeden 'N' ile yanitlar
+	// ve genisletilmis sorgu protokolu mesajlarini reddeder.
+	gate := firewall.NewGate(policy, target, clientWriter,
 		func(msg protocol.Message, v firewall.Verdict, reason string, duration time.Duration) {
 			if v == firewall.Block {
 				m.BlockedQueriesTotal.Inc()
@@ -241,15 +262,30 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, m 
 		},
 		func(err error) { log.Printf("[conn %d] client->server protokol ayristirma durdu: %v", connID, err) },
 	)
+	gate.SetTxState(txState)
 
-	// server -> client yonu hala salt gozlemci SniffReader ile izleniyor;
-	// io.Copy'nin davranisi bu yonde degismedi.
-	serverDec := protocol.NewServerDecoder(
-		func(m protocol.Message) { logMessage(connID, m) },
-		func(err error) { log.Printf("[conn %d] server->client protokol ayristirma durdu: %v", connID, err) },
-	)
-
-	serverReader := protocol.NewSniffReader(target, serverDec)
+	// server -> client yonu: eskiden salt gozlemci SniffReader kullanan bu
+	// yon, artik yapilandirilmis sutunlari (ör. email) maskeleyen aktif
+	// bir Transformer'dir (bkz. internal/masking). Degismeyen mesajlar
+	// (Authentication, ParameterStatus, CommandComplete, vb.) oldugu gibi
+	// iletilir.
+	transformer := masking.NewTransformer(maskCfg, masker, clientWriter, txState, masking.Hooks{
+		OnMessage: func(msg protocol.Message) { logMessage(connID, msg) },
+		OnMaskAttempt: func(column string, changed bool, maskErr error, duration time.Duration) {
+			m.MaskingPluginDuration.Observe(duration.Seconds())
+			if maskErr != nil {
+				m.MaskingErrorsTotal.Inc()
+				// Guvenlik: yalnizca sutun adi ve hata loglanir, hicbir
+				// zaman hucre degeri (orijinal ya da maskelenmis) loglanmaz.
+				log.Printf("[conn %d] S->C sutun maskeleme hatasi (sutun=%q): %v", connID, column, maskErr)
+				return
+			}
+			if changed {
+				m.MaskedCellsTotal.Inc()
+			}
+		},
+		OnError: func(err error) { log.Printf("[conn %d] server->client isleme durdu: %v", connID, err) },
+	})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -271,7 +307,16 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, m 
 
 	go func() {
 		defer wg.Done()
-		io.Copy(client, serverReader)
+		runErr := transformer.Run(target)
+		if masking.IsFailClosed(runErr) {
+			// Transformer bilerek kapatti (ayristirma/maskeleme hatasi,
+			// desteklenmeyen ikili format ya da COPY protokolu); client'a
+			// zaten bir FATAL ErrorResponse yazildi (bkz. Transformer).
+			// Karsi yondeki bloklu okumanin da hemen sonlanmasi icin
+			// client'i tam kapatiyoruz.
+			client.Close()
+			return
+		}
 		client.(*net.TCPConn).CloseWrite()
 	}()
 
@@ -279,8 +324,9 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, m 
 }
 
 // logMessage, genel (politika kararina bagli olmayan) mesaj loglamasidir.
-// Guvenlik: hicbir kosulda SQL sorgu metnini basmaz (bkz. logGateDecision,
-// Query mesajlari icin tek yetkili log noktasidir).
+// Guvenlik: hicbir kosulda SQL sorgu metnini ya da DataRow hucre
+// degerlerini basmaz (bkz. logGateDecision, Query mesajlari icin tek
+// yetkili log noktasidir; DataRow ise burada hic loglanmaz).
 func logMessage(connID uint64, m protocol.Message) {
 	dir := "C->S"
 	if m.Direction == protocol.Backend {
@@ -290,7 +336,8 @@ func logMessage(connID uint64, m protocol.Message) {
 	case protocol.NameStartupMessage:
 		log.Printf("[conn %d] %s StartupMessage protokol=%d.%d params=%v", connID, dir, m.ProtocolMajor, m.ProtocolMinor, m.StartupParams)
 	case "DataRow", "CopyData":
-		// yuksek hacimli mesajlar; log gurultusunu onlemek icin atlanir
+		// yuksek hacimli VE potansiyel olarak hassas veri tasiyan
+		// mesajlar; log gurultusunu ve PII sizintisini onlemek icin atlanir.
 	default:
 		log.Printf("[conn %d] %s %s (uzunluk=%d)", connID, dir, m.Name, m.Length)
 	}

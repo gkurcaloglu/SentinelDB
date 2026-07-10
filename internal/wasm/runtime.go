@@ -1,8 +1,14 @@
-// Package wasm, SentinelDB gateway'inin firewall karar mantığını yerleşik
-// (native) Go kodu yerine, çalışma zamanında yüklenen bir Wasm eklentisi
-// (bkz. plugins/firewall) içinde çalıştırmasını sağlayan host tarafı
-// altyapıyı barındırır. Wasm runtime olarak, cgo/C toolchain gerektirmeyen
-// saf Go implementasyonu github.com/tetratelabs/wazero kullanılır.
+// Package wasm, SentinelDB gateway'inin firewall karar mantığını VE PII
+// maskeleme mantığını yerleşik (native) Go kodu yerine, çalışma zamanında
+// yüklenen TEK bir Wasm eklentisi (bkz. plugins/firewall) içinde
+// çalıştırmasını sağlayan host tarafı altyapıyı barındırır. Wasm runtime
+// olarak, cgo/C toolchain gerektirmeyen saf Go implementasyonu
+// github.com/tetratelabs/wazero kullanılır.
+//
+// Firewall (evaluate_query) ve maskeleme (mask_value) operasyonları AYNI
+// yüklü CompiledModule üzerinden, sürümlü tek bir istek/yanıt zarfı
+// (bkz. internal/wasmproto) ile çalışır; ikinci bir runtime ya da ikinci
+// bir ayrı yüklenen eklenti yoktur.
 package wasm
 
 import (
@@ -12,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -19,17 +26,22 @@ import (
 	"github.com/gkurcaloglu/sentineldb/internal/wasmproto"
 )
 
-// defaultTimeout, tek bir Evaluate çağrısına tanınan azami süredir. Eklenti
+// defaultTimeout, tek bir eklenti çağrısına tanınan azami süredir. Eklenti
 // bu süreyi aşarsa çağrı context iptaliyle zorla sonlandırılır (bkz.
 // wazero.RuntimeConfig.WithCloseOnContextDone); böylece bozuk ya da kötü
 // niyetli bir eklenti gateway'i sonsuza dek bloklayamaz.
 const defaultTimeout = 2 * time.Second
 
-// Runtime, derlenmiş bir firewall Wasm eklentisini yöneten host tarafı
-// çalışma zamanıdır. Eklenti WASI "command" modeliyle (main() bir kez
-// çalışıp çıkar) derlendiğinden, aynı CompiledModule her Evaluate
-// çağrısında taze bir instance olarak çalıştırılır; bir instance'ı ikinci
-// kez çağırmak WASI command modülleri için tanımsızdır.
+// maxMaskedValueSize, mask_value yanıtında kabul edilen azami değer
+// boyutudur. Bunun üzerindeki bir çıktı, bozuk ya da kötü niyetli bir
+// eklentinin işareti sayılır ve reddedilir (fail-closed).
+const maxMaskedValueSize = 64 * 1024 // 64 KiB - e-posta gibi degerler icin cok comert bir sinir
+
+// Runtime, derlenmiş, tek bir firewall/masking Wasm eklentisini yöneten
+// host tarafı çalışma zamanıdır. Eklenti WASI "command" modeliyle (main()
+// bir kez çalışıp çıkar) derlendiğinden, aynı CompiledModule her çağrıda
+// taze bir instance olarak çalıştırılır; bir instance'ı ikinci kez
+// çağırmak WASI command modülleri için tanımsızdır.
 type Runtime struct {
 	runtime  wazero.Runtime
 	compiled wazero.CompiledModule
@@ -67,14 +79,86 @@ func (rt *Runtime) Close(ctx context.Context) error {
 	return rt.runtime.Close(ctx)
 }
 
-// Evaluate, query'yi ve blockedPhrases listesini JSON isteği olarak
-// eklentiye (stdin) yazar, eklentiyi taze bir instance olarak çalıştırır ve
-// stdout'tan dönen kararı ayrıştırır. verdict wasmproto.VerdictAllow ya da
-// wasmproto.VerdictBlock olur.
+// Evaluate, query'yi ve blockedPhrases listesini bir evaluate_query
+// isteği olarak eklentiye gönderir ve dönen kararı ayrıştırır. verdict,
+// eklentinin döndürdüğü ham dizgidir (ör. "ALLOW"/"BLOCK"); bunun tam
+// olarak geçerli bir değer olup olmadığının doğrulanması wasm.Policy'nin
+// sorumluluğundadır (bkz. policy.go).
 func (rt *Runtime) Evaluate(ctx context.Context, query string, blockedPhrases []string) (verdict, reason string, err error) {
-	reqBytes, err := json.Marshal(wasmproto.Request{Query: query, BlockedPhrases: blockedPhrases})
+	resp, err := rt.call(ctx, wasmproto.Envelope{
+		Version:        wasmproto.ProtocolVersion,
+		Op:             wasmproto.OpEvaluateQuery,
+		Query:          query,
+		BlockedPhrases: blockedPhrases,
+	})
 	if err != nil {
-		return "", "", fmt.Errorf("istek serilestirilemedi: %w", err)
+		return "", "", err
+	}
+	if err := validateResult(resp, wasmproto.OpEvaluateQuery); err != nil {
+		return "", "", err
+	}
+	return resp.Verdict, resp.Reason, nil
+}
+
+// MaskResult, bir mask_value çağrısının doğrulanmış sonucudur.
+type MaskResult struct {
+	Value   string
+	Changed bool
+	Reason  string
+}
+
+// Mask, tek bir hücre değerini eklentiye mask_value isteği olarak
+// gönderir. Dönen değerin geçerli UTF-8 olduğu ve boyutunun makul bir
+// sınırı aşmadığı doğrulanır; aksi halde (ya da eklenti bir Error
+// döndürürse) bir hata döner - çağıran (internal/masking) bunu
+// fail-closed olarak ele almalıdır.
+func (rt *Runtime) Mask(ctx context.Context, column, kind, value string) (MaskResult, error) {
+	resp, err := rt.call(ctx, wasmproto.Envelope{
+		Version: wasmproto.ProtocolVersion,
+		Op:      wasmproto.OpMaskValue,
+		Column:  column,
+		Kind:    kind,
+		Value:   value,
+	})
+	if err != nil {
+		return MaskResult{}, err
+	}
+	if err := validateResult(resp, wasmproto.OpMaskValue); err != nil {
+		return MaskResult{}, err
+	}
+	if !utf8.ValidString(resp.Value) {
+		return MaskResult{}, fmt.Errorf("eklenti gecersiz UTF-8 dondurdu")
+	}
+	if len(resp.Value) > maxMaskedValueSize {
+		return MaskResult{}, fmt.Errorf("eklenti cok buyuk bir deger dondurdu: %d bayt (ust sinir %d)", len(resp.Value), maxMaskedValueSize)
+	}
+	return MaskResult{Value: resp.Value, Changed: resp.Changed, Reason: resp.Reason}, nil
+}
+
+// validateResult, eklentinin döndürdüğü ortak zarf alanlarını (Error,
+// Version, Op) doğrular. Bu, hem Evaluate hem Mask için ortak olan
+// "eklenti sözleşmeye uydu mu" kontrolüdür.
+func validateResult(resp wasmproto.Result, wantOp string) error {
+	if resp.Error != "" {
+		return fmt.Errorf("eklenti hata dondurdu: %s", resp.Error)
+	}
+	if resp.Version != wasmproto.ProtocolVersion {
+		return fmt.Errorf("eklenti protokol versiyonu uyusmuyor: got %d want %d", resp.Version, wasmproto.ProtocolVersion)
+	}
+	if resp.Op != wantOp {
+		return fmt.Errorf("eklenti yaniti beklenmeyen operasyon iceriyor: got %q want %q", resp.Op, wantOp)
+	}
+	return nil
+}
+
+// call, verilen isteği JSON olarak eklentiye (stdin) yazar, eklentiyi taze
+// bir instance olarak çalıştırır ve stdout'tan dönen zarfı ayrıştırır. Bu,
+// Evaluate ve Mask tarafından paylaşılan tek düşük seviyeli çağrı
+// mekanizmasıdır (tek yüklü CompiledModule, tek runtime).
+func (rt *Runtime) call(ctx context.Context, req wasmproto.Envelope) (wasmproto.Result, error) {
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		return wasmproto.Result{}, fmt.Errorf("istek serilestirilemedi: %w", err)
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, rt.timeout)
@@ -92,13 +176,13 @@ func (rt *Runtime) Evaluate(ctx context.Context, query string, blockedPhrases []
 		defer mod.Close(context.Background())
 	}
 	if instErr != nil {
-		return "", "", fmt.Errorf("wasm eklentisi calistirilamadi: %w (stderr=%q)", instErr, stderr.String())
+		return wasmproto.Result{}, fmt.Errorf("wasm eklentisi calistirilamadi: %w (stderr=%q)", instErr, stderr.String())
 	}
 
-	var resp wasmproto.Response
+	var resp wasmproto.Result
 	if err := json.Unmarshal(stdout.Bytes(), &resp); err != nil {
-		return "", "", fmt.Errorf("eklenti ciktisi ayristirilamadi: %w (stdout=%q, stderr=%q)", err, stdout.String(), stderr.String())
+		return wasmproto.Result{}, fmt.Errorf("eklenti ciktisi ayristirilamadi: %w (stdout=%q, stderr=%q)", err, stdout.String(), stderr.String())
 	}
 
-	return resp.Verdict, resp.Reason, nil
+	return resp, nil
 }

@@ -335,3 +335,76 @@ func TestGate_MalformedMessage_DoesNotSilentlyDiscardSubsequentBytes(t *testing.
 		t.Fatalf("expected an ErrorResponse to be written to the client instead of silent discard")
 	}
 }
+
+// TestGate_BlockedQuery_UsesLastKnownTxState gorev G'yi dogrular: bir
+// sorgu, baglanti bir islem (transaction) ortasindayken ('T') engellenirse,
+// Gate'in urettigi sentetik ReadyForQuery her zamanki gibi sabit 'I'
+// degil, SetTxState ile bildirilen son bilinen durumu tasimalidir - aksi
+// halde istemciye yanlislikla "islem bitti/bosta" sinyali verilir.
+func TestGate_BlockedQuery_UsesLastKnownTxState(t *testing.T) {
+	var target, respond bytes.Buffer
+	txState := protocol.NewTxState()
+	txState.Set(protocol.TxStatusInTransaction)
+
+	g := NewGate(DenyKeywords("DROP TABLE"), &target, &respond,
+		func(m protocol.Message, v Verdict, reason string, duration time.Duration) {},
+		func(err error) { t.Fatalf("unexpected decode error: %v", err) },
+	)
+	g.SetTxState(txState)
+
+	startup := encodeStartupMessage()
+	query := encodeQuery("DROP TABLE users;")
+	stream := append(append([]byte{}, startup...), query...)
+
+	if err := g.Run(bytes.NewReader(stream)); err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+
+	var got []protocol.Message
+	dec := protocol.NewServerDecoder(func(m protocol.Message) { got = append(got, m) }, func(err error) {
+		t.Fatalf("unexpected re-decode error: %v", err)
+	})
+	dec.Write(respond.Bytes())
+
+	if len(got) != 2 || got[1].Name != "ReadyForQuery" {
+		t.Fatalf("expected [ErrorResponse, ReadyForQuery], got %+v", got)
+	}
+	// ReadyForQuery'nin ham baytlarindan durum baytini (tag+length'ten
+	// sonraki tek bayt) dogrudan kontrol et.
+	statusByte := got[1].Raw[len(got[1].Raw)-1]
+	if statusByte != protocol.TxStatusInTransaction {
+		t.Fatalf("expected synthetic ReadyForQuery status %q (in-transaction), got %q", protocol.TxStatusInTransaction, statusByte)
+	}
+}
+
+// TestGate_BlockedQuery_DefaultsToIdleWithoutTxState, SetTxState hic
+// cagrilmadiginda onceki davranisin (her zaman 'I') korundugunu dogrular.
+func TestGate_BlockedQuery_DefaultsToIdleWithoutTxState(t *testing.T) {
+	var target, respond bytes.Buffer
+	g := NewGate(DenyKeywords("DROP TABLE"), &target, &respond,
+		func(m protocol.Message, v Verdict, reason string, duration time.Duration) {},
+		func(err error) { t.Fatalf("unexpected decode error: %v", err) },
+	)
+
+	startup := encodeStartupMessage()
+	query := encodeQuery("DROP TABLE users;")
+	stream := append(append([]byte{}, startup...), query...)
+
+	if err := g.Run(bytes.NewReader(stream)); err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+
+	var got []protocol.Message
+	dec := protocol.NewServerDecoder(func(m protocol.Message) { got = append(got, m) }, func(err error) {
+		t.Fatalf("unexpected re-decode error: %v", err)
+	})
+	dec.Write(respond.Bytes())
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 messages, got %+v", got)
+	}
+	statusByte := got[1].Raw[len(got[1].Raw)-1]
+	if statusByte != protocol.TxStatusIdle {
+		t.Fatalf("expected default status %q, got %q", protocol.TxStatusIdle, statusByte)
+	}
+}

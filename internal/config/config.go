@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,6 +15,7 @@ type Config struct {
 	Firewall FirewallConfig `yaml:"firewall"`
 	Wasm     WasmConfig     `yaml:"wasm"`
 	Logging  LoggingConfig  `yaml:"logging"`
+	Masking  MaskingConfig  `yaml:"masking"`
 }
 
 // FirewallConfig, firewall politikasını besleyen ayarlardır. BlockedPhrases
@@ -44,6 +46,35 @@ type LoggingConfig struct {
 	LogFullQueries bool `yaml:"log_full_queries"`
 }
 
+// MaskingConfig, PII maskeleme davranışını kontrol eder. Eşleştirme
+// yalnızca RowDescription'daki sütun adına karşı, büyük/küçük harf
+// duyarsız tam eşleşme ile yapılır - regex, şema keşfi (schema discovery)
+// ya da AI tabanlı sınıflandırma yoktur (bkz. internal/masking.Config).
+type MaskingConfig struct {
+	// Enabled, false ise hiçbir sütun maskelenmez ve internal/masking
+	// Wasm eklentisini hiç çağırmaz.
+	Enabled bool `yaml:"enabled"`
+	// Columns, maskeleneceği yapılandırılmış sütun adlarının listesidir
+	// (ör. "email"). Yalnızca configured (bu listede olan) sütunlar
+	// incelenir; diğer sütunların değerleri hiç okunmaz/tahmin edilmez.
+	Columns []string `yaml:"columns"`
+}
+
+// validate, masking.enabled=true iken en az bir boş olmayan sütun adı
+// verilmiş olmasını zorunlu kılar. Aksi halde maskeleme "açık ama hiçbir
+// şey yapmıyor" gibi sessizce yanlış bir duruma düşebilirdi.
+func (m MaskingConfig) validate() error {
+	if !m.Enabled {
+		return nil
+	}
+	for _, c := range m.Columns {
+		if strings.TrimSpace(c) != "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("masking.enabled=true ama masking.columns bos; en az bir sutun adi gerekli")
+}
+
 // Load, path'teki YAML dosyasını okuyup bir Config'e ayrıştırır.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -54,6 +85,10 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("config dosyasi ayristirilamadi (%s): %w", path, err)
+	}
+
+	if err := cfg.Masking.validate(); err != nil {
+		return nil, fmt.Errorf("config gecersiz (%s): %w", path, err)
 	}
 
 	return &cfg, nil

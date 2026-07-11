@@ -22,3 +22,12 @@ wasm:
 # baglanti kimligi gibi guvenli metadata icerir.
 logging:
   log_full_queries: false
+
+# masking: yaniti donen PostgreSQL sonuclarinda hangi sutunlarin
+# maskelenecegini belirler. Eslesme yalnizca RowDescription'daki sutun
+# adina karsi, buyuk/kucuk harf duyarsiz TAM esleseme ile yapilir (regex
+# ya da sema kesfi yoktur). Sadece burada listelenen sutunlar incelenir.
+masking:
+  enabled: true
+  columns:
+    - email

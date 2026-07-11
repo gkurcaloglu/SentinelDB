@@ -61,6 +61,7 @@ type Gate struct {
 	onDecide func(m protocol.Message, v Verdict, reason string, duration time.Duration)
 	onError  func(error)
 	err      error
+	txState  *protocol.TxState
 }
 
 // NewGate, verilen Policy ile bir Gate oluşturur. target, izin verilen
@@ -79,6 +80,26 @@ func NewGate(policy Policy, target, respond io.Writer, onDecide func(m protocol.
 // Decoder, Gate'in kullandığı alttaki protocol.Decoder'a erişim sağlar.
 func (g *Gate) Decoder() *protocol.Decoder {
 	return g.dec
+}
+
+// SetTxState, Gate'in sentetik ReadyForQuery ürettiğinde (bir sorgu
+// engellendiğinde) kullanacağı paylaşılan işlem-durumu izleyicisini
+// bağlar. ts nil ise (ya da hiç çağrılmazsa) Gate her zaman 'I' (idle)
+// varsayar - önceki davranışla birebir aynıdır.
+//
+// ts, tipik olarak internal/masking.Transformer'ın gerçek sunucudan gelen
+// ReadyForQuery mesajlarıyla güncellediği AYNI *protocol.TxState'tir;
+// böylece bir işlem ortasında ('T') engellenen bir sorgu, istemciye
+// yanlışlıkla "işlem bitti" sinyali vermez.
+func (g *Gate) SetTxState(ts *protocol.TxState) {
+	g.txState = ts
+}
+
+func (g *Gate) readyForQueryStatus() byte {
+	if g.txState != nil {
+		return g.txState.Get()
+	}
+	return protocol.TxStatusIdle
 }
 
 // Run, client'tan EOF olana ya da bir hata oluşana kadar okur. Okunan her
@@ -172,7 +193,7 @@ func (g *Gate) handle(m protocol.Message) {
 			g.err = err
 			return
 		}
-		if _, err := g.respond.Write(protocol.BuildReadyForQuery('I')); err != nil {
+		if _, err := g.respond.Write(protocol.BuildReadyForQuery(g.readyForQueryStatus())); err != nil {
 			g.err = err
 		}
 		return

@@ -37,6 +37,65 @@ func TestNew_RegistersBothCounters(t *testing.T) {
 	}
 }
 
+func TestNew_RegistersMaskingMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	if m.MaskedCellsTotal == nil || m.MaskingErrorsTotal == nil || m.MaskingPluginDuration == nil {
+		t.Fatal("expected all masking metrics to be initialized")
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("unexpected error gathering metrics: %v", err)
+	}
+	names := make(map[string]bool, len(families))
+	for _, f := range families {
+		names[f.GetName()] = true
+	}
+	for _, want := range []string{
+		"sentineldb_masked_cells_total",
+		"sentineldb_masking_errors_total",
+		"sentineldb_masking_plugin_duration_seconds",
+	} {
+		if !names[want] {
+			t.Errorf("expected registry to contain metric %q, got families %v", want, names)
+		}
+	}
+}
+
+func TestMetrics_MaskingCountersIncrementIndependently(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.MaskedCellsTotal.Add(3)
+	m.MaskingErrorsTotal.Inc()
+	m.MaskingPluginDuration.Observe(0.004)
+	m.MaskingPluginDuration.Observe(0.012)
+
+	if got := testutil.ToFloat64(m.MaskedCellsTotal); got != 3 {
+		t.Errorf("MaskedCellsTotal = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(m.MaskingErrorsTotal); got != 1 {
+		t.Errorf("MaskingErrorsTotal = %v, want 1", got)
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("unexpected error gathering metrics: %v", err)
+	}
+	var sampleCount uint64
+	for _, f := range families {
+		if f.GetName() != "sentineldb_masking_plugin_duration_seconds" {
+			continue
+		}
+		sampleCount = f.GetMetric()[0].GetHistogram().GetSampleCount()
+	}
+	if sampleCount != 2 {
+		t.Errorf("expected 2 histogram observations, got %d", sampleCount)
+	}
+}
+
 func TestMetrics_CountersIncrementIndependently(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := New(reg)

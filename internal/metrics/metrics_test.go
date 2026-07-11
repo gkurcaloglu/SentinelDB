@@ -132,6 +132,33 @@ func TestMetrics_Snapshot(t *testing.T) {
 	}
 }
 
+func TestMetrics_SnapshotIncludesMaskingMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := New(reg)
+
+	m.MaskedCellsTotal.Add(5)
+	m.MaskingErrorsTotal.Add(2)
+	m.MaskingPluginDuration.Observe(0.010)
+	m.MaskingPluginDuration.Observe(0.030)
+
+	snap, err := m.Snapshot()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if snap.MaskedCellsTotal != 5 {
+		t.Errorf("Snapshot().MaskedCellsTotal = %v, want 5", snap.MaskedCellsTotal)
+	}
+	if snap.MaskingErrorsTotal != 2 {
+		t.Errorf("Snapshot().MaskingErrorsTotal = %v, want 2", snap.MaskingErrorsTotal)
+	}
+	if snap.MaskingPluginDurationCount != 2 {
+		t.Errorf("Snapshot().MaskingPluginDurationCount = %v, want 2", snap.MaskingPluginDurationCount)
+	}
+	if got, want := snap.MaskingPluginDurationSumSecs, 0.040; got < want-1e-9 || got > want+1e-9 {
+		t.Errorf("Snapshot().MaskingPluginDurationSumSecs = %v, want %v", got, want)
+	}
+}
+
 func TestMetrics_SnapshotBeforeAnyIncrementIsZero(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := New(reg)

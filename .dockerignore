@@ -1,0 +1,33 @@
+.git/
+.gitignore
+
+# Frontend: dashboard'un kendi Dockerfile'i kendi baglamini (dashboard/)
+# kullanir; kok imaj derlemesi icin gerekli degildir.
+dashboard/
+
+# Derleme/kapsam ciktilari, gecici dosyalar
+*.exe
+*.exe~
+*.test
+*.out
+coverage/
+coverage.*
+*.cover
+
+# Ortam degiskenleri / sirlar
+.env
+.env.*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs (imaj icin gerekli degil)
+README.md

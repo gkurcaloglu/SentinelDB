@@ -91,12 +91,19 @@ func (m *Metrics) Snapshot() (Snapshot, error) {
 		if len(metrics) == 0 {
 			continue
 		}
-		value := metrics[0].GetCounter().GetValue()
 		switch f.GetName() {
 		case nameConnectionsTotal:
-			snap.ConnectionsTotal = value
+			snap.ConnectionsTotal = metrics[0].GetCounter().GetValue()
 		case nameBlockedQueriesTotal:
-			snap.BlockedQueriesTotal = value
+			snap.BlockedQueriesTotal = metrics[0].GetCounter().GetValue()
+		case nameMaskedCellsTotal:
+			snap.MaskedCellsTotal = metrics[0].GetCounter().GetValue()
+		case nameMaskingErrorsTotal:
+			snap.MaskingErrorsTotal = metrics[0].GetCounter().GetValue()
+		case nameMaskingPluginDurationSecs:
+			hist := metrics[0].GetHistogram()
+			snap.MaskingPluginDurationCount = hist.GetSampleCount()
+			snap.MaskingPluginDurationSumSecs = hist.GetSampleSum()
 		}
 	}
 	return snap, nil
@@ -106,4 +113,12 @@ func (m *Metrics) Snapshot() (Snapshot, error) {
 type Snapshot struct {
 	ConnectionsTotal    float64
 	BlockedQueriesTotal float64
+	MaskedCellsTotal    float64
+	MaskingErrorsTotal  float64
+	// MaskingPluginDurationCount/SumSecs, sentineldb_masking_plugin_duration_seconds
+	// histogramının ham örnek sayısı ve saniye toplamıdır; ortalama süre
+	// SumSecs/Count olarak hesaplanabilir (Count=0 iken çağıran taraf 0
+	// kabul etmelidir).
+	MaskingPluginDurationCount   uint64
+	MaskingPluginDurationSumSecs float64
 }

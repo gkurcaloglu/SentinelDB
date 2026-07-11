@@ -18,8 +18,9 @@ import (
 // buildTestPlugin, plugins/firewall kaynağını GOOS=wasip1 GOARCH=wasm ile
 // gerçek bir .wasm ikili dosyasına derler. internal/wasm testlerinin sahte
 // bir şey değil, gerçek bir Go-derlenmiş Wasm eklentisine karşı çalışmasını
-// sağlar.
-func buildTestPlugin(t *testing.T) string {
+// sağlar. testing.TB kabul eder ki hem *testing.T (testler) hem *testing.B
+// (bkz. bench_test.go) aynı derleme mantığını paylaşabilsin.
+func buildTestPlugin(t testing.TB) string {
 	t.Helper()
 
 	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))

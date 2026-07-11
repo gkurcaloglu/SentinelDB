@@ -1,0 +1,51 @@
+name: Feature request
+description: Propose a new capability or change for SentinelDB
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        SentinelDB's core goal is data governance at the wire-protocol
+        layer: enforcing a query firewall and masking PII in query
+        results before they reach a client, without modifying the
+        application or the database. Please explain how your request
+        supports that goal — see also
+        [CONTRIBUTING.md — Scope discipline](../../CONTRIBUTING.md#scope-discipline)
+        and the [README roadmap](../../README.md#roadmap) for what's
+        already planned or explicitly out of scope for now (Extended
+        Query Protocol, TLS termination, AI classification, RBAC,
+        Kubernetes, SaaS).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What can't you do today, or what governance/security gap does this close?
+    validations:
+      required: true
+
+  - type: textarea
+    id: governance-fit
+    attributes:
+      label: How does this support SentinelDB's core data-governance goal?
+      description: >
+        Explain the connection to query firewalling or PII masking at the
+        gateway layer. Requests unrelated to that goal (general
+        infrastructure, unrelated tooling) are likely out of scope.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach (optional)
+      description: If you have a concrete idea of how this could work, describe it.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered (optional)
+    validations:
+      required: false

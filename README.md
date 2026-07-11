@@ -1,5 +1,13 @@
 # SentinelDB
 
+[![CI](https://github.com/gkurcaloglu/SentinelDB/actions/workflows/ci.yml/badge.svg)](https://github.com/gkurcaloglu/SentinelDB/actions/workflows/ci.yml)
+
+**Project status: experimental V0 (V1 MVP).** Working prototype for local
+experimentation, demos, and further development — not a production
+security boundary. See [V1 limitations](#v1-limitations-be-aware-of-these-before-using-this-anywhere-real),
+[SECURITY.md](SECURITY.md), and [docs/threat-model.md](docs/threat-model.md)
+before using it for anything beyond that.
+
 A PostgreSQL wire-protocol gateway that sits between your clients and PostgreSQL to enforce a query firewall and mask PII in query results, using sandboxed WebAssembly for the decision/masking logic.
 
 ## The problem SentinelDB solves
@@ -61,6 +69,21 @@ flowchart LR
 - **Experimental — not production-ready.** This is a V1 MVP: it has not had a security audit, has not been load-tested, and has no high-availability story. Treat it as a prototype/demo, not a compliance control.
 - No automatic PII/data classification: you must explicitly list which columns to mask.
 - No claim of GDPR/KVKK or any other regulatory compliance. Masking one column type (email) is not a compliance program.
+
+## Supported / unsupported protocol
+
+| Protocol path | Status |
+|---|---|
+| Simple Query Protocol (`'Q'`) | ✅ Supported — the only evaluated/masked query path |
+| `SSLRequest` / `GSSENCRequest` | ❌ Rejected (`'N'`) — traffic always stays plaintext |
+| Extended Query Protocol (Parse/Bind/Describe/Execute/Close/Flush/Sync) | ❌ Rejected — `FATAL` error, connection closed |
+| `RowDescription` / `DataRow` (text format) | ✅ Parsed, and masked for configured columns |
+| `DataRow` binary-format columns (`FormatCode != 0`) | ❌ Fail-closed if configured for masking |
+| `COPY` protocol | ❌ Fail-closed — not parsed or masked |
+| `StartupMessage` / `PasswordMessage` / `Terminate` | ✅ Forwarded unchanged (not policy-evaluated) |
+
+See [docs/postgresql-protocol.md](docs/postgresql-protocol.md) for the
+full, exact breakdown.
 
 ## Quick start (Docker Compose)
 
@@ -194,7 +217,24 @@ go vet ./...
 go test ./...
 ```
 
-(`go test -race` requires a cgo-capable toolchain; if `CGO_ENABLED=0` or no C compiler is installed, that flag will fail with a cgo error unrelated to test correctness.)
+(`go test -race` requires a cgo-capable toolchain; if `CGO_ENABLED=0` or no C compiler is installed, that flag will fail with a cgo error unrelated to test correctness. CI runs it on Linux — see [.github/workflows/ci.yml](.github/workflows/ci.yml).)
+
+## Benchmarks
+
+Local Go microbenchmarks (wire-protocol parsing, response masking, Wasm
+plugin invocation) via `go test -bench`, no external tooling:
+
+```powershell
+# PowerShell 7+
+pwsh scripts/benchmark.ps1
+# Windows PowerShell 5.1
+powershell -ExecutionPolicy Bypass -File .\scripts\benchmark.ps1
+```
+
+These are isolated hot-path microbenchmarks on one developer machine, not
+a production throughput/SLA measurement — see
+[docs/benchmarks.md](docs/benchmarks.md) for the full results, machine
+details, and caveats.
 
 ## Rebuilding the Wasm plugin
 
@@ -229,11 +269,45 @@ Dockerfile              gateway production image
 docker-compose.yml     postgres + sentineldb + prometheus + grafana + dashboard
 ```
 
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md) — system context, component
+  responsibilities, data flows, connection lifecycle, fail-closed
+  boundaries
+- [docs/postgresql-protocol.md](docs/postgresql-protocol.md) — exact
+  wire-protocol support (this README's [protocol table](#supported--unsupported-protocol)
+  in full detail)
+- [docs/plugin-api.md](docs/plugin-api.md) — the Wasm plugin's
+  `evaluate_query`/`mask_value` JSON contract, limits, and rebuild steps
+- [docs/threat-model.md](docs/threat-model.md) — assets, trust
+  boundaries, known bypass limitations, why this isn't a production
+  security boundary
+- [docs/operations.md](docs/operations.md) — running the demo stack,
+  ports, troubleshooting, data-volume cleanup
+- [docs/benchmarks.md](docs/benchmarks.md) — local microbenchmark results
+  and caveats
+- [CHANGELOG.md](CHANGELOG.md) / [docs/release-notes-v0.1.0.md](docs/release-notes-v0.1.0.md)
+  — what changed, release by release
+- [CONTRIBUTING.md](CONTRIBUTING.md) — local setup, testing, PR process
+- [SECURITY.md](SECURITY.md) — supported versions, vulnerability
+  reporting
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, how to run the
+Go/dashboard/Docker checks, Wasm plugin rebuilding, and the pull request
+process. Please keep changes scoped to SentinelDB's current V1 design —
+see [CONTRIBUTING.md — Scope discipline](CONTRIBUTING.md#scope-discipline).
+
 ## Security warning
 
 SentinelDB V1 is an **experimental prototype**. It has not undergone a third-party security review. It does not encrypt traffic, has a narrow (Simple Query Protocol-only) attack surface by rejecting everything else, and its masking is a literal exact-column-name rule, not data discovery. Do not point it at a production database or treat it as a substitute for database-level access controls, encryption at rest/in transit, or a compliance program.
 
 All demo host ports are bound to `127.0.0.1` only (see [Service and port table](#service-and-port-table)) precisely because the PostgreSQL traffic they carry is plaintext and the credentials are hard-coded demo values — do not rebind them to `0.0.0.0` or a LAN-facing interface.
+
+See [SECURITY.md](SECURITY.md) for supported versions and how to report a
+vulnerability, and [docs/threat-model.md](docs/threat-model.md) for the
+full assets/trust-boundaries/known-bypass breakdown.
 
 ## Roadmap
 
@@ -241,9 +315,9 @@ All demo host ports are bound to `127.0.0.1` only (see [Service and port table](
 - TLS termination between client and gateway
 - Additional masking types beyond email (phone numbers, national IDs, free-text redaction)
 - COPY protocol support
-- Performance benchmarking
-- CI/CD pipeline and containerized/orchestrated deployment (Kubernetes) — none of this exists yet
+- Production-scale load testing (local microbenchmarks exist today — see [docs/benchmarks.md](docs/benchmarks.md) — but there is no throughput/capacity testing under realistic concurrent load yet)
+- Kubernetes / orchestrated deployment (only the Docker Compose demo stack exists today)
 
-## License status
+## License
 
-No `LICENSE` file is currently present in this repository. Until one is added, the code is **not licensed for reuse** by default (all rights reserved). Add a `LICENSE` file before treating this as open source.
+MIT — see [LICENSE](LICENSE).

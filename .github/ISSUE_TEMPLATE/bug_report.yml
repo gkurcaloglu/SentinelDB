@@ -1,0 +1,78 @@
+name: Bug report
+description: Report a problem with SentinelDB (not a security vulnerability — see the Security tab / SECURITY.md for those)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        **Do not include secrets, credentials, real customer data, or
+        personal data (PII) in this report** — including in logs, config
+        snippets, or screenshots. SentinelDB masks configured columns
+        like `email`, but only in gateway output; anything you paste
+        here directly is not masked by anything. Redact/replace with
+        placeholders before submitting.
+
+        If you believe you've found a **security vulnerability** (a way
+        to bypass the firewall or masking, leak data, or crash the
+        gateway maliciously), please do not file it here — see
+        [SECURITY.md](../../SECURITY.md) for private reporting.
+
+  - type: input
+    id: version
+    attributes:
+      label: SentinelDB version / commit
+      description: Tag, release, or commit SHA you're running (`git rev-parse HEAD` if built from source).
+      placeholder: "v0.1.0 or commit SHA"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and environment
+      description: OS/version, and whether you're running via Docker Compose or a local Go build.
+      placeholder: "e.g. Windows 11, Docker Compose demo stack"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Exact steps to reproduce, including relevant `config.yaml` settings (redact anything sensitive).
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: >
+        Paste sanitized `docker compose logs sentineldb` (or gateway
+        stdout) output. Double-check there is no query text, cell/row
+        values, connection strings, or passwords in what you paste —
+        even if `logging.log_full_queries` was left at its default
+        (`false`).
+      render: shell
+    validations:
+      required: false

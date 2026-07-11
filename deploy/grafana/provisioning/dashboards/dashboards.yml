@@ -1,0 +1,14 @@
+# /var/lib/grafana/dashboards altina mount edilen dashboard JSON'larini
+# otomatik olarak yukleyen provider tanimi (bkz. deploy/grafana/dashboards).
+apiVersion: 1
+
+providers:
+  - name: SentinelDB
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,0 +1,12 @@
+# SentinelDB demo yigininin minimal Prometheus yapilandirmasi.
+# sentineldb servisi, Docker Compose ag icinde servis adiyla ("sentineldb")
+# 9090 portundan kazinir; bu, gateway container'inin metrics.go'da actigi
+# /metrics endpoint'idir (bkz. cmd/gateway/main.go metricsAddr).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "sentineldb"
+    static_configs:
+      - targets: ["sentineldb:9090"]

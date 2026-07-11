@@ -24,14 +24,9 @@ import (
 	"github.com/gkurcaloglu/sentineldb/internal/wasm"
 )
 
+const configPath = "config.yaml"
+
 const (
-	listenAddr = "localhost:5432"
-	targetAddr = "localhost:5433"
-	configPath = "config.yaml"
-
-	metricsAddr = ":9090"
-	apiAddr     = ":8080"
-
 	// dialTimeout, upstream Postgres'e baglanmak icin tanınan azami süredir.
 	// Bu olmadan net.Dial, upstream yanit vermediginde sonsuza kadar
 	// bekleyebilir ve handleConn goroutine'i asla sonlanmaz.
@@ -40,6 +35,27 @@ const (
 	// bekleyen istekleri tamamlamasi icin tanınan azami süredir.
 	httpShutdownTimeout = 5 * time.Second
 )
+
+// listenAddr/targetAddr/metricsAddr/apiAddr, varsayilan olarak lokal
+// (non-Docker) gelistirmedeki degerleriyle sabittir; ilgili ortam
+// degiskeni set edilmisse (ör. Docker Compose'ta) onu kullanir. Bu, gateway'in
+// Postgres'e Docker servis adiyla ("postgres:5432" gibi) baglanabilmesini ve
+// container icinde tum arayuzlerde dinleyebilmesini ("0.0.0.0:5432")
+// saglar; localhost disi bir deger verilmedigi surece davranis oncekiyle
+// birebir aynidir.
+var (
+	listenAddr  = envOrDefault("SENTINELDB_LISTEN_ADDR", "localhost:5432")
+	targetAddr  = envOrDefault("SENTINELDB_TARGET_ADDR", "localhost:5433")
+	metricsAddr = envOrDefault("SENTINELDB_METRICS_ADDR", ":9090")
+	apiAddr     = envOrDefault("SENTINELDB_API_ADDR", ":8080")
+)
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 var connCounter atomic.Uint64
 

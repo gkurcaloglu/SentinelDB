@@ -52,7 +52,7 @@ export default function App() {
           </div>
         )}
 
-        <main className="mt-8 grid gap-6 sm:grid-cols-2">
+        <main className="mt-8 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
           <StatCard
             label="Toplam Bağlantı"
             value={status ? status.connections_total : '—'}
@@ -64,6 +64,24 @@ export default function App() {
             value={status ? status.blocked_queries_total : '—'}
             icon="⛔"
             accent="bg-red-500"
+          />
+          <StatCard
+            label="Maskelenen Hücre"
+            value={status ? status.masked_cells_total : '—'}
+            icon="🎭"
+            accent="bg-violet-500"
+          />
+          <StatCard
+            label="Maskeleme Hatası"
+            value={status ? status.masking_errors_total : '—'}
+            icon="⚠️"
+            accent="bg-amber-500"
+          />
+          <StatCard
+            label="Ort. Maskeleme Süresi"
+            value={status ? `${status.masking_plugin_avg_duration_ms.toFixed(2)} ms` : '—'}
+            icon="⏱️"
+            accent="bg-emerald-500"
           />
         </main>
 

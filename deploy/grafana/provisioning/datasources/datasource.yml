@@ -1,0 +1,11 @@
+# Grafana baslarken bu dosyayi otomatik okuyup Prometheus veri kaynagini
+# elle hicbir islem gerekmeden ekler (bkz. root README "Grafana").
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

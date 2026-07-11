@@ -47,6 +47,36 @@ func TestStatusHandler_ReturnsCurrentCountersAndRules(t *testing.T) {
 	}
 }
 
+func TestStatusHandler_ReturnsMaskingMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := metrics.New(reg)
+	m.MaskedCellsTotal.Add(9)
+	m.MaskingErrorsTotal.Add(1)
+	m.MaskingPluginDuration.Observe(0.020)
+	m.MaskingPluginDuration.Observe(0.040)
+
+	handler := NewStatusHandler(m, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	var got Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unexpected error unmarshaling response: %v (body=%s)", err, rec.Body.String())
+	}
+
+	if got.MaskedCellsTotal != 9 {
+		t.Errorf("MaskedCellsTotal = %v, want 9", got.MaskedCellsTotal)
+	}
+	if got.MaskingErrorsTotal != 1 {
+		t.Errorf("MaskingErrorsTotal = %v, want 1", got.MaskingErrorsTotal)
+	}
+	if want := 30.0; got.MaskingPluginAvgDurationMs != want {
+		t.Errorf("MaskingPluginAvgDurationMs = %v, want %v", got.MaskingPluginAvgDurationMs, want)
+	}
+}
+
 func TestStatusHandler_NilRulesSerializeAsEmptyArray(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)

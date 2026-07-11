@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchStatus } from './api'
 import StatCard from './components/StatCard'
 import RulesPanel from './components/RulesPanel'
@@ -10,22 +10,43 @@ export default function App() {
   const [status, setStatus] = useState(null)
   const [error, setError] = useState(null)
   const [lastUpdated, setLastUpdated] = useState(null)
+  // Bir istek en fazla REQUEST_TIMEOUT_MS (5s) surebilir, POLL_INTERVAL_MS
+  // ise 3s'dir; bu yuzden bir sonraki poll ancak mevcut istek bittikten
+  // sonra planlanir (setInterval kullanilmaz), aksi halde ust uste binen
+  // istekler birikebilir. activeRef, unmount sonrasi gec gelen bir yanitin
+  // state'i guncellemesini engeller.
+  const activeRef = useRef(true)
 
   const load = useCallback(async () => {
     try {
       const data = await fetchStatus()
+      if (!activeRef.current) return
       setStatus(data)
       setError(null)
       setLastUpdated(new Date())
     } catch (err) {
+      if (!activeRef.current) return
       setError(err.message)
     }
   }, [])
 
   useEffect(() => {
-    load()
-    const id = setInterval(load, POLL_INTERVAL_MS)
-    return () => clearInterval(id)
+    activeRef.current = true
+    let timeoutId
+
+    const poll = async () => {
+      await load()
+      if (activeRef.current) {
+        timeoutId = setTimeout(poll, POLL_INTERVAL_MS)
+      }
+    }
+
+    poll()
+
+    return () => {
+      activeRef.current = false
+      clearTimeout(timeoutId)
+    }
   }, [load])
 
   const connected = status !== null && error === null

@@ -6,9 +6,9 @@
 #   1) docker compose yigini ayaga kaldirilir,
 #   2) postgres ve sentineldb saglikli olana kadar beklenir,
 #   3) minimal bir demo tablosu olusturulup tek bir email satiri eklenir,
-#   4) AYNI Simple Query Protocol SELECT sorgusu iki farkli host portundan
-#      calistirilir: 5433 (dogrudan gercek PostgreSQL) ve 5432 (SentinelDB
-#      gateway),
+#   4) AYNI Simple Query Protocol SELECT sorgusu, mevcut Compose network'u
+#      ICINDEN, iki farkli hedefe karsi calistirilir: "postgres" (gercek
+#      PostgreSQL) ve "sentineldb" (SentinelDB gateway) servis adlari,
 #   5) dogrudan sonucun "john@example.com", gateway sonucunun ise
 #      "jo****@example.com" icerdigi dogrulanir.
 #
@@ -16,9 +16,23 @@
 # calistirilir; SentinelDB V1 yalnizca bu protokolu destekler (bkz. root
 # README "V1 Sinirlamalari").
 #
+# Neden host portlari (host.docker.internal) yerine Compose network'u:
+# host portlari artik yalniza 127.0.0.1'e baglanir (bkz. root README
+# "Guvenlik Uyarisi" / gorev A); host.docker.internal her Docker ortaminda
+# host'un loopback'ine baglanan bir container'a geri erisim saglamayabilir.
+# Bu yuzden dogrulama, postgres container'indaki psql client'i Compose
+# network'u uzerinden servis adlariyla ("postgres", "sentineldb") kullanir.
+# Host portlari yine de MANUEL kullanim icin acik kalir (bkz. README).
+#
 # Kullanim:
-#   pwsh scripts/e2e-demo.ps1            # demo calisir, yigin AYAKTA kalir
-#   pwsh scripts/e2e-demo.ps1 -Cleanup   # demo sonunda yigini durdurur (docker compose down)
+#   pwsh scripts/e2e-demo.ps1
+#     -> PowerShell 7+ ile calistirir; demo calisir, yigin AYAKTA kalir.
+#   powershell -ExecutionPolicy Bypass -File .\scripts\e2e-demo.ps1
+#     -> Windows PowerShell 5.1 ile calistirir (PowerShell 7 kurulu
+#        olmasi GEREKMEZ); script PS 7'ye ozel hicbir sozdizimi kullanmaz.
+#   ... -Cleanup
+#     -> demo sonunda yigini durdurur (docker compose down). Named volume
+#        (pgdata) SILINMEZ; bir sonraki calistirmada veri kalici olur.
 
 param(
     [switch]$Cleanup
@@ -30,14 +44,17 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
 # DEMO ONLY - docker-compose.yml'deki postgres servisiyle birebir ayni
-# olmali. Gercek/production kimlik bilgisi degildir.
+# olmali. Gercek/production kimlik bilgisi degildir. Bu deger konsola HICBIR
+# ZAMAN yazilmaz; yalnizca `docker compose exec -e` ile alt process'in ortam
+# degiskeni olarak gecilir.
 $PgUser     = "sentineldb_demo"
 $PgPassword = "demo_only_change_me"
 $PgDb       = "sentineldb_demo"
 
-$DirectHost  = "host.docker.internal"
-$DirectPort  = 5433
-$GatewayPort = 5432
+# Compose network'undeki servis adlari (bkz. docker-compose.yml).
+$DirectServiceHost  = "postgres"
+$GatewayServiceHost = "sentineldb"
+$PgPort = 5432
 
 $DemoTable = "e2e_demo_users"
 
@@ -49,20 +66,23 @@ function Write-Section {
 
 function Invoke-PsqlInContainer {
     param([string]$Sql)
+    # Unix socket uzerinden yerel baglanti (peer/trust auth); sifre
+    # gerekmez.
     docker compose exec -T postgres psql -U $PgUser -d $PgDb -c $Sql | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "postgres container icinde psql komutu basarisiz oldu: $Sql" }
 }
 
-function Invoke-PsqlFromHost {
-    param([string]$HostPort, [string]$Sql)
-    # Ayri, tek kullanimlik bir postgres imaji konteyneri uzerinden HOST'ta
-    # yayinlanan porta (host.docker.internal) baglanir; boylece sorgu
-    # gercekten "disaridan", Docker'in yayinladigi porttan gecer (bkz.
-    # gorev F: "5433/5432 uzerinden").
-    $out = docker run --rm -e PGPASSWORD=$PgPassword postgres:16-alpine `
-        psql -h $DirectHost -p $HostPort -U $PgUser -d $PgDb -t -A -c $Sql
+function Invoke-PsqlOverNetwork {
+    param([string]$TargetServiceHost, [string]$Sql)
+    # postgres container'indaki psql client'ini kullanarak, Compose
+    # network'u uzerinden hostname ile (postgres ya da sentineldb) TCP
+    # baglantisi kurar. TCP baglantilari scram-sha-256 gerektirdigi icin
+    # sifre, yalniza exec edilen process'e `-e` ile ortam degiskeni olarak
+    # gecilir; asla Write-Host ile yazdirilmaz.
+    $out = docker compose exec -T -e PGPASSWORD=$PgPassword postgres `
+        psql -h $TargetServiceHost -p $PgPort -U $PgUser -d $PgDb -t -A -c $Sql
     if ($LASTEXITCODE -ne 0) {
-        throw "host portu $HostPort uzerinden psql basarisiz oldu"
+        throw "$TargetServiceHost`:$PgPort uzerinden psql basarisiz oldu"
     }
     return ($out -join "`n")
 }
@@ -101,15 +121,15 @@ try {
 
     $selectSql = "SELECT email FROM $DemoTable;"
 
-    Write-Section "4/8 Dogrudan PostgreSQL sorgusu (host port $DirectPort, Simple Query Protocol)"
-    $directResult = Invoke-PsqlFromHost -HostPort $DirectPort -Sql $selectSql
+    Write-Section "4/8 Dogrudan PostgreSQL sorgusu (Compose network: $DirectServiceHost`:$PgPort, Simple Query Protocol)"
+    $directResult = Invoke-PsqlOverNetwork -TargetServiceHost $DirectServiceHost -Sql $selectSql
 
-    Write-Section "5/8 SentinelDB gateway sorgusu (host port $GatewayPort, Simple Query Protocol)"
-    $gatewayResult = Invoke-PsqlFromHost -HostPort $GatewayPort -Sql $selectSql
+    Write-Section "5/8 SentinelDB gateway sorgusu (Compose network: $GatewayServiceHost`:$PgPort, Simple Query Protocol)"
+    $gatewayResult = Invoke-PsqlOverNetwork -TargetServiceHost $GatewayServiceHost -Sql $selectSql
 
     Write-Section "6/8 Sonuclar"
-    Write-Host "  Dogrudan PostgreSQL (5433) : $($directResult.Trim())"
-    Write-Host "  SentinelDB Gateway  (5432) : $($gatewayResult.Trim())"
+    Write-Host "  Dogrudan PostgreSQL ($DirectServiceHost)  : $($directResult.Trim())"
+    Write-Host "  SentinelDB Gateway  ($GatewayServiceHost) : $($gatewayResult.Trim())"
 
     Write-Section "7/8 Dogrudan sonuc dogrulaniyor"
     # Not: [string]::Contains bilerek kullanilir - PowerShell'in -like
@@ -127,7 +147,6 @@ try {
     }
     Write-Host "  OK: gateway sonucu maskelenmis 'jo****@example.com' iceriyor" -ForegroundColor Green
 
-    Invoke-PsqlInContainer "DROP TABLE IF EXISTS $DemoTable;"
     Write-Host ""
     Write-Host "E2E DEMO BASARILI: SentinelDB gateway, email sutununu dogru sekilde maskeliyor." -ForegroundColor Green
 }
@@ -137,8 +156,21 @@ catch {
     $exitCode = 1
 }
 finally {
+    # Demo tablosunu temizlemek best-effort'tur: dogrulama basarisiz olsa
+    # bile calisir, ancak buradaki bir hata orijinal basarisizligi ASLA
+    # gizlemez - $exitCode zaten yukaridaki catch'te belirlendi ve burada
+    # degistirilmez.
+    try {
+        Invoke-PsqlInContainer "DROP TABLE IF EXISTS $DemoTable;"
+    }
+    catch {
+        Write-Host ""
+        Write-Host "Uyari: demo tablosu ($DemoTable) temizlenemedi: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
     if ($Cleanup) {
         Write-Section "Cleanup: docker compose yigini durduruluyor (-Cleanup verildi)"
+        # -v BAYRAGI YOK: pgdata named volume korunur.
         docker compose down
     }
     else {

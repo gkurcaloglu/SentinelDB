@@ -3,7 +3,15 @@
 # ---- builder ----
 # Yalnizca gateway ikilisini derlemek icin kullanilir; runtime imajina
 # hicbir Go arac zinciri kopyalanmaz.
-FROM golang:1.26-alpine AS builder
+# --platform=$BUILDPLATFORM: builder daima host mimarisinde calisir (Go
+# capraz derleme yapar), boylece QEMU altinda derleyici calistirmaktan
+# kaynaklanan yavasligi onler. TARGETOS/TARGETARCH BuildKit tarafindan
+# hedef imaj platformuna gore otomatik doldurulur (bkz. gorev B: amd64
+# sabit kodlanmamali).
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -17,7 +25,7 @@ COPY plugins/ ./plugins/
 # plugins/firewall/v2.wasm zaten repoda derlenmis halde tracked'dir (bkz.
 # scripts/build-wasm-plugins.ps1); burada yeniden derlenmez, oldugu gibi
 # runtime asamasina tasinir.
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
 
 # ---- runtime ----

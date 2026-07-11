@@ -76,19 +76,30 @@ This starts five services: `postgres`, `sentineldb`, `prometheus`, `grafana`, `d
 docker compose ps
 ```
 
+All published host ports are bound explicitly to `127.0.0.1` (loopback only) — see [Service and port table](#service-and-port-table) — so the stack is reachable from the machine it runs on but not from other hosts on the network.
+
 ## Reproducible masking demo
 
 The scripted version of this (recommended) is [scripts/e2e-demo.ps1](scripts/e2e-demo.ps1):
 
 ```powershell
+# PowerShell 7+
 pwsh scripts/e2e-demo.ps1          # leaves the stack running afterwards
 pwsh scripts/e2e-demo.ps1 -Cleanup # stops the stack (docker compose down) when done
+
+# Windows PowerShell 5.1 (no PowerShell 7 install required)
+powershell -ExecutionPolicy Bypass -File .\scripts\e2e-demo.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\e2e-demo.ps1 -Cleanup
 ```
+
+`-Cleanup` only stops the stack (`docker compose down`) — it never drops the `pgdata` named volume, so data persists across runs. Without `-Cleanup`, the stack (and the published `127.0.0.1` ports) stay up for manual use after the script finishes. The script never prints the demo database password to the console.
 
 It creates a one-row demo table, then runs the **same** `SELECT` (via `psql -c`, which uses libpq's `PQexec` — i.e. genuinely the Simple Query Protocol) against both the real database and the gateway, and asserts:
 
-- direct PostgreSQL (host port `5433`) returns `john@example.com`
-- SentinelDB (host port `5432`) returns `jo****@example.com`
+- direct PostgreSQL (`postgres:5432` on the Compose network) returns `john@example.com`
+- SentinelDB (`sentineldb:5432` on the Compose network) returns `jo****@example.com`
+
+The script verifies from *inside* the Compose network (via `docker compose exec`) rather than through the published host ports, because `host.docker.internal` is not guaranteed to reach a service bound only to host loopback (`127.0.0.1`) in every Docker environment. The host ports below remain published on `127.0.0.1` for manual use.
 
 The exact manual commands it automates, if you want to run them by hand:
 
@@ -97,28 +108,35 @@ The exact manual commands it automates, if you want to run them by hand:
 docker compose exec -T postgres psql -U sentineldb_demo -d sentineldb_demo `
   -c "CREATE TABLE e2e_demo_users (id serial primary key, email text); INSERT INTO e2e_demo_users (email) VALUES ('john@example.com');"
 
-# 2. direct query, bypassing SentinelDB (host port 5433)
-docker run --rm -e PGPASSWORD=demo_only_change_me postgres:16-alpine `
-  psql -h host.docker.internal -p 5433 -U sentineldb_demo -d sentineldb_demo -c "SELECT email FROM e2e_demo_users;"
+# 2. direct query, bypassing SentinelDB, over the Compose network
+docker compose exec -T -e PGPASSWORD=demo_only_change_me postgres `
+  psql -h postgres -p 5432 -U sentineldb_demo -d sentineldb_demo -c "SELECT email FROM e2e_demo_users;"
 # -> john@example.com
 
-# 3. same query, through SentinelDB (host port 5432)
-docker run --rm -e PGPASSWORD=demo_only_change_me postgres:16-alpine `
-  psql -h host.docker.internal -p 5432 -U sentineldb_demo -d sentineldb_demo -c "SELECT email FROM e2e_demo_users;"
+# 3. same query, through SentinelDB, over the Compose network
+docker compose exec -T -e PGPASSWORD=demo_only_change_me postgres `
+  psql -h sentineldb -p 5432 -U sentineldb_demo -d sentineldb_demo -c "SELECT email FROM e2e_demo_users;"
 # -> jo****@example.com
+
+# Alternative: from the host itself (not from inside another container),
+# the same ports are reachable directly since they're published on 127.0.0.1:
+#   psql -h 127.0.0.1 -p 5433 -U sentineldb_demo -d sentineldb_demo -c "SELECT email FROM e2e_demo_users;"
+#   psql -h 127.0.0.1 -p 5432 -U sentineldb_demo -d sentineldb_demo -c "SELECT email FROM e2e_demo_users;"
 ```
 
 ## Service and port table
 
 | Service | Container port | Host port | Purpose |
 |---|---|---|---|
-| `postgres` | 5432 | **5433** | Direct access to the real database (demo/verification only) |
-| `sentineldb` | 5432 | **5432** | PostgreSQL gateway (Simple Query Protocol) |
-| `sentineldb` | 8080 | **8080** | Read-only status API (`/api/status`) |
-| `sentineldb` | 9090 | **9090** | Prometheus metrics (`/metrics`) |
-| `prometheus` | 9090 | **9091** | Prometheus UI (shifted so it doesn't clash with the gateway's own 9090) |
-| `grafana` | 3000 | **3000** | Grafana UI |
-| `dashboard` | 8080 | **5173** | React monitoring dashboard |
+| `postgres` | 5432 | **127.0.0.1:5433** | Direct access to the real database (demo/verification only) |
+| `sentineldb` | 5432 | **127.0.0.1:5432** | PostgreSQL gateway (Simple Query Protocol) |
+| `sentineldb` | 8080 | **127.0.0.1:8080** | Read-only status API (`/api/status`) |
+| `sentineldb` | 9090 | **127.0.0.1:9090** | Prometheus metrics (`/metrics`) |
+| `prometheus` | 9090 | **127.0.0.1:9091** | Prometheus UI (shifted so it doesn't clash with the gateway's own 9090) |
+| `grafana` | 3000 | **127.0.0.1:3000** | Grafana UI |
+| `dashboard` | 8080 | **127.0.0.1:5173** | React monitoring dashboard |
+
+Every published port is bound explicitly to `127.0.0.1` in `docker-compose.yml` (e.g. `127.0.0.1:5432:5432`), not to all interfaces — this stack carries plaintext PostgreSQL traffic and hard-coded demo credentials, so it must not be reachable from other hosts on the network. Container-to-container traffic (`sentineldb` → `postgres`, `prometheus`/`grafana` → `sentineldb`) is unaffected and continues to use Docker service names on the internal `sentineldb-net` network.
 
 All credentials in `docker-compose.yml` (PostgreSQL: `sentineldb_demo` / `demo_only_change_me`; Grafana: `admin` / `admin_demo_only`) are **demo-only**. Do not reuse them anywhere real.
 
@@ -214,6 +232,8 @@ docker-compose.yml     postgres + sentineldb + prometheus + grafana + dashboard
 ## Security warning
 
 SentinelDB V1 is an **experimental prototype**. It has not undergone a third-party security review. It does not encrypt traffic, has a narrow (Simple Query Protocol-only) attack surface by rejecting everything else, and its masking is a literal exact-column-name rule, not data discovery. Do not point it at a production database or treat it as a substitute for database-level access controls, encryption at rest/in transit, or a compliance program.
+
+All demo host ports are bound to `127.0.0.1` only (see [Service and port table](#service-and-port-table)) precisely because the PostgreSQL traffic they carry is plaintext and the credentials are hard-coded demo values — do not rebind them to `0.0.0.0` or a LAN-facing interface.
 
 ## Roadmap
 

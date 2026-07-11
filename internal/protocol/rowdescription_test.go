@@ -121,3 +121,28 @@ func TestParseRowDescription_NeverPanics(t *testing.T) {
 		}()
 	}
 }
+
+// FuzzParseRowDescription, ParseRowDescription'in guvenilmeyen govde
+// baytlari uzerinde -asla panic etmeme- degismezini korur (bkz. gorev
+// C/I). Tohum kumesi mevcut tablo tabanli testlerden alinmistir.
+func FuzzParseRowDescription(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0x00})
+	f.Add([]byte{0xFF, 0xFF})
+	f.Add([]byte{0x00, 0x01})
+	f.Add([]byte{0x00, 0x01, 0x00})
+	f.Add([]byte{'e', 'm', 'a', 'i', 'l'})
+	f.Add(encodeRowDescriptionBody([]RowField{
+		{Name: "id", TableOID: 16400, Attribute: 1, DataTypeOID: 23, DataTypeSize: 4, TypeModifier: -1},
+		{Name: "email", TableOID: 16400, Attribute: 2, DataTypeOID: 25, DataTypeSize: -1, TypeModifier: -1},
+	}))
+
+	f.Fuzz(func(t *testing.T, body []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("ParseRowDescription panicked on input %v: %v", body, r)
+			}
+		}()
+		_, _ = ParseRowDescription(body)
+	})
+}

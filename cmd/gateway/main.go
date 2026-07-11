@@ -34,6 +34,20 @@ const (
 	// httpShutdownTimeout, kapatma sirasinda metrics/API sunucularinin
 	// bekleyen istekleri tamamlamasi icin tanınan azami süredir.
 	httpShutdownTimeout = 5 * time.Second
+	// httpReadHeaderTimeout, metrics/API sunucularinin istek basliklarini
+	// okumak icin tanidigi azami süredir. Bu olmadan http.Server varsayilan
+	// olarak sinirsiz bekler; yavas ya da kasitli olarak baslik göndermeyi
+	// geciktiren bir istemci (Slowloris tarzi) bir dinleyici goroutine'ini
+	// sonsuza kadar mesgul tutabilirdi.
+	httpReadHeaderTimeout = 5 * time.Second
+	// httpReadTimeout/httpWriteTimeout, tüm istek/yanit dongusu icin tanınan
+	// azami süredir (bu endpoint'ler kucuk, sabit boyutlu JSON/metin
+	// dondurdugu icin comert bir sinirdir).
+	httpReadTimeout  = 10 * time.Second
+	httpWriteTimeout = 10 * time.Second
+	// httpIdleTimeout, keep-alive baglantilarin istek beklerken acik
+	// kalabilecegi azami süredir.
+	httpIdleTimeout = 60 * time.Second
 )
 
 // listenAddr/targetAddr/metricsAddr/apiAddr, varsayilan olarak lokal
@@ -146,7 +160,14 @@ func main() {
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	metricsServer := &http.Server{Addr: metricsAddr, Handler: metricsMux}
+	metricsServer := &http.Server{
+		Addr:              metricsAddr,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
 
 	go func() {
 		log.Printf("metrics sunucusu %s adresinde /metrics uzerinden yayinda", metricsAddr)
@@ -160,7 +181,14 @@ func main() {
 	// kural listesi).
 	apiMux := http.NewServeMux()
 	apiMux.Handle("/api/status", api.WithCORS(api.NewStatusHandler(m, cfg.Firewall.BlockedPhrases)))
-	apiServer := &http.Server{Addr: apiAddr, Handler: apiMux}
+	apiServer := &http.Server{
+		Addr:              apiAddr,
+		Handler:           apiMux,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
+	}
 
 	go func() {
 		log.Printf("API sunucusu %s adresinde /api/status uzerinden yayinda", apiAddr)

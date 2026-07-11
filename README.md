@@ -286,7 +286,10 @@ docker-compose.yml     postgres + sentineldb + prometheus + grafana + dashboard
   ports, troubleshooting, data-volume cleanup
 - [docs/benchmarks.md](docs/benchmarks.md) — local microbenchmark results
   and caveats
-- [CHANGELOG.md](CHANGELOG.md) / [docs/release-notes-v0.1.0.md](docs/release-notes-v0.1.0.md)
+- [docs/audit-v0.1.md](docs/audit-v0.1.md) — final V0.1 internal audit:
+  confirmed fixes, confirmed-safe behaviors, known V1 limitations, V2
+  recommendations
+- [CHANGELOG.md](CHANGELOG.md) / [docs/release-notes-v0.1.0.md](docs/release-notes-v0.1.0.md) / [docs/release-notes-v0.1.1.md](docs/release-notes-v0.1.1.md)
   — what changed, release by release
 - [CONTRIBUTING.md](CONTRIBUTING.md) — local setup, testing, PR process
 - [SECURITY.md](SECURITY.md) — supported versions, vulnerability

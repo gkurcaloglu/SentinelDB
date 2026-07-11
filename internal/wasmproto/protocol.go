@@ -67,7 +67,11 @@ type Result struct {
 	// bağlı açıklama) tarafından kullanılır.
 	Reason string `json:"reason,omitempty"`
 
-	// OpMaskValue yanıt alanları.
-	Value   string `json:"value,omitempty"`
-	Changed bool   `json:"changed,omitempty"`
+	// OpMaskValue yanıt alanları. Bilerek omitempty DEĞİLDİR: mask_value
+	// yanıtlarında bu iki alan her zaman açıkça yazılmalıdır (host,
+	// "değişmedi" - changed=false - ile "alan hiç yok" durumunu ayırt
+	// edebilmek için varlıklarını (presence) doğrular; bkz.
+	// internal/wasm.decodeStrictResult).
+	Value   string `json:"value"`
+	Changed bool   `json:"changed"`
 }

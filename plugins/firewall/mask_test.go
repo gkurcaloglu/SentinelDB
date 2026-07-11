@@ -21,6 +21,12 @@ func TestMaskEmail(t *testing.T) {
 		{"john@example", "john@example", false},                         // alan adinda nokta yok
 		{"john@.com", "john@.com", false},                               // alan adi noktayla basliyor
 		{"john@example.", "john@example.", false},                       // alan adi noktayla bitiyor
+
+		// Unicode (gorev D): "ilk iki karakter" rune anlamina gelir, bayt degil.
+		{"你好@example.com", "你好****@example.com", true},      // 2 rune'luk yerel kisim, tamamen korunur
+		{"你@example.com", "你****@example.com", true},        // tek rune'luk yerel kisim
+		{"你好吗@example.com", "你好****@example.com", true},     // 3 rune, sadece ilk 2'si korunur
+		{"jo****@example.com", "jo****@example.com", false}, // zaten maskelenmis gibi -> sonuc girdiyle ayni, changed=false
 	}
 
 	for _, tc := range cases {

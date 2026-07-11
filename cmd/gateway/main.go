@@ -269,12 +269,18 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, ma
 	// bir Transformer'dir (bkz. internal/masking). Degismeyen mesajlar
 	// (Authentication, ParameterStatus, CommandComplete, vb.) oldugu gibi
 	// iletilir.
-	transformer := masking.NewTransformer(maskCfg, masker, clientWriter, txState, masking.Hooks{
+	transformer := masking.NewTransformer(ctx, maskCfg, masker, clientWriter, txState, masking.Hooks{
 		OnMessage: func(msg protocol.Message) { logMessage(connID, msg) },
 		OnMaskAttempt: func(column string, changed bool, maskErr error, duration time.Duration) {
+			// Wasm cagrisinin suresi, basarili/basarisiz her denemede
+			// gozlemlenir. sentineldb_masking_errors_total BURADA
+			// ARTIRILMAZ: bir maskeleme hatasi her zaman Transformer'in
+			// failClosed() cagirmasina ve dolayisiyla OnError'un TAM
+			// OLARAK BIR KEZ tetiklenmesine yol acar (bkz. asagidaki
+			// OnError). Sayaci burada da artirmak, ayni hatayi iki kez
+			// saymaya (OnMaskAttempt + OnError) neden olurdu.
 			m.MaskingPluginDuration.Observe(duration.Seconds())
 			if maskErr != nil {
-				m.MaskingErrorsTotal.Inc()
 				// Guvenlik: yalnizca sutun adi ve hata loglanir, hicbir
 				// zaman hucre degeri (orijinal ya da maskelenmis) loglanmaz.
 				log.Printf("[conn %d] S->C sutun maskeleme hatasi (sutun=%q): %v", connID, column, maskErr)
@@ -284,7 +290,17 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, ma
 				m.MaskedCellsTotal.Inc()
 			}
 		},
-		OnError: func(err error) { log.Printf("[conn %d] server->client isleme durdu: %v", connID, err) },
+		// OnError, Transformer'in fail-closed kapattigi HER durum icin
+		// (maskeleme hatasi, bozuk RowDescription/DataRow, alan sayisi
+		// uyumsuzlugu, ikili sutun, desteklenmeyen COPY, ayristirma
+		// hatasi) TAM OLARAK BIR KEZ tetiklenir (Transformer, t.err zaten
+		// doluysa OnError'u tekrar cagirmaz). Bu yuzden
+		// sentineldb_masking_errors_total'i artirmak icin tek ve dogru yer
+		// burasidir.
+		OnError: func(err error) {
+			m.MaskingErrorsTotal.Inc()
+			log.Printf("[conn %d] server->client isleme durdu: %v", connID, err)
+		},
 	})
 
 	var wg sync.WaitGroup
@@ -302,7 +318,9 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, ma
 			target.Close()
 			return
 		}
-		target.(*net.TCPConn).CloseWrite()
+		if tcpConn, ok := target.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 	}()
 
 	go func() {
@@ -317,7 +335,9 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, ma
 			client.Close()
 			return
 		}
-		client.(*net.TCPConn).CloseWrite()
+		if tcpConn, ok := client.(*net.TCPConn); ok {
+			tcpConn.CloseWrite()
+		}
 	}()
 
 	wg.Wait()

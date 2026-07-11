@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gkurcaloglu/sentineldb/internal/protocol"
 )
@@ -87,9 +88,11 @@ type maskCall struct {
 type fakeMasker struct {
 	maskFunc func(column, value string) (string, bool, error)
 	calls    []maskCall
+	lastCtx  context.Context
 }
 
 func (f *fakeMasker) Mask(ctx context.Context, column, kind, value string) (string, bool, string, error) {
+	f.lastCtx = ctx
 	f.calls = append(f.calls, maskCall{column, kind, value})
 	if f.maskFunc == nil {
 		return value, false, "", nil
@@ -126,7 +129,7 @@ func TestTransformer_MasksConfiguredColumn(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(0)))
@@ -155,7 +158,7 @@ func TestTransformer_NonTargetColumnUnchanged(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(0)))
@@ -181,7 +184,7 @@ func TestTransformer_NullEmailUnchanged_MaskerNeverCalled(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(0)))
@@ -208,7 +211,7 @@ func TestTransformer_InvalidEmailUnchanged(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(0)))
@@ -231,7 +234,7 @@ func TestTransformer_MultipleRows(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(0)))
@@ -256,7 +259,7 @@ func TestTransformer_MultipleResultSets_ClearsStateBetweenSets(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	// Birinci sonuc kumesi: email sutunu var, maskelenmeli.
@@ -286,7 +289,7 @@ func TestTransformer_CaseInsensitiveColumnMatching(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"EmAiL"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription([]protocol.RowField{
@@ -306,7 +309,7 @@ func TestTransformer_BinaryFormatColumnFailsClosed(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(1))) // format code 1 = binary
@@ -331,7 +334,7 @@ func TestTransformer_FieldCountMismatchFailsClosed(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(0))) // 2 alan bekleniyor
@@ -351,7 +354,7 @@ func TestTransformer_FragmentedReadsAreHandledCorrectly(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
 	cfg := NewConfig(true, []string{"email"})
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{})
 
 	var full bytes.Buffer
 	full.Write(encodeRowDescription(idAndEmailFields(0)))
@@ -380,7 +383,7 @@ func TestTransformer_MaskerErrorFailsClosed(t *testing.T) {
 	cfg := NewConfig(true, []string{"email"})
 
 	var loggedErr error
-	tr := NewTransformer(cfg, masker, &client, nil, Hooks{
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{
 		OnError: func(err error) { loggedErr = err },
 	})
 
@@ -399,7 +402,7 @@ func TestTransformer_MaskerErrorFailsClosed(t *testing.T) {
 
 func TestTransformer_CopyProtocolFailsClosed(t *testing.T) {
 	var client bytes.Buffer
-	tr := NewTransformer(NewConfig(false, nil), emailLikeMasker(), &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), NewConfig(false, nil), emailLikeMasker(), &client, nil, Hooks{})
 
 	stream := bytes.NewReader(encodeCopyOutResponse())
 	err := tr.Run(stream)
@@ -411,7 +414,7 @@ func TestTransformer_CopyProtocolFailsClosed(t *testing.T) {
 func TestTransformer_ReadyForQuery_UpdatesTxState(t *testing.T) {
 	var client bytes.Buffer
 	txState := protocol.NewTxState()
-	tr := NewTransformer(NewConfig(false, nil), emailLikeMasker(), &client, txState, Hooks{})
+	tr := NewTransformer(context.Background(), NewConfig(false, nil), emailLikeMasker(), &client, txState, Hooks{})
 
 	stream := bytes.NewReader(encodeReadyForQuery(protocol.TxStatusInTransaction))
 	if err := tr.Run(stream); err != nil {
@@ -424,7 +427,7 @@ func TestTransformer_ReadyForQuery_UpdatesTxState(t *testing.T) {
 
 func TestTransformer_UnrelatedMessagesForwardedUnchanged(t *testing.T) {
 	var client bytes.Buffer
-	tr := NewTransformer(NewConfig(false, nil), emailLikeMasker(), &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), NewConfig(false, nil), emailLikeMasker(), &client, nil, Hooks{})
 
 	auth := encodeAuthenticationOk()
 	if err := tr.Run(bytes.NewReader(auth)); err != nil {
@@ -438,7 +441,7 @@ func TestTransformer_UnrelatedMessagesForwardedUnchanged(t *testing.T) {
 func TestTransformer_MaskingDisabled_NoMaskingAttempted(t *testing.T) {
 	var client bytes.Buffer
 	masker := emailLikeMasker()
-	tr := NewTransformer(NewConfig(false, []string{"email"}), masker, &client, nil, Hooks{})
+	tr := NewTransformer(context.Background(), NewConfig(false, []string{"email"}), masker, &client, nil, Hooks{})
 
 	var stream bytes.Buffer
 	stream.Write(encodeRowDescription(idAndEmailFields(0)))
@@ -453,6 +456,202 @@ func TestTransformer_MaskingDisabled_NoMaskingAttempted(t *testing.T) {
 	}
 	if !bytes.Equal(lastMessage(t, client.Bytes()), dataRow) {
 		t.Fatal("expected DataRow forwarded unchanged when masking is disabled")
+	}
+}
+
+// TestTransformer_PropagatesConnectionContextToMasker gorev A'yi dogrular:
+// Transformer, olusturulurken verilen baglanti/kok context'ini SAKLAR ve
+// AYNEN (yeni bir context.Background() uretmeden) her Mask cagrisina
+// gecer. Bunu, dis context'i Run() TAMAMLANDIKTAN SONRA iptal edip,
+// maskerin ALDIGI context referansinin da iptal oldugunu gozlemleyerek
+// kanitliyoruz - bu, gercekten AYNI context'in tasindigini (kopyalanmis
+// ya da yeniden uretilmis bagimsiz bir context degil) gosterir. Gercek
+// gateway'de bu, kapatma sirasinda devam eden bir mask_value cagrisinin
+// da iptal edilebilmesini saglar.
+func TestTransformer_PropagatesConnectionContextToMasker(t *testing.T) {
+	var client bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	masker := emailLikeMasker()
+	cfg := NewConfig(true, []string{"email"})
+	tr := NewTransformer(ctx, cfg, masker, &client, nil, Hooks{})
+
+	var stream bytes.Buffer
+	stream.Write(encodeRowDescription(idAndEmailFields(0)))
+	stream.Write(encodeDataRow([]protocol.DataCell{{Value: []byte("1")}, {Value: []byte("john@example.com")}}))
+
+	if err := tr.Run(&stream); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if masker.lastCtx == nil {
+		t.Fatal("expected the masker to receive a non-nil context")
+	}
+	if err := masker.lastCtx.Err(); err != nil {
+		t.Fatalf("expected an active (non-cancelled) context during the call, got err: %v", err)
+	}
+
+	cancel()
+	if err := masker.lastCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancelling the connection context to be observable via the SAME context the masker received, got: %v", err)
+	}
+}
+
+// TestTransformer_DefaultConstructorUsage, mevcut bagimsiz birim
+// testlerinin (bu dosyadaki digerleri gibi) context.Background() ile
+// Transformer olusturmasinin gecerli oldugunu dogrular (gorev A'nin
+// belirttigi gibi).
+func TestTransformer_DefaultConstructorUsage(t *testing.T) {
+	var client bytes.Buffer
+	tr := NewTransformer(context.Background(), NewConfig(false, nil), emailLikeMasker(), &client, nil, Hooks{})
+	if tr.ctx == nil {
+		t.Fatal("expected context.Background() to be stored, not nil")
+	}
+}
+
+// TestTransformer_NilContextDefaultsToBackground, NewTransformer'a nil
+// context gecilirse panic etmek yerine guvenli bir varsayilana (context.
+// Background()) dustugunu dogrular.
+func TestTransformer_NilContextDefaultsToBackground(t *testing.T) {
+	var client bytes.Buffer
+	tr := NewTransformer(nil, NewConfig(false, nil), emailLikeMasker(), &client, nil, Hooks{}) //nolint:staticcheck // kasitli: nil-guvenligini test ediyoruz
+	if tr.ctx == nil {
+		t.Fatal("expected a non-nil default context when nil is passed")
+	}
+}
+
+// --- gorev E: OnMaskAttempt/OnError tetiklenme deseni testleri ---
+//
+// cmd/gateway/main.go, sentineldb_masking_errors_total sayacini YALNIZCA
+// OnError icinde artirir (OnMaskAttempt'in hata dalinda DEGIL) - boylece
+// bir maskeleme eklentisi hatasi iki kez sayilmaz (bkz. gorev E'nin
+// yorumu, cmd/gateway/main.go). Bu testler, Transformer'in hook'lari bu
+// varsayimi doguladigi TAM SAYIDA cagirdigini kanitlar: eger bu testler
+// gecerse, main.go'daki metrik artirma mantigi da dogru sayar.
+
+type hookCounts struct {
+	maskAttempts    int
+	maskAttemptErrs int
+	maskAttemptOKs  int
+	errorCalls      int
+}
+
+func TestTransformer_HookPattern_PluginFailure_ErrorCountedOnce(t *testing.T) {
+	var client bytes.Buffer
+	masker := &fakeMasker{maskFunc: func(column, value string) (string, bool, error) {
+		return "", false, errors.New("eklenti coktu")
+	}}
+	cfg := NewConfig(true, []string{"email"})
+
+	var hc hookCounts
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{
+		OnMaskAttempt: func(column string, changed bool, err error, duration time.Duration) {
+			hc.maskAttempts++
+			if err != nil {
+				hc.maskAttemptErrs++
+			} else {
+				hc.maskAttemptOKs++
+			}
+		},
+		OnError: func(err error) { hc.errorCalls++ },
+	})
+
+	var stream bytes.Buffer
+	stream.Write(encodeRowDescription(idAndEmailFields(0)))
+	stream.Write(encodeDataRow([]protocol.DataCell{{Value: []byte("1")}, {Value: []byte("john@example.com")}}))
+
+	err := tr.Run(&stream)
+	if !IsFailClosed(err) {
+		t.Fatalf("expected a fail-closed error, got %v", err)
+	}
+
+	if hc.maskAttempts != 1 || hc.maskAttemptErrs != 1 {
+		t.Fatalf("expected exactly 1 failed mask attempt, got attempts=%d errs=%d", hc.maskAttempts, hc.maskAttemptErrs)
+	}
+	if hc.errorCalls != 1 {
+		t.Fatalf("expected OnError to fire EXACTLY ONCE for a plugin failure (so the metric increments once), got %d", hc.errorCalls)
+	}
+}
+
+func TestTransformer_HookPattern_ProtocolFailure_ErrorCountedOnce(t *testing.T) {
+	var client bytes.Buffer
+	masker := emailLikeMasker()
+	cfg := NewConfig(true, []string{"email"})
+
+	var hc hookCounts
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{
+		OnMaskAttempt: func(column string, changed bool, err error, duration time.Duration) { hc.maskAttempts++ },
+		OnError:       func(err error) { hc.errorCalls++ },
+	})
+
+	var stream bytes.Buffer
+	stream.Write(encodeRowDescription(idAndEmailFields(0))) // 2 alan bekleniyor
+	stream.Write(encodeDataRow([]protocol.DataCell{
+		{Value: []byte("1")},
+		{Value: []byte("john@example.com")},
+		{Value: []byte("extra")}, // alan sayisi uyumsuzlugu - masker'a hic ulasilmaz
+	}))
+
+	err := tr.Run(&stream)
+	if !IsFailClosed(err) {
+		t.Fatalf("expected a fail-closed error, got %v", err)
+	}
+
+	if hc.maskAttempts != 0 {
+		t.Fatalf("expected the masker to never be reached for a field-count mismatch, got %d attempts", hc.maskAttempts)
+	}
+	if hc.errorCalls != 1 {
+		t.Fatalf("expected OnError to fire EXACTLY ONCE for a protocol-level failure, got %d", hc.errorCalls)
+	}
+}
+
+func TestTransformer_HookPattern_COPYFailure_ErrorCountedOnce(t *testing.T) {
+	var client bytes.Buffer
+	var hc hookCounts
+	tr := NewTransformer(context.Background(), NewConfig(false, nil), emailLikeMasker(), &client, nil, Hooks{
+		OnMaskAttempt: func(column string, changed bool, err error, duration time.Duration) { hc.maskAttempts++ },
+		OnError:       func(err error) { hc.errorCalls++ },
+	})
+
+	err := tr.Run(bytes.NewReader(encodeCopyOutResponse()))
+	if !IsFailClosed(err) {
+		t.Fatalf("expected a fail-closed error for COPY, got %v", err)
+	}
+	if hc.errorCalls != 1 {
+		t.Fatalf("expected OnError to fire EXACTLY ONCE for an unsupported COPY response, got %d", hc.errorCalls)
+	}
+}
+
+func TestTransformer_HookPattern_SuccessfulMask_NoErrorCounted(t *testing.T) {
+	var client bytes.Buffer
+	masker := emailLikeMasker()
+	cfg := NewConfig(true, []string{"email"})
+
+	var hc hookCounts
+	tr := NewTransformer(context.Background(), cfg, masker, &client, nil, Hooks{
+		OnMaskAttempt: func(column string, changed bool, err error, duration time.Duration) {
+			hc.maskAttempts++
+			if err == nil {
+				hc.maskAttemptOKs++
+			}
+		},
+		OnError: func(err error) { hc.errorCalls++ },
+	})
+
+	var stream bytes.Buffer
+	stream.Write(encodeRowDescription(idAndEmailFields(0)))
+	stream.Write(encodeDataRow([]protocol.DataCell{{Value: []byte("1")}, {Value: []byte("john@example.com")}}))
+
+	if err := tr.Run(&stream); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if hc.maskAttempts != 1 || hc.maskAttemptOKs != 1 {
+		t.Fatalf("expected exactly 1 successful mask attempt, got attempts=%d oks=%d", hc.maskAttempts, hc.maskAttemptOKs)
+	}
+	if hc.errorCalls != 0 {
+		t.Fatalf("expected OnError to never fire for a successful mask, got %d calls", hc.errorCalls)
 	}
 }
 

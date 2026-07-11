@@ -52,6 +52,7 @@ type Hooks struct {
 //     Go string'ine çevrilir; başka bir kodlama kullanan bağlantılar için
 //     bu varsayım geçerli olmayabilir (V1 kapsamı dışında).
 type Transformer struct {
+	ctx     context.Context
 	dec     *protocol.Decoder
 	client  io.Writer
 	masker  Masker
@@ -66,12 +67,18 @@ type Transformer struct {
 }
 
 // NewTransformer, verilen Config ve Masker ile bir Transformer oluşturur.
-// client, izin verilen/dönüştürülen tüm baytların yazılacağı gerçek
-// client bağlantısıdır (tipik olarak bir *protocol.SerializedWriter, bkz.
-// görev F). txState nil olabilir (bu durumda ReadyForQuery durumu takip
-// edilmez).
-func NewTransformer(cfg Config, masker Masker, client io.Writer, txState *protocol.TxState, hooks Hooks) *Transformer {
-	t := &Transformer{cfg: cfg, masker: masker, client: client, txState: txState, hooks: hooks}
+// ctx, bağlantının kök/iptal edilebilir context'idir; her Mask çağrısına
+// AYNEN geçilir (yeni bir context.Background() ÜRETİLMEZ) - böylece
+// gateway kapatılırken (ctx iptal edildiğinde) devam eden bir mask_value
+// çağrısı da hemen sonlandırılabilir. client, izin verilen/dönüştürülen
+// tüm baytların yazılacağı gerçek client bağlantısıdır (tipik olarak bir
+// *protocol.SerializedWriter, bkz. görev F). txState nil olabilir (bu
+// durumda ReadyForQuery durumu takip edilmez).
+func NewTransformer(ctx context.Context, cfg Config, masker Masker, client io.Writer, txState *protocol.TxState, hooks Hooks) *Transformer {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t := &Transformer{ctx: ctx, cfg: cfg, masker: masker, client: client, txState: txState, hooks: hooks}
 	t.dec = protocol.NewServerDecoder(t.handle, t.handleDecodeError)
 	return t
 }
@@ -200,7 +207,7 @@ func (t *Transformer) handleDataRow(m protocol.Message) {
 		}
 
 		start := time.Now()
-		maskedValue, valueChanged, _, maskErr := t.masker.Mask(context.Background(), field.Name, maskKindEmail, string(cell.Value))
+		maskedValue, valueChanged, _, maskErr := t.masker.Mask(t.ctx, field.Name, maskKindEmail, string(cell.Value))
 		duration := time.Since(start)
 		if t.hooks.OnMaskAttempt != nil {
 			t.hooks.OnMaskAttempt(field.Name, valueChanged, maskErr, duration)

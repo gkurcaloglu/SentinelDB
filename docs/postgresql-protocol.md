@@ -98,6 +98,32 @@ than a naive reading of the wire format:**
   negative or zero, as `FETCH_ALL`. `ExecuteMessage.MaxRows` preserves
   the wire value exactly as sent.
 
+### Connection-local state model (no runtime wiring)
+
+`internal/protocol/extended_state.go` adds a standalone, connection-local
+state model (`protocol.State`) that tracks prepared-statement and portal
+*generations*, a FIFO pending-operation queue for future backend-
+acknowledgement correlation, and `Sync`-delimited cycle identities, per
+the design document's "Object generations" and "Explicit pipeline-cycle
+identities" sections linked above.
+
+**This is a pure data structure, not a running component.** It performs no
+I/O, starts no goroutines, does no logging, and is **not constructed or
+called anywhere in `cmd/gateway`, `firewall.Gate`, or
+`masking.Transformer`**. It exists purely so the connection-state
+machinery a later stage needs (pending-operation correlation, `Parse`
+policy evaluation, local rejection/`Sync` recovery — see the design
+document's "Implementation decomposition") can be built and tested in
+isolation, without touching anything that affects a live connection today.
+
+**Extended Query is still rejected fail-closed at runtime, exactly as
+before.** Nothing described in this section changes `firewall.Gate`'s
+behavior: `isExtendedProtocolMessage` still rejects every `Parse`/`Bind`/
+`Describe`/`Execute`/`Close`/`Flush`/`Sync` message before any policy
+decision, unconditionally. Building `protocol.State` does not change
+anything described elsewhere in this document — it remains a groundwork
+data structure for a future stage, not a currently supported feature.
+
 ## SSLRequest / GSSENCRequest rejection
 
 SentinelDB always answers `SSLRequest` and `GSSENCRequest` with a single

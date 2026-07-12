@@ -296,6 +296,29 @@ mutation. All per-cycle bookkeeping (block state, tombstones) is released
 the moment that cycle's matching `ReadyForQuery` is processed, regardless
 of how many other cycles remain outstanding.
 
+**Abandoned-operation tombstone capacity is a correctness limit, not a
+best-effort cache.** When a real backend `ErrorResponse` abandons later
+same-cycle operations, every abandoned operation that has no
+already-registered plan unit to remove directly *requires* a tombstone
+(otherwise a later, contract-violating `AddForwardedOperation` call for
+that same operation ID could be wrongly accepted as live). The sequencer
+computes the complete set of newly required tombstones *before* mutating
+anything and only ever applies the transition atomically: if the full set
+fits within `SequencerLimits.MaxAbandonedTombstones`, every tombstone is
+recorded, the abandoned plan units are removed, and same-cycle synthetic
+units are suppressed, all at once; if it does not fit, **zero** mutation
+is applied for that failure — live tombstones are never silently evicted
+and a partial tombstone set is never recorded. Instead, the real
+`ErrorResponse` is relayed exactly once, `ActionTerminateConnection` is
+returned immediately after it, and the sequencer transitions permanently
+to its terminal state (`ErrSequencerTerminal` for every subsequent
+`AddForwardedOperation`/`AddSyntheticError`/`HandleBackendMessage` call).
+This is a resource-exhaustion fail-closed connection termination, exactly
+like the "no pending operation at all" connection-level `ErrorResponse`
+case above — retaining incomplete abandonment-tracking state and
+continuing as if the sequencer were still fully correct is never an
+option.
+
 **None of this is wired into runtime networking or client output.**
 `ResponseSequencer` is not constructed or called anywhere in
 `cmd/gateway`, `firewall.Gate`, or `masking.Transformer`. Extended Query

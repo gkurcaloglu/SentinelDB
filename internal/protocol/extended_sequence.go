@@ -434,8 +434,18 @@ func (s *ResponseSequencer) applyCorrelationResult(m Message, res CorrelationRes
 		s.finishCycle(res.CompletedCycleID)
 
 	case res.IsErrorResponse:
-		s.popPlanHeadIfMatches(res.OperationID)
-		s.applyRealFailure(res)
+		if !s.applyRealFailure(res) {
+			// Tombstone kapasitesi bu terk-edilme kumesinin tamamini
+			// karsilayamiyor: eksik dogruluk durumuyla normal calismaya
+			// devam etmek fail-closed garantisini ihlal eder. Gercek
+			// ErrorResponse (yukarida zaten eklendi) TAM OLARAK BIR KEZ
+			// iletilir, sequencer kalici olarak sonlandirma durumuna
+			// gecer ve baska hicbir sey (baska cycle'lardan drain dahil)
+			// yayinlanmaz - bu bir kaynak-tukenmesi fail-closed baglanti
+			// sonlandirmasidir.
+			s.terminal = true
+			return append(actions, OutputAction{Kind: ActionTerminateConnection})
+		}
 
 	case res.OperationCompleted:
 		s.popPlanHeadIfMatches(res.OperationID)
@@ -462,26 +472,53 @@ func (s *ResponseSequencer) popPlanHeadIfMatches(opID PendingOperationID) {
 
 // applyRealFailure, gercek bir backend ErrorResponse'unun ayni cycle
 // icindeki daha sonraki islemleri terk ettirdigi (abandon) durumu
-// sequencer tarafinda yansitir: kuyrukta zaten bekleyen terk edilmis
-// birimler cikti uretmeden kaldirilir, henuz kaydedilmemis olanlar
-// tombstone'lanir (boylece gec gelen AddForwardedOperation cagrisi
-// reddedilir) ve ayni cycle icin kuyrukta bekleyen sentetik birimler
-// gercek hata onceligiyle bastirilir (hic yayinlanmaz).
-func (s *ResponseSequencer) applyRealFailure(res CorrelationResult) {
+// sequencer tarafinda atomik olarak yansitir. Tombstone kapasitesi bir
+// dogruluk (correctness) siniridir, en-iyi-caba (best-effort) bir onbellek
+// DEGILDIR: eksik terk-edilmis-islem izlemesiyle normal calismaya devam
+// etmek, gec gelen bir AddForwardedOperation cagrisinin zaten terk
+// edilmis bir islemi canliymis gibi yanlislikla kabul etmesine izin
+// verebilir - bu, fail-closed garantisini ihlal eder.
+//
+// Once, HICBIR SEY MUTASYONA UGRATILMADAN, kac YENI tombstone
+// gerekecegi hesaplanir (zaten kuyrukta bekleyen bir plan birimi olan
+// terk edilmis islemler dogrudan kaldirilir, tombstone gerektirmez).
+// Bu gereksinim s.limits.MaxAbandonedTombstones'u asarsa, HICBIR
+// mutasyon uygulanmadan false donulur - cagiran, sequencer'i kalici
+// sonlandirma durumuna gecirmekten sorumludur (bkz. applyCorrelationResult).
+// Yalnizca tam tombstone gereksinimi sigarsa, tam gecis atomik olarak
+// uygulanir: basarisiz islemin kendi plan birimi kaldirilir, zaten
+// kuyruktaki terk edilmis birimler kaldirilir, ayni cycle'daki bekleyen
+// sentetik birimler bastirilir ve gereken her tombstone kaydedilir.
+func (s *ResponseSequencer) applyRealFailure(res CorrelationResult) bool {
 	cycle := res.FailedOperation.Cycle
-	s.blockedCycles[cycle] = true
-	s.reallyFailed[cycle] = true
 
 	abandonedIDs := make(map[PendingOperationID]bool, len(res.AbandonedOperations))
 	for _, ab := range res.AbandonedOperations {
 		abandonedIDs[ab.ID] = true
 	}
 
+	// Salt-okunur asama: hangi terk edilmis kimliklerin zaten kuyrukta
+	// bir plan birimi YOK (bu yuzden YENI bir tombstone gerektirir) -
+	// hicbir sey mutasyona ugratilmadan belirlenir.
+	needsTombstone := make(map[PendingOperationID]bool, len(abandonedIDs))
+	for id := range abandonedIDs {
+		if _, queued := s.planIndex[id]; !queued {
+			needsTombstone[id] = true
+		}
+	}
+	if len(s.abandonedOps)+len(needsTombstone) > s.limits.MaxAbandonedTombstones {
+		return false // kapasite yetersiz: hicbir mutasyon uygulanmadi
+	}
+
+	// Kapasite yeterli dogrulandi - tam gecisi uygula.
+	s.popPlanHeadIfMatches(res.OperationID)
+	s.blockedCycles[cycle] = true
+	s.reallyFailed[cycle] = true
+
 	remaining := s.plan[:0:0]
 	for _, unit := range s.plan {
 		if unit.kind == PlanUnitForwardedOperation && abandonedIDs[unit.opID] {
 			delete(s.planIndex, unit.opID)
-			delete(abandonedIDs, unit.opID)
 			continue
 		}
 		if unit.kind == PlanUnitSyntheticError && unit.cycle == cycle {
@@ -491,16 +528,14 @@ func (s *ResponseSequencer) applyRealFailure(res CorrelationResult) {
 	}
 	s.plan = remaining
 
-	for id := range abandonedIDs {
-		if len(s.abandonedOps) >= s.limits.MaxAbandonedTombstones {
-			break
-		}
+	for id := range needsTombstone {
 		s.abandonedOps[id] = true
 		if s.cycleTombstones[cycle] == nil {
 			s.cycleTombstones[cycle] = make(map[PendingOperationID]bool)
 		}
 		s.cycleTombstones[cycle][id] = true
 	}
+	return true
 }
 
 // finishCycle, bir cycle'in ReadyForQuery ile basariyla tamamlanmasinin

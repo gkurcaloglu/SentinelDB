@@ -663,7 +663,165 @@ func TestSequencer_Limits_MaxActiveCycles_Enforced(t *testing.T) {
 	}
 }
 
-func TestSequencer_Limits_MaxAbandonedTombstones_NeverExceeded(t *testing.T) {
+// --- Tombstone-capacity exhaustion: fail-closed connection termination ---
+//
+// Tombstone capacity is a CORRECTNESS limit, not a best-effort cache: the
+// sequencer must never continue normal operation with an incomplete
+// abandoned-operation tombstone set (bkz. gereksinim: "Remove best-effort
+// tombstone behavior"). If the full set of NEWLY required tombstones for a
+// real ErrorResponse's abandoned operations does not fit within
+// SequencerLimits.MaxAbandonedTombstones, the sequencer applies ZERO
+// mutation for that failure, relays the real ErrorResponse exactly once,
+// emits ActionTerminateConnection, and transitions permanently to the
+// terminal state - a resource-exhaustion fail-closed connection
+// termination, not a silently-degraded live sequencer.
+
+// setupTombstoneScenario builds a registered, failing head Parse
+// operation, then n later same-cycle Parse operations deliberately left
+// UNREGISTERED with the sequencer (so each requires its own brand-new
+// tombstone once abandoned), then a registered Sync for the same cycle.
+// It does not itself trigger the ErrorResponse.
+func setupTombstoneScenario(t *testing.T, maxTombstones, n int) (*ResponseSequencer, PendingOperation, []PendingOperation) {
+	t.Helper()
+	s := NewState()
+	limits := DefaultSequencerLimits()
+	limits.MaxAbandonedTombstones = maxTombstones
+	seq, err := NewResponseSequencer(s, limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	failOp, _, _ := s.CreateParse("s0", "SELECT bad", nil)
+	if _, err := seq.AddForwardedOperation(failOp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	later := make([]PendingOperation, n)
+	for i := 0; i < n; i++ {
+		op, _, _ := s.CreateParse(fmt.Sprintf("s%d", i+1), "SELECT x", nil)
+		later[i] = op // deliberately NOT registered with the sequencer
+	}
+	syncOp, _ := s.CreateSync()
+	if _, err := seq.AddForwardedOperation(syncOp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return seq, failOp, later
+}
+
+func TestSequencer_TombstoneCapacity_ExactlyEnough_SucceedsNormally(t *testing.T) {
+	seq, _, later := setupTombstoneScenario(t, 2, 2)
+	actions, err := seq.HandleBackendMessage(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 || actions[0].Kind != ActionEmitBackendFrame {
+		t.Fatalf("expected only the real error frame relayed, got %+v", actions)
+	}
+	if seq.terminal {
+		t.Fatal("expected the sequencer to remain non-terminal with exactly sufficient capacity")
+	}
+	for _, op := range later {
+		if !seq.abandonedOps[op.ID] {
+			t.Fatalf("expected operation %d tombstoned", op.ID)
+		}
+	}
+	if _, err := seq.HandleBackendMessage(rfqMsg(TxStatusIdle)); err != nil {
+		t.Fatalf("unexpected error completing the still-pending Sync: %v", err)
+	}
+}
+
+func TestSequencer_TombstoneCapacity_MoreThanNeeded_SucceedsNormally(t *testing.T) {
+	seq, _, later := setupTombstoneScenario(t, 5, 2)
+	actions, err := seq.HandleBackendMessage(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("unexpected actions: %+v", actions)
+	}
+	if seq.terminal {
+		t.Fatal("expected the sequencer to remain non-terminal with ample spare capacity")
+	}
+	for _, op := range later {
+		if !seq.abandonedOps[op.ID] {
+			t.Fatalf("expected operation %d tombstoned", op.ID)
+		}
+	}
+}
+
+func TestSequencer_TombstoneCapacity_OneOverLimit_TriggersTerminal(t *testing.T) {
+	seq, _, _ := setupTombstoneScenario(t, 1, 2)
+	actions, err := seq.HandleBackendMessage(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 2 {
+		t.Fatalf("expected exactly 2 actions (emit real error + terminate), got %+v", actions)
+	}
+	if actions[0].Kind != ActionEmitBackendFrame || actions[0].Synthetic {
+		t.Fatalf("expected the first action to relay the real ErrorResponse: %+v", actions[0])
+	}
+	if actions[1].Kind != ActionTerminateConnection {
+		t.Fatalf("expected the second action to terminate the connection: %+v", actions[1])
+	}
+	if !seq.terminal {
+		t.Fatal("expected the sequencer to be terminal after tombstone-capacity exhaustion")
+	}
+}
+
+func TestSequencer_TombstoneCapacity_MultipleOverLimit_TriggersTerminal(t *testing.T) {
+	seq, _, _ := setupTombstoneScenario(t, 1, 5)
+	actions, err := seq.HandleBackendMessage(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 2 {
+		t.Fatalf("expected exactly 2 actions (emit real error + terminate), got %+v", actions)
+	}
+	if actions[1].Kind != ActionTerminateConnection {
+		t.Fatalf("expected termination: %+v", actions[1])
+	}
+	if !seq.terminal {
+		t.Fatal("expected the sequencer to be terminal after tombstone-capacity exhaustion")
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_RealErrorEmittedExactlyOnce(t *testing.T) {
+	seq, _, _ := setupTombstoneScenario(t, 1, 3)
+	msg := minimalErrorResponse()
+	actions, err := seq.HandleBackendMessage(msg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	emitCount := 0
+	for _, a := range actions {
+		if a.Kind == ActionEmitBackendFrame {
+			emitCount++
+			if !bytes.Equal(a.Bytes, msg.Raw) {
+				t.Fatalf("expected the relayed bytes to match the real ErrorResponse frame")
+			}
+		}
+	}
+	if emitCount != 1 {
+		t.Fatalf("expected exactly one relayed ErrorResponse action, got %d in %+v", emitCount, actions)
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_NoSyntheticOrReadyForQueryEmitted(t *testing.T) {
+	seq, _, _ := setupTombstoneScenario(t, 1, 3)
+	actions, err := seq.HandleBackendMessage(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, a := range actions {
+		if a.Synthetic || a.Kind == ActionEmitSyntheticFrame {
+			t.Fatalf("expected no synthetic action ever emitted on exhaustion, got %+v", actions)
+		}
+		if a.MessageType == MsgReadyForQuery {
+			t.Fatalf("expected no fabricated ReadyForQuery, got %+v", actions)
+		}
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_QueuedSyntheticSameCycleNeverEmitted(t *testing.T) {
 	s := NewState()
 	limits := DefaultSequencerLimits()
 	limits.MaxAbandonedTombstones = 1
@@ -675,14 +833,187 @@ func TestSequencer_Limits_MaxAbandonedTombstones_NeverExceeded(t *testing.T) {
 	if _, err := seq.AddForwardedOperation(failOp); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	s.CreateParse("s1", "SELECT 1", nil) // unregistered, will be abandoned
-	s.CreateParse("s2", "SELECT 2", nil) // unregistered, will be abandoned
+	s.CreateParse("s1", "SELECT 1", nil) // unregistered abandoned #1
+	s.CreateParse("s2", "SELECT 2", nil) // unregistered abandoned #2 -> exceeds capacity of 1
+	if _, err := seq.AddSyntheticError(failOp.Cycle, minimalErrorResponse().Raw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
+	actions, err := seq.HandleBackendMessage(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, a := range actions {
+		if a.Synthetic {
+			t.Fatalf("expected the queued same-cycle synthetic to never be emitted, got %+v", actions)
+		}
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_LaterBackendOutputRejectedAfterTerminal(t *testing.T) {
+	seq, _, _ := setupTombstoneScenario(t, 1, 2)
 	if _, err := seq.HandleBackendMessage(minimalErrorResponse()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(seq.abandonedOps) > limits.MaxAbandonedTombstones {
-		t.Fatalf("expected at most %d tombstones, got %d", limits.MaxAbandonedTombstones, len(seq.abandonedOps))
+	if _, err := seq.HandleBackendMessage(backendMsg(MsgParameterStatus, []byte{'k', 0, 'v', 0})); !errors.Is(err, ErrSequencerTerminal) {
+		t.Fatalf("expected ErrSequencerTerminal for later backend output, got %v", err)
+	}
+	if _, err := seq.HandleBackendMessage(rfqMsg(TxStatusIdle)); !errors.Is(err, ErrSequencerTerminal) {
+		t.Fatalf("expected ErrSequencerTerminal for a later cycle's ReadyForQuery, got %v", err)
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_LaterAddForwardedOperationRejected(t *testing.T) {
+	s := NewState()
+	limits := DefaultSequencerLimits()
+	limits.MaxAbandonedTombstones = 1
+	seq, err := NewResponseSequencer(s, limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	failOp, _, _ := s.CreateParse("s0", "SELECT bad", nil)
+	seq.AddForwardedOperation(failOp)
+	s.CreateParse("s1", "SELECT 1", nil)
+	s.CreateParse("s2", "SELECT 2", nil)
+	if _, err := seq.HandleBackendMessage(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	op, _, _ := s.CreateParse("sX", "SELECT x", nil)
+	if _, err := seq.AddForwardedOperation(op); !errors.Is(err, ErrSequencerTerminal) {
+		t.Fatalf("expected ErrSequencerTerminal, got %v", err)
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_LaterAddSyntheticErrorRejected(t *testing.T) {
+	seq, _, _ := setupTombstoneScenario(t, 1, 2)
+	if _, err := seq.HandleBackendMessage(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := seq.AddSyntheticError(CycleID(999), minimalErrorResponse().Raw); !errors.Is(err, ErrSequencerTerminal) {
+		t.Fatalf("expected ErrSequencerTerminal, got %v", err)
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_LaterHandleBackendMessageRejected(t *testing.T) {
+	seq, _, _ := setupTombstoneScenario(t, 1, 2)
+	if _, err := seq.HandleBackendMessage(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := seq.HandleBackendMessage(emptyBackendMsg(MsgParseComplete)); !errors.Is(err, ErrSequencerTerminal) {
+		t.Fatalf("expected ErrSequencerTerminal, got %v", err)
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_NoPartialTombstoneSetObservable(t *testing.T) {
+	seq, failOp, later := setupTombstoneScenario(t, 1, 3)
+	if _, err := seq.HandleBackendMessage(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(seq.abandonedOps) != 0 {
+		t.Fatalf("expected zero tombstones recorded (all-or-nothing), got %d: %+v", len(seq.abandonedOps), seq.abandonedOps)
+	}
+	if len(seq.cycleTombstones) != 0 {
+		t.Fatalf("expected no per-cycle tombstone bookkeeping recorded, got %+v", seq.cycleTombstones)
+	}
+	for _, op := range later {
+		if seq.abandonedOps[op.ID] {
+			t.Fatalf("expected operation %d NOT tombstoned (all-or-nothing failure)", op.ID)
+		}
+	}
+	// Active-cycle metadata for the failed cycle must also be untouched
+	// (bkz. gereksinim: "do not partially ... alter active-cycle
+	// metadata") - no mutation at all was applied for this failure.
+	if seq.blockedCycles[failOp.Cycle] {
+		t.Fatal("expected the cycle block state to remain untouched on exhaustion (zero mutation applied)")
+	}
+	if seq.reallyFailed[failOp.Cycle] {
+		t.Fatal("expected reallyFailed to remain untouched on exhaustion (zero mutation applied)")
+	}
+}
+
+func TestSequencer_TombstoneCapacity_SufficientCapacity_LaterCyclesStillWorkNormally(t *testing.T) {
+	s := NewState()
+	limits := DefaultSequencerLimits()
+	limits.MaxAbandonedTombstones = 2
+	seq, err := NewResponseSequencer(s, limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	failOp, _, _ := s.CreateParse("s0", "SELECT bad", nil)
+	seq.AddForwardedOperation(failOp)
+	s.CreateParse("s1", "SELECT 1", nil) // unregistered, abandoned -> 1 tombstone
+	syncOp, _ := s.CreateSync()
+	if _, err := seq.AddForwardedOperation(syncOp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := seq.HandleBackendMessage(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if seq.terminal {
+		t.Fatal("expected the sequencer to remain usable with sufficient capacity")
+	}
+	if _, err := seq.HandleBackendMessage(rfqMsg(TxStatusIdle)); err != nil {
+		t.Fatalf("unexpected error completing the failed cycle's Sync: %v", err)
+	}
+
+	// A later, independent, unrelated cycle must work entirely normally.
+	nextOp, _, _ := s.CreateParse("s2", "SELECT 2", nil)
+	if _, err := seq.AddForwardedOperation(nextOp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	actions, err := seq.HandleBackendMessage(emptyBackendMsg(MsgParseComplete))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("unexpected actions: %+v", actions)
+	}
+}
+
+func TestSequencer_TombstoneExhaustion_NoNamesSQLParamsOrServerValuesLeaked(t *testing.T) {
+	s := NewState()
+	limits := DefaultSequencerLimits()
+	limits.MaxAbandonedTombstones = 1
+	seq, err := NewResponseSequencer(s, limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const secretStmt = "SECRET_TOMBSTONE_STMT_MARKER"
+	const secretSQL = "SECRET_TOMBSTONE_SQL_MARKER"
+	const secretServerText = "SECRET_TOMBSTONE_SERVER_TEXT_MARKER"
+
+	failOp, _, _ := s.CreateParse(secretStmt, "SELECT bad -- "+secretSQL, nil)
+	if _, err := seq.AddForwardedOperation(failOp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s.CreateParse("s1", "SELECT 1 -- "+secretSQL, nil)
+	s.CreateParse("s2", "SELECT 2 -- "+secretSQL, nil)
+
+	actions, err := seq.HandleBackendMessage(fieldedErrorResponse(secretServerText))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err != nil {
+		v := err.Error()
+		if strings.Contains(v, secretStmt) || strings.Contains(v, secretSQL) {
+			t.Fatalf("error text leaked a marker: %s", v)
+		}
+	}
+	// The relayed real-error frame legitimately carries the server's own
+	// ErrorResponse text (that IS the frame being relayed) - but no
+	// sequencer-internal metadata (Kind/MessageType/CycleID/OperationID/
+	// OperationKind) may ever carry a client-supplied name or SQL text,
+	// and internal tombstone/plan state must never retain one either.
+	for _, a := range actions {
+		meta := fmt.Sprintf("Kind=%v MessageType=%v CycleID=%v OperationID=%v OperationKind=%v Synthetic=%v", a.Kind, a.MessageType, a.CycleID, a.OperationID, a.OperationKind, a.Synthetic)
+		if strings.Contains(meta, secretStmt) || strings.Contains(meta, secretSQL) {
+			t.Fatalf("action metadata leaked a marker: %s", meta)
+		}
+	}
+	internalDump := fmt.Sprintf("%+v %+v %+v", seq.abandonedOps, seq.plan, seq.cycleTombstones)
+	if strings.Contains(internalDump, secretStmt) || strings.Contains(internalDump, secretSQL) {
+		t.Fatalf("internal sequencer state leaked a name/SQL marker: %s", internalDump)
 	}
 }
 
@@ -840,7 +1171,18 @@ func FuzzResponseSequencer(f *testing.F) {
 		}()
 
 		s := NewState()
-		seq, err := NewResponseSequencer(s, DefaultSequencerLimits())
+		limits := DefaultSequencerLimits()
+		// Deliberately small tombstone capacity, so a real ErrorResponse's
+		// abandonment set very frequently exceeds it during fuzzing -
+		// this stress-tests the fail-closed exhaustion path (bkz.
+		// gereksinim: "Extend FuzzResponseSequencer with very small
+		// tombstone limits").
+		if b, ok := r0Peek(data); ok {
+			limits.MaxAbandonedTombstones = int(b)%4 + 1 // 1..4
+		} else {
+			limits.MaxAbandonedTombstones = 2
+		}
+		seq, err := NewResponseSequencer(s, limits)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -867,6 +1209,33 @@ func FuzzResponseSequencer(f *testing.F) {
 				t.Fatalf("action leaked a client-supplied name marker: %s", dump)
 			}
 		}
+		// checkTerminationBatchShape asserts that whenever a returned
+		// action batch contains ActionTerminateConnection, it is the
+		// LAST action, and the ENTIRE batch is exactly [one real
+		// ErrorResponse relay, terminate] - never more than one relayed
+		// frame, never a synthetic frame, never anything after
+		// termination (bkz. gereksinim: "terminal transition emits at
+		// most one real ErrorResponse and one terminate action").
+		checkTerminationBatchShape := func(actions []OutputAction) {
+			hasTerminate := false
+			for i, a := range actions {
+				if a.Kind == ActionTerminateConnection {
+					hasTerminate = true
+					if i != len(actions)-1 {
+						t.Fatalf("ActionTerminateConnection must be the final action in its batch: %+v", actions)
+					}
+				}
+			}
+			if !hasTerminate {
+				return
+			}
+			if len(actions) != 2 {
+				t.Fatalf("expected exactly 2 actions in a terminating batch (emit + terminate), got %+v", actions)
+			}
+			if actions[0].Kind != ActionEmitBackendFrame || actions[0].Synthetic {
+				t.Fatalf("expected the action preceding termination to be exactly one real backend frame: %+v", actions)
+			}
+		}
 
 		registerIfCreated := func(op PendingOperation, createErr error) {
 			if createErr != nil {
@@ -882,6 +1251,8 @@ func FuzzResponseSequencer(f *testing.F) {
 			if !ok {
 				break
 			}
+			var actions []OutputAction
+			var callErr error
 			switch int(opb) % 14 {
 			case 0:
 				i, ok := r.pick(len(stmtNames))
@@ -941,13 +1312,9 @@ func FuzzResponseSequencer(f *testing.F) {
 				if !ok {
 					continue
 				}
-				actions, err := seq.HandleBackendMessage(correctTerminalFor(head.Kind))
-				checkErrNoMarkers(err)
-				checkActionsNoNameMarkers(actions)
+				actions, callErr = seq.HandleBackendMessage(correctTerminalFor(head.Kind))
 			case 9: // real ErrorResponse against the current head (or connection-level)
-				actions, err := seq.HandleBackendMessage(fieldedErrorResponse(bodyMarker))
-				checkErrNoMarkers(err)
-				checkActionsNoNameMarkers(actions)
+				actions, callErr = seq.HandleBackendMessage(fieldedErrorResponse(bodyMarker))
 			case 10: // asynchronous message, valid or malformed
 				b, ok := r.next()
 				if !ok {
@@ -964,27 +1331,21 @@ func FuzzResponseSequencer(f *testing.F) {
 				case MsgNotificationResponse:
 					body = append([]byte{0, 0, 0, 1}, append([]byte(bodyMarker), 0, 'p', 0)...)
 				}
-				actions, err := seq.HandleBackendMessage(backendMsg(mt, body))
-				checkErrNoMarkers(err)
-				checkActionsNoNameMarkers(actions)
+				actions, callErr = seq.HandleBackendMessage(backendMsg(mt, body))
 			case 11: // ReadyForQuery with a random (possibly invalid) status
 				b, ok := r.next()
 				if !ok {
 					continue
 				}
 				statuses := []byte{TxStatusIdle, TxStatusInTransaction, TxStatusFailedTransaction, 'X'}
-				actions, err := seq.HandleBackendMessage(rfqMsg(statuses[int(b)%len(statuses)]))
-				checkErrNoMarkers(err)
-				checkActionsNoNameMarkers(actions)
+				actions, callErr = seq.HandleBackendMessage(rfqMsg(statuses[int(b)%len(statuses)]))
 			case 12: // AddSyntheticError against a small, plausible cycle number
 				b, ok := r.next()
 				if !ok {
 					continue
 				}
 				cycle := CycleID(int(b)%5 + 1)
-				actions, err := seq.AddSyntheticError(cycle, fieldedErrorResponse(bodyMarker).Raw)
-				checkErrNoMarkers(err)
-				checkActionsNoNameMarkers(actions)
+				actions, callErr = seq.AddSyntheticError(cycle, fieldedErrorResponse(bodyMarker).Raw)
 			case 13: // malformed random-body message against a random type
 				b1, ok1 := r.next()
 				n, ok2 := r.pick(4)
@@ -1006,15 +1367,22 @@ func FuzzResponseSequencer(f *testing.F) {
 					MsgCommandComplete, MsgErrorResponse,
 				}
 				mt := allTypes[int(b1)%len(allTypes)]
-				actions, err := seq.HandleBackendMessage(backendMsg(mt, body))
-				checkErrNoMarkers(err)
-				checkActionsNoNameMarkers(actions)
+				actions, callErr = seq.HandleBackendMessage(backendMsg(mt, body))
 			}
+
+			checkErrNoMarkers(callErr)
+			checkActionsNoNameMarkers(actions)
+			checkTerminationBatchShape(actions)
 
 			checkStructuralInvariants(t, s)
 			if len(seq.plan) > 0 && seq.plan[0].kind == PlanUnitSyntheticError {
 				t.Fatalf("invariant violated: a synthetic unit was left at the plan head after settling")
 			}
+			// Tombstone capacity is a correctness limit: it must never be
+			// exceeded, AND (since exhaustion now fails closed atomically
+			// rather than best-effort) the sequencer must never be left
+			// non-terminal with an incomplete tombstone set for an
+			// already-processed real failure.
 			if len(seq.abandonedOps) > seq.limits.MaxAbandonedTombstones {
 				t.Fatalf("tombstone limit exceeded: %d > %d", len(seq.abandonedOps), seq.limits.MaxAbandonedTombstones)
 			}
@@ -1022,11 +1390,29 @@ func FuzzResponseSequencer(f *testing.F) {
 				t.Fatalf("plan queue limit exceeded: %d > %d", len(seq.plan), seq.limits.MaxPlanUnits)
 			}
 			if seq.terminal {
+				// No further output of any kind may ever occur once
+				// terminal - every entry point must reject uniformly.
 				if _, err := seq.HandleBackendMessage(emptyBackendMsg(MsgParseComplete)); !errors.Is(err, ErrSequencerTerminal) {
 					t.Fatalf("expected ErrSequencerTerminal once terminal, got %v", err)
+				}
+				if out, err := seq.AddForwardedOperation(PendingOperation{ID: 1, Kind: OpParse, Cycle: 1}); !errors.Is(err, ErrSequencerTerminal) || out != nil {
+					t.Fatalf("expected ErrSequencerTerminal with no output for AddForwardedOperation once terminal, got out=%+v err=%v", out, err)
+				}
+				if out, err := seq.AddSyntheticError(CycleID(1), minimalErrorResponse().Raw); !errors.Is(err, ErrSequencerTerminal) || out != nil {
+					t.Fatalf("expected ErrSequencerTerminal with no output for AddSyntheticError once terminal, got out=%+v err=%v", out, err)
 				}
 				terminated = true
 			}
 		}
 	})
+}
+
+// r0Peek returns the first byte of data without consuming it, used only
+// to seed a fuzz iteration's tombstone-capacity limit deterministically
+// from the input.
+func r0Peek(data []byte) (byte, bool) {
+	if len(data) == 0 {
+		return 0, false
+	}
+	return data[0], true
 }

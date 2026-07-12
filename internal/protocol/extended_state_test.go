@@ -207,6 +207,11 @@ func FuzzExtendedStateSequence(f *testing.F) {
 					case OpSync:
 						if cyc, err := s.ApplyReadyForQuery(TxStatusIdle); err == nil {
 							trackCycle(cyc)
+							for id, p := range s.portals {
+								if p.CreatedCycle <= cyc {
+									t.Fatalf("ReadyForQuery('I') for cycle %d left portal %d with CreatedCycle %d (<= completed cycle)", cyc, id, p.CreatedCycle)
+								}
+							}
 						}
 					}
 				case 1:
@@ -256,13 +261,19 @@ func FuzzExtendedStateSequence(f *testing.F) {
 					continue
 				}
 				status := statuses[i]
-				before := s.PortalCount()
-				_ = before
 				cyc, err := s.ApplyReadyForQuery(status)
 				if err == nil {
 					trackCycle(cyc)
-					if status == TxStatusIdle && s.PortalCount() != 0 {
-						t.Fatalf("ReadyForQuery('I') left %d live portals", s.PortalCount())
+					if status == TxStatusIdle {
+						// Corrected invariant: ReadyForQuery('I') leaves no
+						// portal whose CreatedCycle is <= the just-completed
+						// cycle - but portals from later, already-pipelined
+						// (outstanding) cycles may legitimately remain.
+						for id, p := range s.portals {
+							if p.CreatedCycle <= cyc {
+								t.Fatalf("ReadyForQuery('I') for cycle %d left portal %d with CreatedCycle %d (<= completed cycle)", cyc, id, p.CreatedCycle)
+							}
+						}
 					}
 				}
 			case 10: // ApplyAllowedSimpleQuery
@@ -283,7 +294,13 @@ func FuzzExtendedStateSequence(f *testing.F) {
 				if !ok {
 					continue
 				}
-				s.ApplyReadyForQuery(b)
+				if cyc, err := s.ApplyReadyForQuery(b); err == nil && b == TxStatusIdle {
+					for id, p := range s.portals {
+						if p.CreatedCycle <= cyc {
+							t.Fatalf("ReadyForQuery('I') for cycle %d left portal %d with CreatedCycle %d (<= completed cycle)", cyc, id, p.CreatedCycle)
+						}
+					}
+				}
 			}
 			checkStructuralInvariants(t, s)
 		}
@@ -1004,6 +1021,203 @@ func TestState_ReadyForQuery_IToI_StillInvalidates(t *testing.T) {
 	}
 	if _, ok := s.CommittedPortal("p1"); ok {
 		t.Fatal("expected I -> I to still invalidate the portal bound during the implicit transaction")
+	}
+}
+
+// --- ReadyForQuery cycle-scoping tests -------------------------------
+//
+// These prove the corrected rule: ReadyForQuery('I') only removes portals
+// whose CreatedCycle is <= the cycle it just completed - never portals from
+// a later, already-pipelined cycle merely because they happen to already
+// exist in local state (bkz. duzeltme notu, ApplyReadyForQuery).
+
+func TestState_ReadyForQuery_I_RemovesPortalFromCompletedCycle(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop1, _, _ := s.CreateBind("portal_1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop1.ID)
+	syncOp1, _ := s.CreateSync() // closes cycle 1
+	cycle1 := syncOp1.Cycle
+
+	completed, err := s.ApplyReadyForQuery(TxStatusIdle)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if completed != cycle1 {
+		t.Fatalf("expected cycle %d to complete, got %d", cycle1, completed)
+	}
+	if _, ok := s.CommittedPortal("portal_1"); ok {
+		t.Fatal("expected portal created in the completed cycle to be removed")
+	}
+}
+
+func TestState_ReadyForQuery_I_PreservesPendingLaterCyclePortal(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	// Cycle 1: bind + execute portal_1, then Sync.
+	bop1, _, _ := s.CreateBind("portal_1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop1.ID)
+	eop1, _ := s.CreateExecute("portal_1")
+	s.CompleteOperation(eop1.ID)
+	s.CreateSync() // closes cycle 1, cycle 2 begins
+
+	// Cycle 2: Bind portal_2 is pipelined (forwarded/registered locally)
+	// BEFORE cycle 1's ReadyForQuery has been observed - the exact race
+	// this fix addresses. Left pending (no BindComplete yet).
+	bop2, pgen2, err := s.CreateBind("portal_2", "s1", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Cycle 1's ReadyForQuery('I') arrives.
+	if _, err := s.ApplyReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := s.Portal(pgen2.ID); !ok {
+		t.Fatal("expected the pending Cycle 2 portal to survive Cycle 1's ReadyForQuery('I')")
+	}
+	_ = bop2
+}
+
+func TestState_ReadyForQuery_I_SurvivingLaterCyclePortalCanStillCommit(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop1, _, _ := s.CreateBind("portal_1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop1.ID)
+	eop1, _ := s.CreateExecute("portal_1")
+	s.CompleteOperation(eop1.ID)
+	s.CreateSync()
+
+	bop2, pgen2, _ := s.CreateBind("portal_2", "s1", nil, nil, nil)
+	if _, err := s.ApplyReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	committed, err := s.ApplyBindComplete(bop2.ID)
+	if err != nil {
+		t.Fatalf("expected the surviving Cycle 2 portal to still receive BindComplete normally: %v", err)
+	}
+	if committed.ID != pgen2.ID {
+		t.Fatalf("expected committed generation %d, got %d", pgen2.ID, committed.ID)
+	}
+	if _, ok := s.CommittedPortal("portal_2"); !ok {
+		t.Fatal("expected portal_2 to now be resolvable as committed")
+	}
+}
+
+func TestState_ReadyForQuery_I_LaterRemovesCycle2Portal(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop1, _, _ := s.CreateBind("portal_1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop1.ID)
+	eop1, _ := s.CreateExecute("portal_1")
+	s.CompleteOperation(eop1.ID)
+	s.CreateSync()
+
+	bop2, pgen2, _ := s.CreateBind("portal_2", "s1", nil, nil, nil)
+	s.ApplyReadyForQuery(TxStatusIdle) // completes cycle 1
+
+	s.ApplyBindComplete(bop2.ID)
+	eop2, _ := s.CreateExecute("portal_2")
+	s.CompleteOperation(eop2.ID)
+	syncOp2, _ := s.CreateSync() // closes cycle 2
+	cycle2 := syncOp2.Cycle
+
+	completed, err := s.ApplyReadyForQuery(TxStatusIdle)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if completed != cycle2 {
+		t.Fatalf("expected cycle %d to complete, got %d", cycle2, completed)
+	}
+	if _, ok := s.Portal(pgen2.ID); ok {
+		t.Fatal("expected Cycle 2's portal to be removed once Cycle 2's own ReadyForQuery('I') arrives")
+	}
+}
+
+// TestState_ReadyForQuery_I_RemovesOlderTransactionPortalAcrossCycles
+// dogrular: bir portal, eski bir (halen acik) explicit transaction
+// icinde ONCEKI bir cycle'da olusturulmus olsa bile - o transaction
+// nihayet SONRAKI bir cycle'in ReadyForQuery('I')'siyle kapandiginda -
+// dogru sekilde kaldirilir (yalnizca "tamamlanan cycle ile ayni cycle"
+// degil, o cycle'dan ONCEKI her cycle de kapsanir).
+func TestState_ReadyForQuery_I_RemovesOlderTransactionPortalAcrossCycles(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	// Cycle 1: bind portal_x inside what becomes a still-open explicit
+	// transaction (status 'T').
+	bop, pgen, _ := s.CreateBind("portal_x", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+	s.CreateSync()
+	if _, err := s.ApplyReadyForQuery(TxStatusInTransaction); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.Portal(pgen.ID); !ok {
+		t.Fatal("expected portal to survive while the transaction remains open (T)")
+	}
+
+	// Cycle 2: transaction remains open (T -> T), no new portal activity.
+	s.CreateSync()
+	if _, err := s.ApplyReadyForQuery(TxStatusInTransaction); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.Portal(pgen.ID); !ok {
+		t.Fatal("expected portal to still survive across a T -> T cycle")
+	}
+
+	// Cycle 3: the transaction finally ends (T -> I).
+	s.CreateSync()
+	if _, err := s.ApplyReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.Portal(pgen.ID); ok {
+		t.Fatal("expected the older portal (bound two cycles earlier) to be removed once its transaction finally ends")
+	}
+}
+
+func TestState_ReadyForQuery_StatementsSurviveAllStatuses(t *testing.T) {
+	for _, status := range []byte{TxStatusIdle, TxStatusInTransaction, TxStatusFailedTransaction} {
+		s := NewState()
+		sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+		s.ApplyParseComplete(sop.ID)
+		s.CreateSync()
+		if _, err := s.ApplyReadyForQuery(status); err != nil {
+			t.Fatalf("status %q: unexpected error: %v", status, err)
+		}
+		if _, ok := s.CommittedStatement("s1"); !ok {
+			t.Fatalf("status %q: expected prepared statement to survive", status)
+		}
+	}
+}
+
+func TestState_ReadyForQuery_I_NoDanglingPortalStatementReferences(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop1, _, _ := s.CreateBind("portal_1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop1.ID)
+	s.CreateSync()
+	bop2, pgen2, _ := s.CreateBind("portal_2", "s1", nil, nil, nil)
+
+	if _, err := s.ApplyReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s.ApplyBindComplete(bop2.ID)
+
+	got, ok := s.Portal(pgen2.ID)
+	if !ok {
+		t.Fatal("expected surviving portal to exist")
+	}
+	if _, ok := s.Statement(got.StatementID); !ok {
+		t.Fatal("expected surviving portal's referenced statement to still exist - no dangling reference")
 	}
 }
 

@@ -742,15 +742,24 @@ func (s *State) ApplyErrorResponse(id PendingOperationID) error {
 // olarak eslesir (bkz. docs/design/0001-extended-query.md, "Explicit
 // pipeline-cycle identities"). status YALNIZCA 'I'/'T'/'E' olabilir.
 //
-// status == 'I' ise TUM portal kayitlari (isimli ve isimsiz, pending ve
-// committed) kosulsuzca temizlenir; hazirlanmis deyimler (statements)
-// hicbir zaman bu sekilde temizlenmez.
+// status == 'I' ise, YALNIZCA CreatedCycle'i tamamlanan cycle'a ("completed
+// cycle") esit ya da ondan KUCUK olan portal kayitlari (isimli ve isimsiz,
+// pending ve committed) kaldirilir - bunlarin islem omru bu ReadyForQuery
+// sinirinda sona erer. CreatedCycle'i tamamlanan cycle'dan BUYUK olan
+// portal'lar (daha sonraki, halihazirda pipeline edilmis bir cycle'a ait)
+// KORUNUR - cunku onlarin kendi islemleri henuz bitmemistir (bkz. Duzeltme
+// notu asagida). Hazirlanmis deyimler (statements) hicbir zaman bu sekilde
+// kaldirilmaz.
 //
-// SINIRLAMA: bu, tasarim belgesinin literal kuralini ("cleared outright,
-// unconditionally") uygular. Cok derin pipelining altinda, KAPANAN cycle'in
-// Sync'inden SONRA (ama henuz onaylanmamis) olusturulmus bir portal da bu
-// temizlikte kaldirilir - bu, gercek zamanlama ile entegrasyonu latter bir
-// asamaya biraklan, bilinen bir sinirlamadir (bkz. final rapor).
+// DUZELTME: onceki bir revizyon burada TUM portal kayitlarini kosulsuzca
+// (cycle'a bakmaksizin) temizliyordu. Bu, birden fazla Sync-sinirli cycle
+// pipeline edildiginde GUVENSIZDI: cycle 2'nin bir portali (ör. Bind
+// portal_2), cycle 1'in ReadyForQuery'si daha donmeden yerel olarak zaten
+// kayitli olabilir - cycle 1'in ReadyForQuery('I')'si bu durumda cycle 2'ye
+// ait portal_2'yi de (sirf o an yerel state'te var oldugu icin) hatalicasina
+// silerdi. Duzeltilen kural, CreatedCycle degerini tamamlanan cycle ID'siyle
+// karsilastirarak yalnizca GERCEKTEN o sinirlanan islem omrune ait
+// portal'lari kaldirir.
 func (s *State) ApplyReadyForQuery(status byte) (CycleID, error) {
 	if status != TxStatusIdle && status != TxStatusInTransaction && status != TxStatusFailedTransaction {
 		return NoCycle, ErrInvalidTransactionStatus
@@ -772,12 +781,26 @@ func (s *State) ApplyReadyForQuery(status byte) (CycleID, error) {
 
 	s.txStatus = status
 	if status == TxStatusIdle {
-		s.portals = make(map[GenerationID]*PortalGeneration)
-		s.namedPortalCommitted = make(map[string]GenerationID)
-		s.unnamedPortalCurrent = NoGeneration
+		s.invalidatePortalsThroughCycle(completedCycle)
 	}
 	s.cleanup()
 	return completedCycle, nil
+}
+
+// invalidatePortalsThroughCycle, CreatedCycle'i "completedCycle" ya da ondan
+// ONCEKI (kucuk esit) olan her portal kaydini kaldirir - bu, o cycle'in
+// kapanmasiyla (ReadyForQuery('I')) sona eren islem omrune ait tum
+// portal'lari, ondan SONRAKI (daha buyuk CreatedCycle'a sahip) - halihazirda
+// pipeline edilmis, henuz kendi Sync/ReadyForQuery'sine ulasmamis - portal'lara
+// DOKUNMADAN kaldirir (bkz. ApplyReadyForQuery dokumantasyonu).
+func (s *State) invalidatePortalsThroughCycle(completedCycle CycleID) {
+	for id, p := range s.portals {
+		if p.CreatedCycle > completedCycle {
+			continue
+		}
+		s.detachPortalPointer(p)
+		delete(s.portals, id)
+	}
 }
 
 // TransactionStatus, en son ApplyReadyForQuery cagrisiyla bildirilen islem

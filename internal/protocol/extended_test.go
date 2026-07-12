@@ -3,6 +3,8 @@ package protocol
 import (
 	"encoding/binary"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 )
 
@@ -277,8 +279,12 @@ func TestParseFrontendBind_MultipleParameters(t *testing.T) {
 	}
 }
 
+// TestParseFrontendBind_ZeroFormatCodes, PostgreSQL'in kuralini dogrular:
+// paramFormatCount 0 ise, paramCount ne olursa olsun (burada birden fazla
+// parametre) her zaman gecerlidir - tum parametreler varsayilan metin
+// formatinda kabul edilir.
 func TestParseFrontendBind_ZeroFormatCodes(t *testing.T) {
-	params := []testBindParam{{value: []byte("x")}}
+	params := []testBindParam{{value: []byte("x")}, {value: []byte("y")}, {null: true}}
 	msg, err := ParseFrontendBind(buildBindPayload("", "", nil, params, nil))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -307,6 +313,44 @@ func TestParseFrontendBind_PerParameterFormatCodes(t *testing.T) {
 	}
 	if len(msg.ParamFormats) != 2 || msg.ParamFormats[0] != 0 || msg.ParamFormats[1] != 1 {
 		t.Fatalf("unexpected param formats: %+v", msg.ParamFormats)
+	}
+}
+
+// TestParseFrontendBind_OneFormatZeroParametersAccepted dogrular: gercek
+// sunucu kontrolu (bkz. backend/tcop/postgres.c, exec_bind_message)
+// paramFormatCount == 1 durumunu paramCount == 0 iken de kabul eder - tek
+// paylasilan kod, uygulanacagi hicbir parametre olmasa da gecerlidir.
+func TestParseFrontendBind_OneFormatZeroParametersAccepted(t *testing.T) {
+	msg, err := ParseFrontendBind(buildBindPayload("", "", []int16{1}, nil, nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msg.ParamFormats) != 1 || len(msg.Params) != 0 {
+		t.Fatalf("unexpected message: %+v", msg)
+	}
+}
+
+func TestParseFrontendBind_TwoFormatsOneParameterRejected(t *testing.T) {
+	params := []testBindParam{{value: []byte("x")}}
+	payload := buildBindPayload("", "", []int16{0, 1}, params, nil)
+	_, err := ParseFrontendBind(payload)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cat := extendedParseErrorCategory(t, err); cat != CategoryInvalidFormatCount {
+		t.Fatalf("expected CategoryInvalidFormatCount, got %v", cat)
+	}
+}
+
+func TestParseFrontendBind_ThreeFormatsTwoParametersRejected(t *testing.T) {
+	params := []testBindParam{{value: []byte("x")}, {value: []byte("y")}}
+	payload := buildBindPayload("", "", []int16{0, 1, 0}, params, nil)
+	_, err := ParseFrontendBind(payload)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cat := extendedParseErrorCategory(t, err); cat != CategoryInvalidFormatCount {
+		t.Fatalf("expected CategoryInvalidFormatCount, got %v", cat)
 	}
 }
 
@@ -509,13 +553,28 @@ func TestParseFrontendExecute_PositiveMaxRows(t *testing.T) {
 	}
 }
 
-func TestParseFrontendExecute_NegativeMaxRows(t *testing.T) {
-	_, err := ParseFrontendExecute(buildExecutePayload("", -1))
-	if err == nil {
-		t.Fatal("expected error")
+// TestParseFrontendExecute_NegativeOne dogrular: PostgreSQL'in kendisi
+// negatif maxRows degerlerini reddetmez, backend/tcop/pquery.c'deki
+// PortalRun mantigi `count <= 0` icin FETCH_ALL uygular - 0 ile ayni
+// davranis. Ayristirici bu yuzden -1'i kabul eder ve degeri oldugu gibi
+// korur; herhangi bir aralik daraltmasi yapmaz.
+func TestParseFrontendExecute_NegativeOne(t *testing.T) {
+	msg, err := ParseFrontendExecute(buildExecutePayload("", -1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if cat := extendedParseErrorCategory(t, err); cat != CategoryNegativeMaxRows {
-		t.Fatalf("expected CategoryNegativeMaxRows, got %v", cat)
+	if msg.MaxRows != -1 {
+		t.Fatalf("expected MaxRows -1, got %d", msg.MaxRows)
+	}
+}
+
+func TestParseFrontendExecute_MinInt32(t *testing.T) {
+	msg, err := ParseFrontendExecute(buildExecutePayload("", math.MinInt32))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.MaxRows != math.MinInt32 {
+		t.Fatalf("expected MaxRows %d, got %d", int32(math.MinInt32), msg.MaxRows)
 	}
 }
 
@@ -628,6 +687,45 @@ func TestParseFrontendSync_NonEmptyPayloadRejected(t *testing.T) {
 	}
 }
 
+// --- Error non-disclosure regression ------------------------------------
+//
+// ExtendedParseError only ever carries a message name and a fixed category
+// (see extended.go doc comment on ExtendedParseError) - it must never embed
+// the SQL text or parameter bytes that were being parsed when validation
+// failed, even after those values were fully read into memory. These tests
+// force a failure (trailing garbage) *after* a recognizable secret marker
+// has already been consumed, then assert the marker never appears in the
+// error text.
+
+func TestParseFrontendParse_ErrorNeverDisclosesSQLText(t *testing.T) {
+	const secret = "SECRET_SQL_MARKER_DO_NOT_LEAK"
+	// Trailing garbage forces failure only after stmt+query+OIDs (containing
+	// the secret query text) have already been fully read.
+	payload := append(buildParsePayload("", secret, nil), 0xFF)
+	_, err := ParseFrontendParse(payload)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error text leaked SQL marker: %v", err)
+	}
+}
+
+func TestParseFrontendBind_ErrorNeverDisclosesParameterValue(t *testing.T) {
+	const secret = "SECRET_PARAM_MARKER_DO_NOT_LEAK"
+	params := []testBindParam{{value: []byte(secret)}}
+	// Trailing garbage forces failure only after the secret parameter value
+	// has already been fully read and copied.
+	payload := append(buildBindPayload("", "", []int16{0}, params, nil), 0xFF)
+	_, err := ParseFrontendBind(payload)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error text leaked parameter marker: %v", err)
+	}
+}
+
 // --- Fuzz targets ------------------------------------------------------
 //
 // These guard the invariants required of any untrusted-input parser:
@@ -700,6 +798,8 @@ func FuzzParseFrontendDescribe(f *testing.F) {
 func FuzzParseFrontendExecute(f *testing.F) {
 	f.Add(buildExecutePayload("", 0))
 	f.Add(buildExecutePayload("p1", 100))
+	f.Add(buildExecutePayload("", -1))
+	f.Add(buildExecutePayload("", math.MinInt32))
 	f.Add([]byte{})
 	f.Add([]byte{0})
 
@@ -715,9 +815,9 @@ func FuzzParseFrontendExecute(f *testing.F) {
 		if msg == nil {
 			t.Fatal("expected non-nil message on success")
 		}
-		if msg.MaxRows < 0 {
-			t.Fatalf("success must never report a negative MaxRows: %d", msg.MaxRows)
-		}
+		// MaxRows accepts the full signed Int32 range - PostgreSQL itself
+		// treats <= 0 as FETCH_ALL, so a negative value on success is not
+		// an invariant violation (see ExecuteMessage doc comment).
 	})
 }
 

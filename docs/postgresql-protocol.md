@@ -73,14 +73,30 @@ thereby allowed through — the typed struct is simply attached to the
 already did:** if a `Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/
 `Sync` message's body fails wire-format validation (bad boundaries,
 missing NUL terminators, a declared count/length that doesn't match the
-actual payload, an out-of-range format code, a negative `Execute` row
-limit, etc.), the decoder does not emit a message at all — it calls the
+actual payload, an out-of-range format code, a `Bind` parameter
+format-code count that is neither `0`, `1`, nor equal to the parameter
+count, etc.), the decoder does not emit a message at all — it calls the
 same `onError`/fail-closed path used for any other undecodable message
 (`Decoder.fail`, surfaced to callers as `firewall.ErrDecodeFailed`, see
 [Fragmentation handling](#fragmentation-handling)). Errors returned by
 these parsers (`protocol.ExtendedParseError`) never include the raw
 payload, parameter values, or SQL text — only the message type and a
 fixed validation-failure category.
+
+**Two fields deliberately match PostgreSQL's real server behavior rather
+than a naive reading of the wire format:**
+
+- `Bind`'s parameter format-code count is validated against the
+  documented PostgreSQL rule (`backend/tcop/postgres.c`,
+  `exec_bind_message`): `0` (all parameters default to text), `1` (one
+  code applies to every parameter, valid even when there are zero
+  parameters), or exactly equal to the parameter count are all accepted;
+  any other value is rejected (`CategoryInvalidFormatCount`).
+- `Execute`'s maximum-row-count field is read as a full signed `Int32`
+  and never rejected for being negative — PostgreSQL's own backend
+  (`backend/tcop/pquery.c`, `PortalRun`) treats any `count <= 0`,
+  negative or zero, as `FETCH_ALL`. `ExecuteMessage.MaxRows` preserves
+  the wire value exactly as sent.
 
 ## SSLRequest / GSSENCRequest rejection
 

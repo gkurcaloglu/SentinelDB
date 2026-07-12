@@ -111,6 +111,44 @@ func TestDecoder_GSSENCRequest_ReturnsDirectlyToStartup(t *testing.T) {
 	}
 }
 
+// TestDecoder_MalformedBindFormatCount_FailsClosed dogrular: Bind'in
+// paramFormatCount/paramCount iliskisi PostgreSQL kuralini ihlal ettiginde
+// (bkz. ParseFrontendBind, CategoryInvalidFormatCount), Decoder bu mesaji
+// asla emit etmez - dogrudan mevcut fail-closed yoluna (Decoder.fail,
+// onError + phasePassthrough) girer, tipki bozuk bir length alaniyla ayni
+// sekilde.
+func TestDecoder_MalformedBindFormatCount_FailsClosed(t *testing.T) {
+	var got []Message
+	var errs int
+	dec := NewClientDecoder(func(m Message) { got = append(got, m) }, func(error) { errs++ })
+
+	// portal="" + stmt="" + paramFormatCount=2 + [format0, format1] +
+	// paramCount=1: paramFormatCount (2) > 1 ve paramCount'a (1) esit degil.
+	payload := []byte{
+		0,    // portal NUL
+		0,    // statement NUL
+		0, 2, // paramFormatCount = 2
+		0, 0, // format code 0 (text)
+		0, 1, // format code 1 (binary)
+		0, 1, // paramCount = 1
+	}
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(len(payload)+4))
+	bind := append(append([]byte{byte(MsgBind)}, length...), payload...)
+
+	dec.Write(bind)
+
+	if len(got) != 0 {
+		t.Fatalf("expected no message emitted for a malformed Bind, got %+v", got)
+	}
+	if errs != 1 {
+		t.Fatalf("expected 1 decode error, got %d", errs)
+	}
+	if dec.getPhase() != phasePassthrough {
+		t.Fatalf("expected passthrough phase after malformed Bind, got %v", dec.getPhase())
+	}
+}
+
 func TestDecoder_InvalidLengthStopsParsingWithoutPanicking(t *testing.T) {
 	var errs int
 	dec := NewServerDecoder(func(Message) {}, func(error) { errs++ })

@@ -51,7 +51,13 @@ type DescribeMessage struct {
 }
 
 // ExecuteMessage, ayrıştırılmış bir Execute ('E') frontend mesajının
-// gövdesidir. MaxRows 0 ise "sınır yok" anlamına gelir.
+// gövdesidir. MaxRows, protokolde belgelenen normal değer olarak 0 ise
+// "sınır yok" anlamına gelir; PostgreSQL'in kendi backend uygulaması
+// (bkz. backend/tcop/pquery.c, PortalRun: `count <= 0` ise `FETCH_ALL`)
+// negatif değerleri de aynı şekilde "sınır yok" olarak yorumlar. Bu
+// ayrıştırıcı, gerçek sunucuyla aynı davranışı yansıtabilmek için ham
+// işaretli Int32 değerini olduğu gibi korur; hiçbir aralık daraltması
+// yapmaz.
 type ExecuteMessage struct {
 	PortalName string
 	MaxRows    int32
@@ -75,11 +81,11 @@ const (
 	CategoryInvalidLength        ExtendedParseErrorCategory = "invalid_length"
 	CategoryLengthExceedsPayload ExtendedParseErrorCategory = "length_exceeds_payload"
 	CategoryInvalidFormatCode    ExtendedParseErrorCategory = "invalid_format_code"
+	CategoryInvalidFormatCount   ExtendedParseErrorCategory = "invalid_format_count"
 	CategoryInvalidSelector      ExtendedParseErrorCategory = "invalid_selector"
 	CategoryTrailingBytes        ExtendedParseErrorCategory = "trailing_bytes"
 	CategoryInvalidUTF8          ExtendedParseErrorCategory = "invalid_utf8"
 	CategoryNonEmptyPayload      ExtendedParseErrorCategory = "non_empty_payload"
-	CategoryNegativeMaxRows      ExtendedParseErrorCategory = "negative_max_rows"
 )
 
 // ExtendedParseError, bir Extended Query frontend mesajının gövdesi
@@ -221,6 +227,16 @@ func ParseFrontendBind(payload []byte) (*BindMessage, error) {
 	paramCount := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
 	offset += 2
 
+	// PostgreSQL'in gerçek sunucu tarafı kuralı (bkz. backend/tcop/pquery.c,
+	// exec_bind_message): paramFormatCount 0 ya da 1 her zaman geçerlidir
+	// (0 = tüm parametreler varsayılan metin formatında, 1 = tek kod tüm
+	// parametrelere uygulanır - paramCount sıfır olsa bile). 1'den büyük bir
+	// sayı yalnızca paramCount'a tam olarak eşitse geçerlidir (parametre
+	// basina bir format kodu).
+	if paramFormatCount > 1 && paramFormatCount != paramCount {
+		return nil, newExtendedParseError(msgName, CategoryInvalidFormatCount)
+	}
+
 	params := make([]BindParam, 0, paramCount)
 	for i := 0; i < paramCount; i++ {
 		if offset+4 > len(payload) {
@@ -236,7 +252,13 @@ func ParseFrontendBind(payload []byte) (*BindMessage, error) {
 		if length < -1 {
 			return nil, newExtendedParseError(msgName, CategoryInvalidLength)
 		}
-		if offset+int(length) > len(payload) {
+		// Toplama yerine cikarma kullanilir: length (kotu niyetli bir
+		// gonderici tarafindan int32'nin ust siniri kadar buyuk olabilir)
+		// offset'e eklenirse dar (32-bit) Go mimarilerinde int tasmasina yol
+		// acabilir. remaining her zaman gecerli, negatif olmayan bir
+		// degerdir (offset <= len(payload) yukarida zaten saglanmistir).
+		remaining := len(payload) - offset
+		if int(length) > remaining {
 			return nil, newExtendedParseError(msgName, CategoryLengthExceedsPayload)
 		}
 		value := make([]byte, length)
@@ -301,7 +323,13 @@ func ParseFrontendDescribe(payload []byte) (*DescribeMessage, error) {
 
 // ParseFrontendExecute, bir Execute ('E') mesajının gövdesini ayrıştırır.
 //
-// Wire format: String(portal adi) + Int32(maksimum satir sayisi, 0=sinirsiz).
+// Wire format: String(portal adi) + Int32(maksimum satir sayisi).
+//
+// maxRows, tam işaretli Int32 aralığıyla kabul edilir ve olduğu gibi
+// korunur - PostgreSQL'in kendisi de negatif değerleri reddetmez, 0'la
+// aynı şekilde "sınır yok" (FETCH_ALL) olarak işler (bkz. ExecuteMessage
+// dokümantasyonu). Bu ayrıştırıcı, gerçek sunucunun kabul ettiği hiçbir
+// değeri reddetmeyerek uyumluluğu korur.
 func ParseFrontendExecute(payload []byte) (*ExecuteMessage, error) {
 	const msgName = "Execute"
 
@@ -315,9 +343,6 @@ func ParseFrontendExecute(payload []byte) (*ExecuteMessage, error) {
 	}
 	maxRows := int32(binary.BigEndian.Uint32(payload[offset : offset+4]))
 	offset += 4
-	if maxRows < 0 {
-		return nil, newExtendedParseError(msgName, CategoryNegativeMaxRows)
-	}
 
 	if offset != len(payload) {
 		return nil, newExtendedParseError(msgName, CategoryTrailingBytes)

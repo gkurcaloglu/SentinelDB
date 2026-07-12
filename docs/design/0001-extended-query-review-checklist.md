@@ -30,6 +30,17 @@ be verified from the document as written, it should be treated as unchecked.
       guesswork) for how SentinelDB detects a transaction has ended, and
       that this evidence is used to invalidate open portal registry
       entries.
+- [ ] **Transaction-end detection triggers on the *reported value* of a
+      real `ReadyForQuery` (`'I'`), not on a transition from a prior
+      status** — a transition-only rule misses the ordinary case of an
+      implicit Extended Query transaction observed as `I → I` (no `'T'`
+      ever surfaces, since `ReadyForQuery` is only sent after `Sync`, by
+      which point an implicit transaction has already closed).
+- [ ] The design explicitly covers `I → T` (entering an explicit
+      transaction, no invalidation), `T → T` (remaining in one across
+      multiple cycles, no invalidation), `E → E` (remaining in a failed
+      transaction, no invalidation), and confirms invalidation never
+      depends on comparing to a previous status.
 - [ ] A Simple Query message's effect on the unnamed prepared statement
       and unnamed portal is explicitly documented, not omitted.
 - [ ] The distinction between statement-level `Describe` (always
@@ -123,6 +134,35 @@ be verified from the document as written, it should be treated as unchecked.
 - [ ] The design specifies that objects already committed in an earlier,
       completed cycle are unaffected by a real upstream error in a later
       cycle.
+- [ ] Server-discard-until-`Sync` and pending-operation abandonment are
+      scoped **per cycle ID**, not as a single connection-wide flag — a
+      real error in one pipelined cycle must not abandon or otherwise
+      affect a different, already-forwarded, later cycle's operations.
+
+## Pipeline cycle identities
+
+- [ ] An explicit, monotonically increasing per-connection cycle ID is
+      defined, and every pending-operation entry and response-plan unit
+      is stated to carry it.
+- [ ] The design states precisely when a cycle ID increments (at `Sync`,
+      for the *next* frontend message) and that `Sync` is always the
+      final response-plan unit for its own cycle.
+- [ ] Real `ReadyForQuery` messages are matched to outstanding `Sync`
+      units **FIFO** (oldest first), not assumed to belong to "the current
+      cycle" — this must be explicit given that multiple cycles can be
+      pipelined ahead of their `ReadyForQuery`s.
+- [ ] Per-cycle state (pending operations, response-plan units, discard
+      flags) is specified to be released only after that specific cycle's
+      matching real `ReadyForQuery`.
+- [ ] Test scenarios exist for at least: two successful cycles pipelined
+      before either `ReadyForQuery` arrives; one cycle erroring while a
+      second, already-forwarded cycle succeeds; a local block in one
+      cycle not affecting another already-forwarded cycle (in both
+      orderings); and correct `ReadyForQuery`-to-`Sync` FIFO correlation
+      under multi-cycle pipelining.
+- [ ] The resource-exhaustion discussion accounts for unbounded
+      *outstanding cycle count* as a distinct risk from registry size or
+      per-cycle pending-operation-queue depth.
 
 ## Response ordering
 
@@ -148,6 +188,53 @@ be verified from the document as written, it should be treated as unchecked.
       blocked-first (no preceding allowed operation), and multiple
       would-be-blocked messages before a single `Sync` (confirming only
       one `ErrorResponse`/response unit is produced).
+- [ ] **A real `ErrorResponse` on an earlier unit is specified to suppress
+      every later unit in the same cycle up to (not including) `Sync`,
+      including later *synthetic* units** — a locally blocked operation
+      queued after an operation that later fails for real must not also
+      produce its own client-visible error, matching genuine PostgreSQL
+      behavior (only one error is ever visible per cycle in that
+      scenario).
+- [ ] The design states this suppression check happens at **drain time**,
+      not enqueue time, since whether an earlier operation will fail is
+      not known when a later operation is blocked.
+- [ ] The cycle's `Sync` unit is explicitly stated to never be skipped,
+      regardless of an earlier real failure in the same cycle.
+- [ ] A Mermaid sequence diagram illustrates the real-error-precedence
+      scenario specifically (distinct from the base ordering diagram).
+- [ ] Test scenarios exist for: an earlier real `Parse`/`Bind`/`Execute`
+      error each suppressing a later local block, and (as a regression
+      guard) an earlier operation succeeding so the later local block is
+      emitted normally.
+
+## Frontend/backend message completeness
+
+- [ ] The design explicitly states which forwarded frontend messages
+      create **no** response-plan unit (`Flush`, `Terminate`), separate
+      from those that do (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/
+      `Sync`).
+- [ ] `Flush` is specified as forwarded but untracked, and its only effect
+      on the response plan is possibly hastening delivery of an
+      **already-enqueued** unit's backend traffic.
+- [ ] `Terminate` is specified as ending the connection immediately with
+      no unit and no expectation of further response.
+- [ ] `NoticeResponse`, `ParameterStatus`, and `NotificationResponse` are
+      explicitly designed as an always-valid, asynchronous category that:
+      is relayed through the sole ordered client writer, preserves backend
+      arrival order, never completes or consumes a pending operation, and
+      never alters statement/portal/cycle/discard state.
+- [ ] The design states explicitly that these three async message types
+      are recognized **before** any "unexpected ordering" check, not
+      handled as a special case of it.
+- [ ] Authentication/startup-phase messages are explicitly described as
+      out of scope for the Extended Query response planner (handled
+      entirely by the existing, unchanged startup path).
+- [ ] Test scenarios exist for: `Flush` between `Execute` and `Sync`;
+      repeated `Flush`; `NoticeResponse` during `Execute`'s `DataRow`s;
+      `ParameterStatus` between `CommandComplete` and `ReadyForQuery`;
+      `NotificationResponse` while nominally idle; an asynchronous message
+      arriving while a synthetic unit is pending drain; and `Terminate`
+      during an incomplete cycle.
 
 ## Masking safety
 
@@ -262,6 +349,19 @@ be verified from the document as written, it should be treated as unchecked.
       numbers drift as the codebase changes.
 - [ ] Open questions in the design document are genuinely open (not
       settled decisions written defensively as "open" to avoid commitment).
+      Specifically confirm the five that must remain open: binary
+      parameter timing, proactive `Describe` vs. fail-closed unknown
+      shape, concrete numeric resource limits, real-ORM compatibility
+      strategy, and blocked-`Parse` metric choice.
+- [ ] **No section still claims** any of the following, all confirmed
+      wrong by review: transaction completion is detected only by a
+      `'T'`/`'E'` → `'I'` transition (misses the `I → I` implicit-cycle
+      case); all synthetic errors are always emitted regardless of
+      earlier real failures; a single global discard boolean is
+      sufficient across multiple pipelined `Sync` cycles; every forwarded
+      frontend message necessarily produces a backend response (`Flush`
+      and `Terminate` do not); every backend message must correlate to
+      the pending-operation head (asynchronous messages do not).
 
 ## Sign-off
 

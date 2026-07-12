@@ -362,6 +362,16 @@ any output actions they immediately produced — have fully succeeded. A
 future frontend caller may forward the original frontend frame upstream
 only after that success.
 
+**`FrontendRegistration` never exposes a client-supplied name.**
+`protocol.PendingOperation` (the value `State.Create*` actually returns)
+carries `TargetName` — the statement/portal name the client supplied.
+`FrontendRegistration.Operation` is `protocol.CorrelatedOperation`
+instead — the same sanitized snapshot type `BackendCorrelator` already
+uses for `CorrelationResult` — carrying only `ID`/`Cycle`/`Kind`/
+`TargetGeneration`. The runtime's own `sanitizeOperation` helper is the
+single conversion point; `protocol.PendingOperation` itself is never
+returned from any public runtime method.
+
 **State/sequencer divergence fails the connection closed.** Creating a
 `State` operation and registering it with the sequencer are two separate
 steps; if `State.Create*` itself fails (e.g. an unknown statement name),
@@ -377,11 +387,14 @@ told it can safely retry or forward a frame after this.
 **Accepted frontend submissions always resolve definitively.** Caller
 context cancellation can only abort a `RegisterFrontendOperation` /
 `SubmitSyntheticError` call *before* the request is enqueued into the
-runtime-owned channel. Once enqueued, ownership transfers to the runtime
-and the caller is guaranteed one of exactly two outcomes: the event
-loop's own acknowledgement, or runtime termination — never an ambiguous
-`ctx.Err()` for an event that may already be in flight or already
-processed.
+runtime-owned channel — checked explicitly immediately before the enqueue
+attempt, so an already-canceled caller context can never win a race
+against a channel send that happens to be immediately ready (Go's
+`select` picks pseudo-randomly among ready cases, which previously made
+this possible). Once enqueued, ownership transfers to the runtime and the
+caller is guaranteed one of exactly two outcomes: the event loop's own
+acknowledgement, or runtime termination — never an ambiguous `ctx.Err()`
+for an event that may already be in flight or already processed.
 
 **Truncated backend messages at end-of-input fail closed, not clean.**
 `protocol.Decoder.Finalize()` reports whether any buffered-but-incomplete
@@ -400,10 +413,38 @@ truncation failures, through a bounded channel; one event-loop goroutine
 `ResponseSequencer`, or writes to the client — drains that channel and a
 second, separate bounded channel of frontend events. The backend reader
 applies real backpressure: a full backend event channel blocks further
-reads from the real upstream socket rather than dropping frames. The
-runtime owns shutdown of both connections itself — closing them is what
-unblocks an in-progress blocked `Read`/`Write` call, since context
-cancellation alone cannot interrupt an arbitrary `io.Reader`/`io.Writer`.
+reads from the real upstream socket rather than dropping frames.
+
+**A separate shutdown watcher, not the event loop itself, closes the
+owned connections.** The event loop can be blocked deep inside a single
+`client.Write` call while processing a `ResponseSequencer` output
+action — a plain blocking `io.Writer.Write`, which observes no context at
+all. If `Run` waited for the event loop to return before closing
+anything, a parent-context cancellation arriving while the loop is stuck
+in that `Write` would deadlock: nothing would ever reach the code that
+closes the connections to unblock it. `Run` instead starts a third,
+independently joined goroutine — the shutdown watcher — *before* calling
+the event loop. It does nothing but wait for the internal (parent-derived)
+context to end and then close both connections; it never writes client
+bytes and never touches `State` or `ResponseSequencer`. Because it runs
+concurrently, it can unblock a stuck `Write`/backend `Read` regardless of
+what the event loop is currently doing.
+
+**The primary returned error reflects who actually initiated shutdown,**
+not just whatever error happened to surface last. A single
+compare-and-swap flag records whether the parent context or an internal
+condition (a sequencer termination action, a genuine backend protocol
+failure, an independent write error, …) closed the connections first —
+determined by checking the *parent* context's own `Err()`, not the
+internal derived one, so the runtime's own housekeeping cancellation is
+never confused with a real caller cancellation. If the parent context
+was the initiator, `Run` returns `context.Canceled`/
+`context.DeadlineExceeded` even though the event loop's own return value
+in that case is typically just a symptom of the forced close (e.g.
+`ErrClientWriteFailed` from a `Write` that only failed because the
+watcher closed the connection to unblock it). If an internal condition
+initiated shutdown first, that error remains primary — causality is never
+determined by inspecting an OS error string.
 
 **This is still not part of the live gateway.** `ExtendedRuntime` is not
 constructed or called anywhere in `cmd/gateway`, `firewall.Gate`, or

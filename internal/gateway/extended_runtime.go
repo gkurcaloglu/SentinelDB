@@ -180,8 +180,29 @@ func (req FrontendOperationRequest) copy() FrontendOperationRequest {
 // cagrisinin sonucudur: State.Create* + ResponseSequencer kaydi + ani
 // cikti eylemlerinin TAMAMI basari ile tamamlandiktan sonraki degismez
 // islem goruntusudur.
+//
+// Operation, protocol.PendingOperation DEGIL, protocol.CorrelatedOperation
+// turundedir - protocol.PendingOperation'in TargetName alani (istemci
+// tarafindan verilen statement/portal adi) hicbir zaman runtime API'sinden
+// disariya sizmaz; yalnizca ID/Cycle/Kind/TargetGeneration gibi sayisal,
+// guvenli metadata dondurulur (bkz. createStateOperation/sanitizeOperation).
 type FrontendRegistration struct {
-	Operation protocol.PendingOperation
+	Operation protocol.CorrelatedOperation
+}
+
+// sanitizeOperation, bir State.Create* cagrisindan donen tam
+// protocol.PendingOperation goruntusunu, TargetName'i (istemci tarafindan
+// verilen ad) ATIP yalnizca sayisal/guvenli alanlari tasiyan bir
+// protocol.CorrelatedOperation'a donusturur. Bu, runtime API'sinin
+// disariya asla bir isim ACIGA CIKARMAMASINI saglayan TEK gecis
+// noktasidir.
+func sanitizeOperation(op protocol.PendingOperation) protocol.CorrelatedOperation {
+	return protocol.CorrelatedOperation{
+		ID:               op.ID,
+		Cycle:            op.Cycle,
+		Kind:             op.Kind,
+		TargetGeneration: op.TargetGeneration,
+	}
 }
 
 // --- Olay modeli --------------------------------------------------------
@@ -286,6 +307,12 @@ type ExtendedRuntime struct {
 
 	closeOnce sync.Once
 
+	// shutdownCause, kapanmayi hangi tetikleyicinin BASLATTIGINI (bkz.
+	// shutdownCause turu) kayit altina alan tek seferlik bir
+	// atomic.CompareAndSwap hedefidir - Run'in dondugu birincil hatanin
+	// nedensellik (causality) belirlenimi icin kullanilir.
+	shutdownCause atomic.Int32
+
 	// onFrontendEventEnqueued/onFrontendEventAccepted, YALNIZCA PAKET
 	// TESTLERI tarafindan ayarlanan isteğe bagli kancalardir (hooks).
 	// Uretimde HER ZAMAN nil'dir ve hicbir etkisi yoktur - yalnizca
@@ -350,50 +377,123 @@ func NewExtendedRuntime(
 	}, nil
 }
 
+// shutdownCause, hangi tetikleyicinin baglanti kapatmayi/sonlandirmayi
+// BASLATTIGINI (birincil neden olarak) kayit altina alir - bkz. gorev 2
+// "Preserve deterministic primary-error causality". Tek seferlik bir
+// atomic.CompareAndSwap ile yazilir: hangi taraf ONCE yazarsa o kalici
+// olarak gecerli olur.
+type shutdownCause int32
+
+const (
+	shutdownCauseNone shutdownCause = iota
+	// shutdownCauseParentCtx, Run'a verilen UST (parent) ctx'in iptal/
+	// deadline nedeniyle sona erdigini ve bunun baglanti kapatmayi
+	// (dolayisiyla olay dongusunun olasi bir bloklu client.Write/backend
+	// Read cagrisinin kesilmesini) BASLATTIGINI belirtir. Bu isaretliyse,
+	// Run'in birincil hatasi loop()'un kendi donus degerinden BAGIMSIZ
+	// olarak parent ctx.Err() olur - cunku loop()'un donus degeri o
+	// noktada yalnizca bu ZORLA kapatmanin bir SEMPTOMU olabilir (ör.
+	// ErrClientWriteFailed, Write yalnizca BU YUZDEN basarisiz oldugu
+	// icin).
+	shutdownCauseParentCtx
+	// shutdownCauseInternal, olay dongusunun KENDI ic nedeniyle
+	// (sequencer sonlandirma eylemi, backend protokol hatasi, gercek bir
+	// istemci yazma hatasi, vb.) durdugunu ve bunun baglanti kapatmayi
+	// BASLATTIGINI belirtir - bu durumda loop()'un kendi donus degeri
+	// birincil hata olarak KORUNUR.
+	shutdownCauseInternal
+)
+
 // Run, olay dongusunu baslatir ve ictegi cagirir (blocking). TAM OLARAK
 // BIR KEZ cagrilabilir - ikinci bir cagri aninda ErrAlreadyRunning
-// dondurur. Run donduğunde: backend-okuyucu goroutine'i katilmis
-// (joined), her iki baglanti (backend, client) kapatilmis ve runtime
-// kalici olarak "stopped" durumundadir.
+// dondurur. Run donduğunde: backend-okuyucu ve kapanma gozetmeni
+// (shutdown watcher) goroutine'leri katilmis (joined), her iki baglanti
+// (backend, client) kapatilmis ve runtime kalici olarak "stopped"
+// durumundadir.
 //
 // Baglanti kapatma, bloklu bir net.Conn Read/Write cagrisini gercekten
 // KESEBILEN TEK mekanizmadir - context iptali TEK BASINA keyfi bir
-// io.Reader/io.Writer cagrisini kesemez. Bu yuzden Run, hem ctx
-// iptalinde hem de kendi ic hata yollarinda, geri donmeden once
-// backend/client'i acikca kapatir.
+// io.Reader/io.Writer cagrisini kesemez. Ancak TEK event-loop
+// goroutine'i (r.loop), sequencer'in urettigi bir OutputAction'i
+// islerken client.Write icinde bloklanmis olabilir - bu durumda hicbir
+// context'i GOZLEMLEYEMEZ ve Run'in "loop donene kadar bekle, SONRA
+// baglantilari kapat" seklinde sirali bir tasarimi, kilitlenmeye
+// (deadlock) yol acardi: Run, baglantilari kapatan koda ASLA ulasamazdi.
+//
+// Bu yuzden Run, loop()'u cagirmadan ONCE, loop() ile ESZAMANLI calisan
+// AYRI bir "kapanma gozetmeni" (shutdown watcher) goroutine'i baslatir.
+// Bu gozetmen, runCtx (parent ctx'in cocugu) sona erdigi ANDA - loop()
+// bloklu olsa BILE - her iki baglantiyi da kapatir; boylece bloklu
+// Write/Read cagrisi HER ZAMAN kesilebilir. Gozetmen KESINLIKLE istemciye
+// bayt yazmaz ve State/ResponseSequencer'a DOKUNMAZ - yalnizca baglanti
+// kapatma eylemini gerceklestirir.
 func (r *ExtendedRuntime) Run(ctx context.Context) error {
 	if !r.lifecycle.CompareAndSwap(int32(lifecycleCreated), int32(lifecycleRunning)) {
 		return ErrAlreadyRunning
 	}
 	close(r.started)
 
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancelRun := context.WithCancel(ctx)
 
 	var wg sync.WaitGroup
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		r.runBackendReader(runCtx)
 	}()
 
-	primaryErr := r.loop(runCtx)
+	// Kapanma gozetmeni: runCtx sona erdiginde (parent ctx iptali/
+	// deadline'i YA DA Run'in kendisinin asagida cagiracagi cancelRun()
+	// nedeniyle) HER IKI baglantiyi da kapatir. parent ctx'in GERCEKTEN
+	// sona erip ermedigini (yalnizca Run'in kendi ic cancelRun()
+	// cagrisindan degil) ayirt etmek icin runCtx.Err() DEGIL, DOGRUDAN
+	// ctx.Err() kontrol edilir - boylece "kim once bitirdi" sorusu
+	// hatasiz cevaplanir (bkz. shutdownCause).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-runCtx.Done()
+		if ctx.Err() != nil {
+			r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseParentCtx))
+		}
+		r.closeOnce.Do(func() {
+			_ = r.backend.Close()
+			_ = r.client.Close()
+		})
+	}()
 
-	// Sonlandirma sirasi: once yeni gonderimleri reddetmeye basla (bkz.
-	// submit), sonra ic context'i iptal et (ctx.Done() uzerinde bekleyen
-	// her seyi - ozellikle backend okuyucunun olay-gonderim select'ini -
-	// aninda uyandirir), sonra HER IKI sahip olunan baglantiyi kapat
-	// (bloklu bir Read/Write cagrisini gercekten kesen tek sey budur).
+	// r.loop DOGRUDAN (ayri bir goroutine olmadan) cagrilir - Run'in
+	// kendi goroutine'i buna bloklu kalsa bile, YUKARIDAKI bagimsiz
+	// gozetmen goroutine'i baglantilari kapatmaya devam edebilir (runCtx
+	// zaten baslamis, kendi ayri goroutine'inde calisiyor). loop() bloklu
+	// bir Write'tan ancak gozetmen baglantiyi kapattiktan SONRA doner.
+	loopErr := r.loop(runCtx)
+
+	// loop() KENDI nedeniyle dondu (sequencer sonlandirmasi, backend
+	// protokol hatasi, gercek yazma hatasi, ya da parent ctx zaten
+	// iptal edilmisken bos dongude ctx.Err() ile). Gozetmen HENUZ
+	// shutdownCause'u parentCtx olarak isaretlemediyse (yani asil neden
+	// GERCEKTEN loop()'un kendisiyse), bunu "internal" olarak kaydet.
+	r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseInternal))
+
 	r.lifecycle.Store(int32(lifecycleStopping))
-	cancel()
-	r.closeOnce.Do(func() {
-		_ = r.backend.Close()
-		_ = r.client.Close()
-	})
+	cancelRun() // gozetmenin de kesin olarak calisip baglantilari kapatmasini/cikmasini saglar (parent ctx HENUZ iptal edilmediyse)
 
-	wg.Wait() // backend-okuyucu Run donmeden once katilmis olmalidir
+	wg.Wait() // backend-okuyucu VE kapanma gozetmeni Run donmeden once katilmis olmalidir
 
 	r.lifecycle.Store(int32(lifecycleStopped))
 	close(r.stopped)
+
+	primaryErr := loopErr
+	if shutdownCause(r.shutdownCause.Load()) == shutdownCauseParentCtx {
+		// Parent ctx'in sona ermesi kapanmayi BASLATTI - loop()'un donus
+		// degeri (varsa) yalnizca bu ZORLA kapatmanin bir semptomu
+		// olabilir (ör. bloklu bir Write'in kesilmesinden kaynaklanan
+		// ErrClientWriteFailed) - bu yuzden gercek nedeni (context.Canceled
+		// ya da context.DeadlineExceeded) rapor ederiz.
+		primaryErr = ctx.Err()
+	}
 
 	return primaryErr
 }
@@ -476,6 +576,20 @@ func (r *ExtendedRuntime) submit(ctx context.Context, ev frontendEvent) (fronten
 		return frontendAck{}, ErrNotRunning
 	case lifecycleStopping, lifecycleStopped:
 		return frontendAck{}, ErrRuntimeStopped
+	}
+
+	// Bkz. gorev 5: asagidaki select, kanal gonderimi HAZIR oldugunda
+	// (ör. bos bir kanal) ctx ZATEN iptal edilmis olsa bile Go'nun
+	// select semantigi geregi (birden fazla hazir dal arasinda
+	// psödorastgele secim) yanlislikla gonderim dalini secebilirdi - bu,
+	// gonderimden ONCE iptal edilmis bir istegin kabul edilmesine yol
+	// acardi. Bu yuzden, kanala erismeden ONCE ctx.Err() ACIKCA kontrol
+	// edilir; ancak bundan SONRA context-farkli enqueue select'i yapilir.
+	// Bir onceki kontrolden SONRA ama gonderim tamamlanmadan once bir
+	// iptal yarisirsa, BASARILI gonderim kabul sinirini belirler ve
+	// mevcut kesin-onay sozlesmesi gecerli olmaya devam eder.
+	if err := ctx.Err(); err != nil {
+		return frontendAck{}, err
 	}
 
 	select {
@@ -660,7 +774,7 @@ func (r *ExtendedRuntime) handleFrontendRegister(ev frontendEvent) error {
 		return procErr
 	}
 
-	ev.ack <- frontendAck{reg: FrontendRegistration{Operation: op}}
+	ev.ack <- frontendAck{reg: FrontendRegistration{Operation: sanitizeOperation(op)}}
 	return nil
 }
 

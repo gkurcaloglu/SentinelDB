@@ -101,7 +101,7 @@ func closePortalReq(name string) FrontendOperationRequest {
 
 func syncReq() FrontendOperationRequest { return FrontendOperationRequest{Kind: protocol.OpSync} }
 
-func mustRegister(t *testing.T, ctx context.Context, rt *ExtendedRuntime, req FrontendOperationRequest) protocol.PendingOperation {
+func mustRegister(t *testing.T, ctx context.Context, rt *ExtendedRuntime, req FrontendOperationRequest) protocol.CorrelatedOperation {
 	t.Helper()
 	reg, err := rt.RegisterFrontendOperation(ctx, req)
 	if err != nil {
@@ -187,6 +187,47 @@ func (w *trackingWriter) WriteCount() int { return int(atomic.LoadInt32(&w.write
 
 func (w *trackingWriter) ConcurrentViolation() bool { return w.concurrentViolation.Load() }
 
+// blockingWriteCloser is a deterministic io.WriteCloser test double whose
+// Write signals through enteredWrite the moment it begins, then blocks
+// UNTIL Close is called - no timing-only sleep is required to know the
+// event loop has genuinely entered a blocked Write. Close unblocks any
+// pending Write and records that it was invoked; it is safe to call more
+// than once.
+type blockingWriteCloser struct {
+	enteredWrite chan struct{}
+	closed       chan struct{}
+	closeOnce    sync.Once
+	closeCalled  atomic.Bool
+	writeCount   atomic.Int32
+}
+
+func newBlockingWriteCloser() *blockingWriteCloser {
+	return &blockingWriteCloser{
+		enteredWrite: make(chan struct{}, 8),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (w *blockingWriteCloser) Write(p []byte) (int, error) {
+	w.writeCount.Add(1)
+	select {
+	case w.enteredWrite <- struct{}{}:
+	default:
+	}
+	<-w.closed
+	return 0, errors.New("test: write interrupted by connection close")
+}
+
+func (w *blockingWriteCloser) Close() error {
+	w.closeCalled.Store(true)
+	w.closeOnce.Do(func() { close(w.closed) })
+	return nil
+}
+
+func (w *blockingWriteCloser) Closed() bool { return w.closeCalled.Load() }
+
+func (w *blockingWriteCloser) WriteCount() int { return int(w.writeCount.Load()) }
+
 // --- Test helpers: runtime setup -----------------------------------------
 
 func testRuntimeLimits() RuntimeLimits {
@@ -264,7 +305,7 @@ func assertNoGoroutineLeak(t *testing.T, before int) {
 // setupRuntimeExecuteHead registers an unnamed Parse, Bind and Execute
 // through the runtime (acknowledging each backend terminal along the
 // way), leaving the sequencer's head at the registered Execute operation.
-func setupRuntimeExecuteHead(t *testing.T, ctx context.Context, rt *ExtendedRuntime, backendW io.Writer, client *trackingWriter) protocol.PendingOperation {
+func setupRuntimeExecuteHead(t *testing.T, ctx context.Context, rt *ExtendedRuntime, backendW io.Writer, client *trackingWriter) protocol.CorrelatedOperation {
 	t.Helper()
 	mustRegister(t, ctx, rt, parseReq("", "SELECT 1", nil))
 	pc := emptyFrame(protocol.MsgParseComplete)
@@ -2008,4 +2049,589 @@ func TestExtendedRuntime_Stress(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ==========================================================================
+// Blocked-Write cancellation (bkz. gorev 1/2/3)
+// ==========================================================================
+
+func TestExtendedRuntime_Cancellation_TrulyBlockedWrite_CancelUnblocksAndReturnsCanceled(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newBlockingWriteCloser()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+
+	// Wait until the event loop has GENUINELY entered client.Write - no
+	// timing-only sleep, a deterministic signal.
+	select {
+	case <-client.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter client.Write")
+	}
+
+	cancel()
+
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("expected the blocked submitter to receive a definitive non-nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("submit did not unblock after cancellation - client.Write was not interrupted")
+	}
+
+	if !client.Closed() {
+		t.Fatal("expected client Close to have been called to unblock the write")
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", runErr)
+	}
+	if client.WriteCount() != 1 {
+		t.Fatalf("expected no output after shutdown (exactly one interrupted Write attempt), got %d", client.WriteCount())
+	}
+
+	// Backend Close also occurs: the peer write end should now observe
+	// the reader side closed.
+	if _, err := backendW.Write([]byte{0}); err == nil {
+		t.Fatal("expected the backend connection to be closed too")
+	}
+}
+
+func TestExtendedRuntime_Cancellation_TrulyBlockedWrite_DeadlineExceeded(t *testing.T) {
+	backendR, _ := io.Pipe()
+	client := newBlockingWriteCloser()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+
+	select {
+	case <-client.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter client.Write")
+	}
+
+	// Deliberately do NOT cancel - let the deadline itself expire.
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("expected the blocked submitter to receive a definitive non-nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("submit did not unblock after the deadline expired")
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", runErr)
+	}
+	if !client.Closed() {
+		t.Fatal("expected client Close to have been called")
+	}
+}
+
+func TestExtendedRuntime_Cancellation_TrulyBlockedWrite_NoGoroutineLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	backendR, _ := io.Pipe()
+	client := newBlockingWriteCloser()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	go func() {
+		_ = rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+	select {
+	case <-client.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter client.Write")
+	}
+
+	cancel()
+	waitDone(t, done)
+
+	assertNoGoroutineLeak(t, before)
+}
+
+// TestExtendedRuntime_Cancellation_TrulyBlockedWrite_Repeated runs the core
+// blocked-Write-then-cancel scenario many times in a fresh runtime each
+// time, to detect flakiness (bkz. gorev 3, madde 12).
+func TestExtendedRuntime_Cancellation_TrulyBlockedWrite_Repeated(t *testing.T) {
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		backendR, _ := io.Pipe()
+		client := newBlockingWriteCloser()
+		rt := newTestRuntime(t, backendR, client)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := runInBackground(t, rt, ctx)
+
+		submitDone := make(chan error, 1)
+		go func() {
+			submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+		}()
+
+		select {
+		case <-client.enteredWrite:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: timed out waiting for client.Write entry", i)
+		}
+
+		cancel()
+
+		select {
+		case err := <-submitDone:
+			if err == nil {
+				t.Fatalf("iteration %d: expected a non-nil definitive error", i)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("iteration %d: submit did not unblock", i)
+		}
+
+		runErr := waitDone(t, done)
+		if !errors.Is(runErr, context.Canceled) {
+			t.Fatalf("iteration %d: expected context.Canceled, got %v", i, runErr)
+		}
+	}
+}
+
+// ==========================================================================
+// Primary-error causality (bkz. gorev 2)
+// ==========================================================================
+
+func TestExtendedRuntime_Causality_IndependentWriteFailure_PreservedOverNoParentCancellation(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	injected := errors.New("test: independent simulated write failure")
+	client.writeErrOnce = injected
+	rt := newTestRuntime(t, backendR, client)
+	// Parent ctx is context.Background() - never canceled - so any
+	// primary error must come from the independent write failure alone.
+	done := runInBackground(t, rt, context.Background())
+
+	if err := rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame()); !errors.Is(err, ErrClientWriteFailed) {
+		t.Fatalf("expected ErrClientWriteFailed, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrClientWriteFailed) {
+		t.Fatalf("expected Run to preserve ErrClientWriteFailed as primary, got %v", runErr)
+	}
+	if errors.Is(runErr, context.Canceled) {
+		t.Fatalf("did not expect context.Canceled to be involved, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_Causality_BackendProtocolFailure_PreservedOverLaterParentCancellation(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	// No pending operation at all: MsgBindComplete is rejected by the
+	// sequencer as a genuine backend protocol failure BEFORE any
+	// cancellation happens.
+	if _, err := backendW.Write(emptyFrame(protocol.MsgBindComplete)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrBackendProtocolFailure) {
+		t.Fatalf("expected ErrBackendProtocolFailure to be primary, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_Causality_TerminationAction_PreservedWhenNoParentCancellation(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	done := runInBackground(t, rt, context.Background())
+
+	if _, err := backendW.Write(minimalErrorFrame()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrTerminationRequested) {
+		t.Fatalf("expected ErrTerminationRequested to be primary (no parent cancellation occurred), got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_Causality_PrimaryErrorIsExactSentinel(t *testing.T) {
+	backendR, _ := io.Pipe()
+	client := newBlockingWriteCloser()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	go func() {
+		_ = rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+	select {
+	case <-client.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for client.Write entry")
+	}
+
+	cancel()
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", runErr)
+	}
+	// The primary error itself must be the fixed sentinel, not a raw
+	// wrapped I/O error string (ex: "use of closed network connection").
+	if runErr.Error() != context.Canceled.Error() {
+		t.Fatalf("expected the primary error to be exactly context.Canceled, got %q", runErr.Error())
+	}
+}
+
+// ==========================================================================
+// FrontendRegistration sanitization (bkz. gorev 4)
+// ==========================================================================
+
+func TestExtendedRuntime_Sanitization_NoNameMarkersAcrossAllOperationKinds(t *testing.T) {
+	const secretStmt = "SECRET_SANITIZE_STMT_MARKER"
+	const secretPortal = "SECRET_SANITIZE_PORTAL_MARKER"
+
+	checkNoMarkers := func(t *testing.T, reg FrontendRegistration) {
+		t.Helper()
+		dumps := []string{
+			fmt.Sprintf("%v", reg), fmt.Sprintf("%+v", reg), fmt.Sprintf("%#v", reg),
+			fmt.Sprintf("%v", reg.Operation), fmt.Sprintf("%+v", reg.Operation), fmt.Sprintf("%#v", reg.Operation),
+		}
+		for _, d := range dumps {
+			if strings.Contains(d, secretStmt) || strings.Contains(d, secretPortal) {
+				t.Fatalf("sanitized registration leaked a name marker: %s", d)
+			}
+		}
+	}
+
+	t.Run("Parse", func(t *testing.T) {
+		backendR, backendW := io.Pipe()
+		defer backendW.Close()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), parseReq(secretStmt, "SELECT 1", nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+
+	t.Run("Bind", func(t *testing.T) {
+		backendR, backendW := io.Pipe()
+		defer backendW.Close()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		mustRegister(t, context.Background(), rt, parseReq(secretStmt, "SELECT 1", nil))
+		pc := emptyFrame(protocol.MsgParseComplete)
+		backendW.Write(pc)
+		waitForBytes(t, client, pc)
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), bindReq(secretPortal, secretStmt, nil, nil, nil))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+
+	t.Run("DescribeStatement", func(t *testing.T) {
+		backendR, backendW := io.Pipe()
+		defer backendW.Close()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		mustRegister(t, context.Background(), rt, parseReq(secretStmt, "SELECT 1", nil))
+		pc := emptyFrame(protocol.MsgParseComplete)
+		backendW.Write(pc)
+		waitForBytes(t, client, pc)
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), describeStmtReq(secretStmt))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+
+	t.Run("DescribePortal", func(t *testing.T) {
+		backendR, backendW := io.Pipe()
+		defer backendW.Close()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		mustRegister(t, context.Background(), rt, parseReq(secretStmt, "SELECT 1", nil))
+		pc := emptyFrame(protocol.MsgParseComplete)
+		backendW.Write(pc)
+		waitForBytes(t, client, pc)
+		mustRegister(t, context.Background(), rt, bindReq(secretPortal, secretStmt, nil, nil, nil))
+		bc := emptyFrame(protocol.MsgBindComplete)
+		backendW.Write(bc)
+		waitForBytes(t, client, append(append([]byte{}, pc...), bc...))
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), describePortalReq(secretPortal))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+
+	t.Run("Execute", func(t *testing.T) {
+		backendR, backendW := io.Pipe()
+		defer backendW.Close()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		mustRegister(t, context.Background(), rt, parseReq(secretStmt, "SELECT 1", nil))
+		pc := emptyFrame(protocol.MsgParseComplete)
+		backendW.Write(pc)
+		waitForBytes(t, client, pc)
+		mustRegister(t, context.Background(), rt, bindReq(secretPortal, secretStmt, nil, nil, nil))
+		bc := emptyFrame(protocol.MsgBindComplete)
+		backendW.Write(bc)
+		waitForBytes(t, client, append(append([]byte{}, pc...), bc...))
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), executeReq(secretPortal))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+
+	t.Run("CloseStatement", func(t *testing.T) {
+		backendR, backendW := io.Pipe()
+		defer backendW.Close()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		mustRegister(t, context.Background(), rt, parseReq(secretStmt, "SELECT 1", nil))
+		pc := emptyFrame(protocol.MsgParseComplete)
+		backendW.Write(pc)
+		waitForBytes(t, client, pc)
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), closeStmtReq(secretStmt))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+
+	t.Run("ClosePortal", func(t *testing.T) {
+		backendR, backendW := io.Pipe()
+		defer backendW.Close()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		mustRegister(t, context.Background(), rt, parseReq(secretStmt, "SELECT 1", nil))
+		pc := emptyFrame(protocol.MsgParseComplete)
+		backendW.Write(pc)
+		waitForBytes(t, client, pc)
+		mustRegister(t, context.Background(), rt, bindReq(secretPortal, secretStmt, nil, nil, nil))
+		bc := emptyFrame(protocol.MsgBindComplete)
+		backendW.Write(bc)
+		waitForBytes(t, client, append(append([]byte{}, pc...), bc...))
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), closePortalReq(secretPortal))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+
+	t.Run("Sync", func(t *testing.T) {
+		backendR, _ := io.Pipe()
+		client := newTrackingWriter()
+		rt := newTestRuntime(t, backendR, client)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := runInBackground(t, rt, ctx)
+
+		reg, err := rt.RegisterFrontendOperation(context.Background(), syncReq())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		checkNoMarkers(t, reg)
+
+		cancel()
+		waitDone(t, done)
+	})
+}
+
+func TestExtendedRuntime_Sanitization_ReturnedOperationIsIndependentSnapshot(t *testing.T) {
+	backendR, _ := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	reg, err := rt.RegisterFrontendOperation(context.Background(), parseReq("s1", "SELECT 1", nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	reg.Operation.ID = 999999 // mutate the CALLER's own copy
+
+	reg2, err := rt.RegisterFrontendOperation(context.Background(), parseReq("s2", "SELECT 2", nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reg2.Operation.ID == 999999 {
+		t.Fatal("expected the mutated caller copy to be independent of internal runtime state")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+// ==========================================================================
+// Pre-canceled caller context takes priority before enqueue (bkz. gorev 5)
+// ==========================================================================
+
+func TestExtendedRuntime_PreCanceledContext_RegisterFrontendOperation_NeverEnqueued(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	var enqueuedCount int32
+	var acceptedCount int32
+	rt.onFrontendEventEnqueued = func() { atomic.AddInt32(&enqueuedCount, 1) }
+	rt.onFrontendEventAccepted = func() { atomic.AddInt32(&acceptedCount, 1) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	// Repeated enough times that the OLD select-randomness implementation
+	// (which could occasionally choose the ready channel send even with
+	// an already-canceled ctx) would be exposed reliably.
+	const iterations = 500
+	for i := 0; i < iterations; i++ {
+		canceledCtx, cancelNow := context.WithCancel(context.Background())
+		cancelNow()
+		if _, err := rt.RegisterFrontendOperation(canceledCtx, parseReq(fmt.Sprintf("s%d", i), "SELECT 1", nil)); !errors.Is(err, context.Canceled) {
+			t.Fatalf("iteration %d: expected context.Canceled, got %v", i, err)
+		}
+	}
+
+	if got := atomic.LoadInt32(&enqueuedCount); got != 0 {
+		t.Fatalf("expected zero events enqueued, got %d", got)
+	}
+	if got := atomic.LoadInt32(&acceptedCount); got != 0 {
+		t.Fatalf("expected zero events accepted by the event loop (no State/sequencer mutation), got %d", got)
+	}
+
+	// Runtime remains fully usable afterward.
+	if _, err := rt.RegisterFrontendOperation(context.Background(), parseReq("ok", "SELECT 1", nil)); err != nil {
+		t.Fatalf("expected the runtime to remain usable, got %v", err)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_PreCanceledContext_SubmitSyntheticError_NeverEnqueued(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	var enqueuedCount int32
+	var acceptedCount int32
+	rt.onFrontendEventEnqueued = func() { atomic.AddInt32(&enqueuedCount, 1) }
+	rt.onFrontendEventAccepted = func() { atomic.AddInt32(&acceptedCount, 1) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	const iterations = 500
+	for i := 0; i < iterations; i++ {
+		canceledCtx, cancelNow := context.WithCancel(context.Background())
+		cancelNow()
+		if err := rt.SubmitSyntheticError(canceledCtx, protocol.CycleID(i+1), minimalErrorFrame()); !errors.Is(err, context.Canceled) {
+			t.Fatalf("iteration %d: expected context.Canceled, got %v", i, err)
+		}
+	}
+
+	if got := atomic.LoadInt32(&enqueuedCount); got != 0 {
+		t.Fatalf("expected zero events enqueued, got %d", got)
+	}
+	if got := atomic.LoadInt32(&acceptedCount); got != 0 {
+		t.Fatalf("expected zero events accepted by the event loop (no State/sequencer mutation), got %d", got)
+	}
+	if len(client.Snapshot()) != 0 {
+		t.Fatalf("expected no output (nothing was ever mutated or drained), got %x", client.Snapshot())
+	}
+
+	if err := rt.SubmitSyntheticError(context.Background(), protocol.CycleID(99999), minimalErrorFrame()); err != nil {
+		t.Fatalf("expected the runtime to remain usable, got %v", err)
+	}
+
+	cancel()
+	waitDone(t, done)
 }

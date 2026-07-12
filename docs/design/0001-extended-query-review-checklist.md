@@ -21,6 +21,17 @@ be verified from the document as written, it should be treated as unchecked.
       semantics are described accurately (unnamed = implicitly replaced;
       named = explicit `Close` required, reuse-without-close is a real
       server error).
+- [ ] **Statement and portal lifetimes are described as distinct, not
+      conflated**: a named prepared statement persists until `Close` or
+      session end (unaffected by transaction boundaries); a named portal
+      persists only until `Close` **or the end of the current
+      transaction**, whichever comes first.
+- [ ] The design specifies concrete backend-protocol evidence (not
+      guesswork) for how SentinelDB detects a transaction has ended, and
+      that this evidence is used to invalidate open portal registry
+      entries.
+- [ ] A Simple Query message's effect on the unnamed prepared statement
+      and unnamed portal is explicitly documented, not omitted.
 - [ ] The distinction between statement-level `Describe` (always
       text-format `RowDescription`) and portal-level `Describe`
       (format-accurate `RowDescription`) is correctly captured.
@@ -31,6 +42,10 @@ be verified from the document as written, it should be treated as unchecked.
       acknowledgements that carry no name.
 - [ ] `Sync`'s dual role (implicit transaction closure + error-recovery
       boundary) is correctly and separately addressed.
+- [ ] **`Execute` is specified as never producing `RowDescription`** —
+      its response is limited to `DataRow*` followed by exactly one of
+      `CommandComplete`/`EmptyQueryResponse`/`PortalSuspended`/
+      `ErrorResponse`. `RowDescription` is sourced only from `Describe`.
 
 ## State lifecycle
 
@@ -45,8 +60,25 @@ be verified from the document as written, it should be treated as unchecked.
 - [ ] Replacement semantics for the unnamed statement/portal slot are
       described, including the effect (or explicit non-effect) on portals
       already bound from a since-replaced unnamed statement.
-- [ ] `Close` behavior (portal survives statement close and vice versa) is
-      addressed.
+- [ ] **`Close` behavior is asymmetric and correctly stated**: closing a
+      statement cascades to implicitly close every portal built from it
+      (this is official, documented PostgreSQL behavior, not an optional
+      design choice); closing a portal never affects its statement.
+- [ ] The statement-close cascade is specified to commit locally only on
+      the matching `CloseComplete` (not eagerly when `Close` is
+      forwarded), and to remove all dependent portal registry entries in
+      the same step.
+- [ ] A later reference to a portal removed by the statement-close cascade
+      (or by transaction-end invalidation) is specified to fail closed,
+      not to be silently resolved against stale metadata.
+- [ ] Registry entries are keyed so that a named `Parse`/`Bind` for a name
+      that already has a committed or pending entry cannot overwrite or
+      destabilize that existing entry before the real server acknowledges
+      the new one (e.g. generation IDs, pending overlays, or an
+      equivalent explicit mechanism — not a bare name-keyed map).
+- [ ] The design states explicitly what happens to a failed duplicate
+      named `Parse`/`Bind`: the pre-existing committed statement/portal
+      must remain intact and usable.
 
 ## Local rejection recovery
 
@@ -76,6 +108,46 @@ be verified from the document as written, it should be treated as unchecked.
 - [ ] Terminate-before-`Sync` behavior is specified.
 - [ ] A state diagram (or equivalent) is present and its transitions match
       the prose description.
+- [ ] **A genuine upstream `ErrorResponse` (not one SentinelDB generated
+      itself) is tracked as a distinct, separate state from the
+      client-facing discard-until-`Sync` flag**, not conflated with it.
+- [ ] The design specifies that all later pending operations in the same
+      cycle are immediately abandoned (never left waiting) once a real
+      upstream `ErrorResponse` is observed, since the real server will not
+      acknowledge them individually.
+- [ ] The design distinguishes "a real `ErrorResponse` in place of an
+      expected acknowledgement" (normal, protocol-legal) from "a message
+      matching no recognized pending operation at all" (true
+      desynchronization, fail closed) — these must not be handled
+      identically.
+- [ ] The design specifies that objects already committed in an earlier,
+      completed cycle are unaffected by a real upstream error in a later
+      cycle.
+
+## Response ordering
+
+- [ ] The design explicitly acknowledges that a mutex/`SerializedWriter`
+      alone guarantees byte-level non-interleaving but **not** semantic
+      response ordering across independent goroutines, and does not treat
+      the mutex as a substitute for an ordering mechanism.
+- [ ] An explicit ordered-response mechanism is designed (e.g. a unified
+      response-plan queue, an ordering barrier tied to operation
+      count/generation, or an equivalent with its own correctness
+      argument) — not left as an assumption.
+- [ ] The design states, with an explicit correctness argument (not just
+      an assertion), why real responses for earlier-forwarded operations
+      are always delivered to the client before a later, locally
+      synthesized `ErrorResponse` for a subsequently blocked operation in
+      the same pipelined cycle.
+- [ ] A Mermaid sequence diagram illustrates the chosen ordering mechanism
+      for a concrete mixed (allowed-then-blocked) pipeline.
+- [ ] Explicit invariants for the ordering mechanism are stated
+      (e.g. "a synthetic unit is never drained before every earlier unit
+      is fully drained").
+- [ ] Test scenarios exist for: pipelined allowed-before-blocked,
+      blocked-first (no preceding allowed operation), and multiple
+      would-be-blocked messages before a single `Sync` (confirming only
+      one `ErrorResponse`/response unit is produced).
 
 ## Masking safety
 
@@ -148,7 +220,10 @@ be verified from the document as written, it should be treated as unchecked.
       "must be rejected fail-closed" are three distinct, non-overlapping
       lists.
 - [ ] Mixing Simple Query and Extended Query on the same connection over
-      time is explicitly addressed.
+      time is explicitly addressed, **including that a forwarded Simple
+      Query destroys the real server's unnamed statement and unnamed
+      portal**, and that SentinelDB's own unnamed-slot registry entries
+      are invalidated to match (named entries must be unaffected).
 
 ## Tests
 
@@ -161,6 +236,15 @@ be verified from the document as written, it should be treated as unchecked.
 - [ ] Portal suspension/resume has a named test entry.
 - [ ] A test entry confirms Simple Query behavior is unaffected after an
       Extended Query cycle completes on the same connection.
+- [ ] Named test entries exist for all four transaction-end scenarios
+      (implicit closure at `Sync`, explicit `COMMIT`, explicit `ROLLBACK`,
+      failed-transaction `ROLLBACK`) and for a portal reference after
+      transaction end.
+- [ ] Named test entries exist for a Simple Query issued after an unnamed
+      statement/portal was created via Extended Query, covering both the
+      invalidation itself and a later reference to the invalidated object.
+- [ ] Named test entries exist for a duplicate named `Parse`/`Bind` whose
+      failure must leave the pre-existing committed object intact.
 
 ## Documentation truthfulness
 

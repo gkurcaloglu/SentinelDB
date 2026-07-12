@@ -2,7 +2,13 @@
 
 ## Status
 
-**Draft.**
+**Draft.** This revision corrects seven confirmed protocol/design errors
+found during the first review pass (prepared-statement `Close` cascading
+to portals, portal transaction-scoping, `Execute` response shape, mixed
+Simple/Extended Query state invalidation, client-response ordering,
+upstream-`ErrorResponse` cleanup, and duplicate-name registry safety) —
+each correction is marked inline where it applies. **Still not approved
+for implementation.**
 
 **No implementation exists yet.** This document is a design proposal only.
 Nothing described below — no connection-state model, no policy-evaluation
@@ -266,18 +272,104 @@ essentially "a prepared statement plus a specific set of parameter values,
 ready to execute." `Execute` runs a named portal, optionally limited to a
 maximum row count per call.
 
-**Named versus unnamed objects.** Both statements and portals may be
-*unnamed* (empty string `""` as the name). An unnamed statement or portal
-is anonymous, scoped to short-term use, and is silently replaced/destroyed
-the next time the client issues a new `Parse`/`Bind` with an empty name —
-no `Close` is needed or expected for unnamed objects. A *named* statement
-or portal persists until an explicit `Close` message, or the connection
-ends; issuing `Parse`/`Bind` with a name that is already in use as a named
-object (without first `Close`-ing it) is a protocol error from the real
-server. This asymmetry (unnamed = implicitly replaced; named = must be
-explicitly closed, and reuse-without-close errors) is a core piece of state
+### Correcting portal lifetime semantics
+
+**Named versus unnamed objects — and statements versus portals have
+*different* lifetimes.** This is a distinction the first draft of this
+document got wrong (conflating the two) and is corrected here:
+
+- A **named prepared statement** persists until an explicit `Close`
+  message or the end of the session — it is **not** affected by
+  transaction boundaries. A client can `Parse` a named statement once and
+  `Bind`/`Execute` it across many separate transactions later in the same
+  session.
+- A **named portal**, by contrast, persists only until an explicit `Close`
+  message **or the end of the current transaction, whichever comes
+  first** — portals are transaction-scoped. A portal bound inside a
+  transaction does not survive that transaction ending (by `COMMIT`,
+  `ROLLBACK`, or the implicit transaction `Sync` closes), whether or not
+  it was ever explicitly `Close`d.
+- An **unnamed portal** is additionally replaced by the next `Bind`
+  message specifying the unnamed portal as destination (no `Close`
+  needed), on top of the transaction-scoping above.
+- An **unnamed statement** is replaced by the next `Parse` message
+  specifying the unnamed statement as destination (no `Close` needed),
+  and is *not* transaction-scoped (matching named statements in this one
+  respect — only unnamed *portals* and named *portals* are
+  transaction-scoped; no statement, named or unnamed, is).
+- **A Simple Query (`'Q'`) message destroys both the unnamed prepared
+  statement and the unnamed portal** as a side effect of the real server
+  processing it — this is a *cross-protocol* interaction between Simple
+  Query and Extended Query on the same connection, addressed in full in
+  [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling)
+  below, since the first draft of this document incorrectly claimed
+  mixing the two protocols "requires no special handling."
+- Issuing `Parse`/`Bind` with a name that is already in use as a *named*
+  (not unnamed) object, without first `Close`-ing it, is a protocol error
+  from the real server — see
+  [Object generations: safely handling duplicate names](#object-generations-safely-handling-duplicate-names)
+  for how SentinelDB's own tracking handles this without needing to
+  pre-judge the outcome.
+
+This lifetime asymmetry (statements: session-scoped, unaffected by
+transactions; portals: transaction-scoped regardless of naming, plus
+unnamed objects additionally replaced on demand) is a core piece of state
 SentinelDB's own tracking must model correctly (see
 [Proposed connection state](#proposed-connection-state)).
+
+**How SentinelDB learns a transaction ended, from backend protocol
+evidence.** SentinelDB has no direct visibility into the real server's
+internal transaction manager — it can only observe wire-protocol messages.
+The one piece of backend evidence that reliably signals "a transaction has
+just ended," regardless of *why* it ended, is a transition in the tracked
+transaction-status byte carried by real `ReadyForQuery` messages
+(`internal/protocol/txstate.go`'s `TxStatusIdle`/`TxStatusInTransaction`/
+`TxStatusFailedTransaction`): **whenever a real `ReadyForQuery` reports
+status `'I'` (idle) and the immediately preceding tracked status was `'T'`
+(in transaction) or `'E'` (failed transaction), a transaction has just
+ended** — uniformly, regardless of whether it ended via an implicitly
+opened transaction being closed by `Sync`, an explicit `COMMIT`, an
+explicit `ROLLBACK`, or the mandatory `ROLLBACK` needed to leave a failed
+(`'E'`) transaction. SentinelDB does not need to parse `CommandComplete`
+tags (`"COMMIT"`/`"ROLLBACK"`) or otherwise special-case *how* the
+transaction ended; the `'T'|'E' → 'I'` transition on the shared
+`*protocol.TxState` is sufficient, single, protocol-generic evidence. When
+this transition is observed, **every currently-open portal registry entry
+(named and unnamed alike) is invalidated** — portals do not survive past
+the transaction that was active when they existed, per the lifetime rules
+above. Named prepared statements are *not* affected by this transition —
+only portals.
+
+**Concrete lifecycle scenarios this must cover** (see also the
+[Test matrix](#test-matrix) for the corresponding test entries):
+
+1. **Implicit transaction completion at `Sync`.** Client sends
+   `Parse`/`Bind`/`Execute` with no explicit `BEGIN` — the real server
+   implicitly opens a transaction for the duration of the extended-query
+   sequence. `Sync` closes it. The status byte on the `Sync`-triggered
+   `ReadyForQuery` transitions `'T' → 'I'`. Any portal bound during that
+   sequence is invalidated at this point.
+2. **Explicit `COMMIT`.** Client is in an explicit transaction (`BEGIN`
+   sent, possibly via Simple Query or its own `Parse`/`Bind`/`Execute`)
+   and issues `COMMIT` (via either protocol). The eventual `ReadyForQuery`
+   following `COMMIT`'s completion transitions `'T' → 'I'`. Same
+   invalidation applies to any portal bound since the transaction began.
+3. **Explicit `ROLLBACK`.** Same detection mechanism — `'T' → 'I'` (or
+   `'E' → 'I'`, if the transaction had already failed) — the *cause*
+   (commit vs. rollback) does not change what SentinelDB does locally;
+   only the tracked status transition matters.
+4. **Failed transaction completion.** A statement inside a transaction
+   errors at the real server, putting the connection in `'E'` (failed)
+   status; the client must issue `ROLLBACK` (the only statement PostgreSQL
+   accepts in `'E'` status besides `COMMIT`/`ROLLBACK` themselves) before
+   continuing. The `ReadyForQuery` following that `ROLLBACK`'s completion
+   transitions `'E' → 'I'` — same invalidation.
+5. **Portal references after transaction end.** Any
+   `Bind`/`Describe`/`Execute`/`Close` referencing a portal name that was
+   invalidated by one of the above transitions must be treated exactly
+   like a reference to a nonexistent object — fail closed (§
+   [Failure and fail-closed invariants](#failure-and-fail-closed-invariants)),
+   never silently resolved against stale cached shape/format metadata.
 
 **Parse versus Bind versus Execute.** `Parse` is the *only* message that
 carries SQL text; it does not execute anything and returns no rows.
@@ -314,12 +406,142 @@ the *actual wire format* of a later `Execute`'s `DataRow`s — only
 portal-level `Describe`, or independent tracking of the creating `Bind`'s
 result-format-codes, can.
 
+### Correcting Execute response semantics
+
+The first draft of this document's backend message table incorrectly
+implied `RowDescription` could appear as part of `Execute`'s own output
+("precedes `DataRow`s during `Execute` in rarer cases per protocol
+nuance"). This is wrong and is corrected here:
+
+- **`Execute` never issues `RowDescription`.** Per the official message-format
+  documentation, `RowDescription` is emitted *exclusively* in response to
+  `Describe` (of a statement or a portal). `Execute`'s own response is
+  always exactly: zero or more `DataRow` messages, followed by **exactly
+  one** of `CommandComplete`, `EmptyQueryResponse` (only for a portal bound
+  from an empty-string `Parse`), `PortalSuspended` (only if a nonzero
+  maximum row count was reached with more rows available), or
+  `ErrorResponse`. There is no fifth possible terminator and no
+  `RowDescription` anywhere in that list.
+- **Consequence: `Execute`'s result *shape* (column names/types) and
+  *wire format* (text/binary per column) must already be known before
+  `Execute` is processed** — they come from whichever `Describe`
+  (statement- or portal-level) SentinelDB has previously observed for that
+  portal or its underlying statement (shape), combined with the creating
+  `Bind`'s result-format-codes (wire format, per
+  [Response masking implications](#response-masking-implications)). There
+  is no mechanism by which `Execute` itself supplies or refreshes this
+  information.
+- **If no `Describe` was ever observed, the shape remains unknown when
+  `Execute`'s `DataRow`s start arriving.** This is not a transient state
+  that resolves itself during `Execute` processing — `Execute` will never
+  emit a `RowDescription` to resolve it. The only two options are: know
+  the shape already (from an earlier `Describe`), or don't know it at all
+  for the lifetime of that portal. The explicitly documented fail-closed
+  rule in [Response masking implications](#response-masking-implications)
+  (fail closed for `DataRow`s on a shape-unknown portal when masking is
+  enabled) exists specifically because there is no "wait a little longer,
+  the shape might still arrive" option — it will not.
+- This correction changes the [Backend message table](#backend-message-table)'s
+  `RowDescription` row (a `RowDescription` with no corresponding pending
+  `Describe` at the queue head is unconditionally unexpected ordering,
+  never a normal part of `Execute`'s output) and reinforces, rather than
+  changes, the masking design already described.
+
 **Close.** `Close` (type byte `'S'` or `'P'`, plus a name) explicitly
 destroys a named statement or portal, freeing the corresponding server-side
-resources; it responds with `CloseComplete`. Closing a statement that
-still has open portals referencing it is permitted by the protocol (the
-portals remain usable); SentinelDB's own bookkeeping must not assume
-closing a statement implies closing its portals, or vice versa.
+resources; it responds with `CloseComplete`. **Correction to this
+document's first draft:** closing a statement does **not** leave its
+portals usable — the official protocol documentation is explicit that
+**closing a prepared statement implicitly closes any open portals that
+were constructed from that statement.** Closing a *portal*, conversely,
+has no effect on the statement it was built from (a statement can have
+zero, one, or several portals open against it at any time, and closing
+one or all of them does not touch the statement itself). SentinelDB's own
+bookkeeping must model this cascade: **closing a statement removes both
+the statement's own registry entry and every portal registry entry
+referencing it**, but closing a portal only ever removes that one portal
+entry. See
+[Proposed connection state](#proposed-connection-state) for exactly when
+(on which backend acknowledgement) this cascade is actually committed
+locally, and
+[Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics)
+for the full analysis.
+
+### Correcting prepared-statement Close semantics
+
+This is deliberately analyzed in full, matching the depth given to the
+blocked-`Parse` scenario elsewhere in this document, because it was wrong
+in the first draft and is easy to get subtly wrong again during
+implementation.
+
+1. **What the official protocol documentation actually says.** Closing a
+   prepared statement implicitly closes any portals that were
+   constructed from it. This is not an optional cleanup detail — it is a
+   direct consequence of the real server's own resource ownership model
+   (a portal holds an execution plan derived from its statement; the
+   statement cannot be freed while a derived portal still references it,
+   so the server frees both together rather than leaving a dangling
+   portal). A later `Bind`/`Describe`/`Execute`/`Close` referencing one of
+   those now-implicitly-closed portals is therefore a reference to a
+   nonexistent object at the real server, exactly as if the client had
+   explicitly `Close`d that portal itself.
+2. **When SentinelDB must apply the cascade locally.** Following this
+   document's existing "do not commit state until the backend
+   acknowledges it" principle (§
+   [Proposed connection state](#proposed-connection-state)), the cascade
+   is **not** applied the moment the client's `Close` (of a statement) is
+   forwarded — it is applied only when the corresponding `CloseComplete`
+   is popped off the pending-operation queue, confirming the real server
+   actually performed the close. At that point, SentinelDB removes: (a)
+   the statement's own registry entry, and (b) **every portal registry
+   entry currently referencing that statement**, in the same local
+   operation. This is a multi-object commit triggered by a single backend
+   acknowledgement — different from every other pending-operation
+   correlation in this design, which is normally one acknowledgement to
+   one registry entry, and must be called out explicitly wherever the
+   pending-operation queue's commit logic is implemented.
+3. **Why the cascade must be conditioned on `CloseComplete`, not on
+   sending `Close`.** The real server could, in principle, reject a
+   `Close` referencing a name it doesn't recognize — though per the
+   protocol documentation this is explicitly *not* an error (closing a
+   nonexistent name is a no-op at the real server) — so in practice
+   `CloseComplete` is not expected to fail. The cascade is still gated on
+   `CloseComplete` rather than on forwarding, purely for consistency with
+   every other "commit only on backend evidence" rule in this design, and
+   to avoid a class of bugs where a future protocol nuance or a
+   real-server error path this document hasn't anticipated could leave
+   SentinelDB's registry disagreeing with the real server's actual state.
+4. **What happens to a portal already `Execute`-ing (or suspended) when
+   its underlying statement is closed.** The protocol does not forbid
+   `Close`-ing a statement while a portal built from it is mid-execution
+   or suspended; per the cascade rule, that portal is destroyed as part of
+   the same `CloseComplete`. Any *later* reference to that portal
+   (a further `Execute` to resume a suspended portal, for example) must be
+   treated exactly like a reference to an unknown portal — fail closed
+   (§ [Failure and fail-closed invariants](#failure-and-fail-closed-invariants)) —
+   this is a real, if unusual, client behavior (arguably a client bug) that
+   SentinelDB must not crash or desynchronize on.
+5. **What must never happen:** SentinelDB must never assume, guess, or
+   optimistically pre-apply the cascade before `CloseComplete` — for
+   example, forwarding a later `Bind`/`Execute` for one of the
+   soon-to-be-cascaded portals *before* `CloseComplete` arrives, on the
+   theory that "the `Close` was already sent so it's probably fine," would
+   risk racing the real server's own processing order. Pipelining means a
+   client *could* legally send `Close` (statement), then immediately
+   `Bind`/`Execute` referencing one of that statement's portals, all
+   before seeing any acknowledgement — but this is exactly the kind of
+   sequence a well-behaved client would not do intentionally, since the
+   real server processes messages for one connection strictly in arrival
+   order and would itself see the portal as already-gone by the time it
+   processes the later `Bind`/`Execute`. SentinelDB's job is to relay this
+   faithfully, not to pre-empt or reorder it: forward the later messages
+   in order (they are not yet locally known to be invalid, since the
+   registry hasn't cascaded yet — see the [object-generation model](#object-generations-safely-handling-duplicate-names)
+   for how pending references are tracked without ambiguity) and let the
+   real server's own ordering and error responses be the final word,
+   relayed to the client via the
+   [response-plan queue](#client-response-ordering-model) like any other
+   backend outcome.
 
 **Sync as a recovery boundary.** `Sync` has two jobs: it closes an
 implicitly-started transaction if one was opened only for the extended
@@ -429,7 +651,7 @@ sequenceDiagram
 | `Bind` | `B` | portal name, source statement name, parameter format codes, parameter values, result format codes | Referenced statement name must resolve to a *committed* (backend-acknowledged) or currently-pending-but-not-yet-blocked statement known to SentinelDB; portal name replacement rules for unnamed portals | Statement registry (lookup by name) | Registers a *pending* portal entry referencing the statement, storing result-format-codes and (only as much parameter metadata as needed, never full parameter values — see [Policy evaluation design](#policy-evaluation-design)) | **Only if the referenced statement is known-allowed and already forwarded/committed or validly pending** — otherwise treated as referencing a blocked/unknown object and discarded, not forwarded | None (no SQL text present) — parameter *values* are explicitly not logged or evaluated in the initial milestone | If the referenced statement was blocked or is unknown: synthesize `ErrorResponse` (only if not already in discard mode — see state machine), enter/remain in discard-until-`Sync`. Otherwise forward and mark pending |
 | `Describe` | `D` | type byte (`'S'`/`'P'`), name | Referenced statement/portal must be known (committed or validly pending) | Statement or portal registry (lookup by name) | None on its own; correlates with the next `ParameterDescription`/`RowDescription`/`NoData` to update SentinelDB's cached shape metadata for that statement/portal (see [Response masking implications](#response-masking-implications)) | Forwarded if the referenced object is known and not blocked; otherwise discarded like `Bind` | None | If unknown/blocked: synthesize `ErrorResponse` if not already discarding, enter discard mode |
 | `Execute` | `E` | portal name, maximum row count | Referenced portal must be known (committed or validly pending); no SQL text is present to validate | Portal registry (lookup by name), portal's suspension/exhaustion status | Marks the portal's execution as pending (backend response correlation, esp. for `PortalSuspended` continuation) | Forwarded only if the referenced portal is known-allowed; otherwise discarded | None (no SQL text) | If unknown/blocked portal: synthesize `ErrorResponse` if not already discarding, enter discard mode |
-| `Close` | `C` | type byte (`'S'`/`'P'`), name | Referenced statement/portal name should exist in SentinelDB's registry for correct bookkeeping, but per protocol, closing a nonexistent name is *not* an error at the real server (it is a no-op there) | Statement or portal registry | Marks the entry pending removal (removed on `CloseComplete`, not immediately — see [Proposed connection state](#proposed-connection-state)) | Forwarded unconditionally (closing is always safe to pass through; the real server tolerates closing a nonexistent name) | None | Backend `CloseComplete` removes the pending-removal entry; no local failure path distinct from a generic decode/ordering error |
+| `Close` | `C` | type byte (`'S'`/`'P'`), name | Referenced statement/portal name should exist in SentinelDB's registry for correct bookkeeping, but per protocol, closing a nonexistent name is *not* an error at the real server (it is a no-op there) | Statement or portal registry | Marks the entry (and, **if closing a statement, every portal registry entry currently referencing it**) pending removal, cascade applied only on the matching `CloseComplete`, not immediately — see [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics) | Forwarded unconditionally (closing is always safe to pass through; the real server tolerates closing a nonexistent name) | None | Backend `CloseComplete` removes the pending-removal entry (and, for a statement close, cascades to remove its dependent portal entries in the same step); no local failure path distinct from a generic decode/ordering error |
 | `Flush` | `H` | none | None | None | None | Forwarded unconditionally *if not currently in discard-until-`Sync` mode*; silently absorbed (not forwarded) while discarding, matching the "no messages processed until `Sync`" contract | None | None (no acknowledgement message exists for `Flush`) |
 | `Sync` | `S` | none | None | Discard-until-`Sync` flag (this message clears it) | Ends the current extended-query cycle: closes any implicit transaction, resets discard mode, clears local per-cycle bookkeeping (committed-object registries persist; only *pending, unforwarded* entries created after a block are discarded) | **Always forwarded to the real server**, whether or not anything was blocked earlier in the cycle (see [Local rejection state machine](#local-rejection-state-machine) for why) | None (already evaluated whatever preceded it) | Real server's own `ReadyForQuery` is relayed to the client unchanged; this is the sole source of truth for post-cycle transaction status |
 | `Terminate` | `X` | none | None | None | Immediately ends the connection from the client's side | Forwarded immediately regardless of discard-mode state, then the connection is closed on both sides without waiting for further backend traffic | None | N/A — this is the terminal state for the connection |
@@ -440,9 +662,9 @@ sequenceDiagram
 |---|---|---|---|---|---|---|
 | `ParseComplete` | `1` | `Parse` | Head of the pending-operation queue (FIFO, see [Proposed connection state](#proposed-connection-state)) must be a pending `Parse` | **Yes** — this is the point the statement moves from "pending" to "committed" in SentinelDB's registry | No (no row data involved) | If the queue head isn't a pending `Parse`: protocol desynchronization — fail closed, close both connections (matches today's "no synthetic message may use incorrect state" invariant) |
 | `BindComplete` | `2` | `Bind` | Head of the pending-operation queue must be a pending `Bind` | **Yes** — portal moves from "pending" to "committed" | No | Same fail-closed handling as above |
-| `CloseComplete` | `3` | `Close` | Head of the pending-operation queue must be a pending `Close` | **Yes** — statement/portal entry is actually removed from the registry now, not when `Close` was sent | No | Same fail-closed handling as above |
+| `CloseComplete` | `3` | `Close` | Head of the pending-operation queue must be a pending `Close` | **Yes** — statement/portal entry is actually removed from the registry now, not when `Close` was sent. **If the closed object was a statement, every portal registry entry referencing it is removed in this same step** (§ [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics)) — closing a portal removes only that one portal entry | No | Same fail-closed handling as above |
 | `ParameterDescription` | `t` | `Describe` (statement) | Head of the pending-operation queue must be a pending `Describe` of type `'S'` | Updates cached parameter type OIDs for that statement | No (not row data) | Same fail-closed handling |
-| `RowDescription` | `T` | `Describe` (statement or portal), or precedes `DataRow`s during `Execute` in rarer cases per protocol nuance | Head of the pending-operation queue (a pending `Describe`) *or* is understood as describing the portal currently executing | **Yes, for masking purposes** — updates the cached column-name/type list (and, if from a portal-level `Describe`, the actual per-column wire format) used to decide which columns to mask | **Yes** — this is the primary metadata source for `masking.Transformer`'s per-portal column tracking | If received with no corresponding pending `Describe` and no portal currently executing: fail closed (unexpected ordering) |
+| `RowDescription` | `T` | `Describe` (statement or portal) **only** | Head of the pending-operation queue must be a pending `Describe` | **Yes, for masking purposes** — updates the cached column-name/type list (and, if from a portal-level `Describe`, the actual per-column wire format) used to decide which columns to mask | **Yes** — this is the primary metadata source for `masking.Transformer`'s per-portal column tracking | **Correction to this document's first draft:** `Execute` never produces `RowDescription` — it is emitted *only* in response to `Describe`. A `RowDescription` with no corresponding pending `Describe` at the queue head is always unexpected ordering: fail closed. See [Correcting Execute response semantics](#correcting-execute-response-semantics) |
 | `NoData` | `n` | `Describe` (statement or portal) whose result has no columns | Head of the pending-operation queue must be a pending `Describe` | Yes — records "no columns" for that statement/portal, distinct from "unknown" | Yes — tells the transformer this portal will never need masking | Same fail-closed handling |
 | `DataRow` | `D` | `Execute` (the currently-executing portal) | Correlated to whichever portal is currently marked "executing" (there is at most one at a time per connection, since PostgreSQL processes a connection's messages serially even under pipelining) | N/A (not a state-committing message on its own) | **Yes** — this is exactly what `masking.Transformer` already masks; the column/format metadata used comes from the executing portal's cached shape (§ [Response masking implications](#response-masking-implications)) | If no portal is marked executing: fail closed |
 | `CommandComplete` | `C` | `Execute` that ran to completion | Marks the currently-executing portal as no longer executing | N/A | Yes — triggers the same `clearResultSet`-equivalent behavior, scoped to that portal | If no portal is marked executing: fail closed |
@@ -458,52 +680,74 @@ distinct from (and additional to) the existing `protocol.TxState`.
 Evaluated structures:
 
 - **Prepared statement registry** — keyed by statement name (`""` for the
-  unnamed slot, which always has capacity for exactly one entry, replaced
-  on every new unnamed `Parse` rather than requiring an explicit `Close`).
-  Per entry: statement name, original SQL text, declared parameter type
-  OIDs (as sent in `Parse`, before resolution), policy decision metadata
-  (verdict, reason, evaluation duration — mirroring what `firewall.Gate`
-  already logs for `Query`, never the parameter values), and a creation
-  status of one of: `pending` (forwarded, awaiting `ParseComplete`),
-  `committed` (acknowledged by the real server), or `blocked` (evaluated
-  locally and never forwarded). Replacement semantics for the unnamed
-  statement: a new unnamed `Parse` immediately invalidates any *committed*
-  unnamed statement's committed portals are **not** automatically
-  invalidated by this — per protocol, replacing the unnamed statement does
-  not retroactively affect portals already bound from the old one, only
-  future `Bind`s naming the unnamed statement resolve to the new one. Named
-  statements are never silently replaced; a `Parse` naming an
-  already-committed named statement is a real-server error SentinelDB
-  should not attempt to preempt (see below).
-- **Portal registry** — keyed by portal name (same `""`-slot semantics as
-  the unnamed statement). Per entry: portal name, the statement name it
-  was bound from (a pointer/reference, not a copy, so statement-level
-  policy metadata stays a single source of truth), parameter format codes,
-  **not** the parameter values themselves (see below), result format
+  unnamed slot). Because a name alone is not a safe key across pipelined,
+  possibly-conflicting operations (§
+  [Object generations](#object-generations-safely-handling-duplicate-names)
+  below), each entry is actually identified by a `(name, generation)`
+  pair, where `generation` is a per-name, monotonically increasing counter
+  assigned locally by SentinelDB. Per entry: statement name, generation,
+  original SQL text, declared parameter type OIDs (as sent in `Parse`,
+  before resolution), policy decision metadata (verdict, reason,
+  evaluation duration — mirroring what `firewall.Gate` already logs for
+  `Query`, never the parameter values), and a creation status of one of:
+  `pending` (forwarded, awaiting `ParseComplete`), `committed`
+  (acknowledged by the real server), or `blocked` (evaluated locally and
+  never forwarded).
+- **Portal registry** — keyed by `(name, generation)` on the same
+  principle (`""` for the unnamed slot). Per entry: portal name,
+  generation, a reference to the **specific `(statement name, statement
+  generation)`** it was bound from (not just a name — see
+  [Object generations](#object-generations-safely-handling-duplicate-names)),
+  parameter format codes, **not** the parameter values themselves (see
+  [Policy evaluation design](#policy-evaluation-design)), result format
   codes, creation status (`pending`/`committed`/`blocked`, same meaning as
   for statements), and execution status (`not started` / `executing` /
-  `suspended` / `exhausted`).
+  `suspended` / `exhausted`). Every portal entry additionally records
+  **which transaction it was created in** (a monotonically increasing
+  local transaction-epoch counter, incremented every time the shared
+  `*protocol.TxState` observes a `'T'|'E' → 'I'` transition — see
+  [Correcting portal lifetime semantics](#correcting-portal-lifetime-semantics)) —
+  this is how portal entries are identified for bulk invalidation at
+  transaction end, without needing to enumerate them by name.
 - **Pending-operation queue** — an ordered (FIFO) list of "operation kind +
-  target name" entries for every frontend message forwarded to the real
-  server whose backend acknowledgement has not yet arrived. This is what
-  makes pipelining correlation possible: `ParseComplete`, `BindComplete`,
-  `CloseComplete`, `ParameterDescription`, `RowDescription`, and `NoData`
-  are all correlated by *popping the queue head*, not by re-parsing the
-  acknowledgement message for a name (most of these acknowledgements carry
-  no name at all — correlation is positional by design in the real
-  protocol, and SentinelDB must respect that rather than inventing a
-  keyed lookup that the wire format doesn't support).
-- **Extended-cycle error state** ("discard-until-`Sync`") — a single
-  per-connection boolean (or small enum, see the state diagram in
-  [Local rejection state machine](#local-rejection-state-machine)), set
-  when SentinelDB itself blocks/rejects something locally, cleared only on
-  `Sync`. While set, subsequent frontend messages (other than `Sync` and
-  `Terminate`) are not forwarded, not evaluated, and do not themselves
-  generate a second `ErrorResponse` (only the first blocking event does —
-  mirroring the real server's own single-`ErrorResponse`-then-silence
-  behavior).
+  target `(name, generation)`" entries for every frontend message
+  forwarded to the real server whose backend acknowledgement has not yet
+  arrived. This is what makes pipelining correlation possible:
+  `ParseComplete`, `BindComplete`, `CloseComplete`, `ParameterDescription`,
+  `RowDescription`, and `NoData` are all correlated by *popping the queue
+  head*, not by re-parsing the acknowledgement message for a name (most of
+  these acknowledgements carry no name at all — correlation is positional
+  by design in the real protocol). Tagging queue entries with generation
+  (not just name) is what lets two pipelined operations against the same
+  name be correlated unambiguously (§
+  [Object generations](#object-generations-safely-handling-duplicate-names)).
+- **Client-facing extended-cycle error state** ("discard-until-`Sync`") —
+  a single per-connection boolean, set when SentinelDB itself
+  blocks/rejects something locally, cleared only on `Sync`. While set,
+  subsequent frontend messages (other than `Sync` and `Terminate`) are not
+  forwarded, not evaluated, and do not themselves generate a second
+  `ErrorResponse`. This is distinct from, and tracked independently of,
+  the **server-facing** discard state below.
+- **Server-facing extended-cycle error state** ("server-discard-until-
+  `Sync`") — a *separate* per-connection boolean, set when a *real*
+  `ErrorResponse` arrives from the backend during an extended-query cycle
+  (as opposed to one SentinelDB synthesized itself), cleared only on the
+  real `ReadyForQuery` that follows. See
+  [Clarifying real upstream ErrorResponse cleanup](#clarifying-real-upstream-errorresponse-cleanup)
+  for why this cannot be the same flag as the client-facing one and what
+  it does to the pending-operation queue.
+- **Response-plan queue** — a new, previously-unmodeled per-connection
+  structure that orders *client-visible output* (both real backend bytes
+  relayed by `masking.Transformer` and synthetic bytes produced by
+  `firewall.Gate`) into a single, strictly-ordered sequence. See
+  [Client-response ordering model](#client-response-ordering-model) for
+  the full design — this is a **new coordination layer**, not something
+  that exists in the codebase today, and it changes which component is
+  responsible for writing to the client during Extended Query cycles.
 - **Current transaction status** — unchanged, reuses the existing
-  `*protocol.TxState` (§ [Existing SentinelDB architecture](#existing-sentineldb-architecture)).
+  `*protocol.TxState` (§ [Existing SentinelDB architecture](#existing-sentineldb-architecture)),
+  but is now also the trigger source for portal transaction-scoping (see
+  above) and for the local transaction-epoch counter.
 - **Active `RowDescription`/result metadata** — extended from today's
   single `t.fields`/`t.maskColIdx` pair (which assumes one active result
   set) to per-portal shape metadata: column names/types (from whichever
@@ -523,18 +767,20 @@ Evaluated structures:
 Analysis: a `Parse`, `Bind`, or `Close` that SentinelDB decides to forward
 is *not yet* guaranteed to succeed at the real server — the real server
 could still reject it (e.g. a genuine SQL syntax error in an
-allowed-by-policy `Parse`, or a named-statement-already-exists conflict
-SentinelDB chose not to preempt). If SentinelDB committed registry state
-optimistically at forward-time and the real server then errors, the
-registry would describe objects that don't actually exist upstream,
-corrupting all subsequent correlation. Therefore: **registry entries are
-created in a `pending` state when the frontend message is forwarded, and
-only promoted to `committed` when the corresponding backend
-acknowledgement (`ParseComplete`/`BindComplete`/`CloseComplete`) is
-popped off the pending-operation queue in the correct position.** If an
-`ErrorResponse` arrives instead of the expected acknowledgement, the
-pending entry is discarded (never committed), matching what really
-happened upstream.
+allowed-by-policy `Parse`, or a named-statement-already-exists conflict).
+If SentinelDB committed registry state optimistically at forward-time and
+the real server then errors, the registry would describe objects that
+don't actually exist upstream, corrupting all subsequent correlation.
+Therefore: **registry entries are created in a `pending` state (as a new
+generation, never overwriting an existing committed generation for the
+same name) when the frontend message is forwarded, and only promoted to
+`committed` when the corresponding backend acknowledgement
+(`ParseComplete`/`BindComplete`/`CloseComplete`) is popped off the
+pending-operation queue in the correct position.** If an `ErrorResponse`
+arrives instead of the expected acknowledgement, the pending generation is
+discarded (never committed) and **any previously committed generation for
+that same name is completely unaffected** — see
+[Object generations](#object-generations-safely-handling-duplicate-names).
 
 **Pipelining implication.** Because multiple operations can be pending
 (forwarded, unacknowledged) simultaneously, the pending-operation queue
@@ -543,10 +789,148 @@ an object that is only `pending` (not yet `committed`) must still be
 treated as *provisionally valid* for forwarding purposes (the client is
 allowed to pipeline `Parse` → `Bind` → `Execute` for the same object
 without waiting for `ParseComplete` first) — SentinelDB tracks this as
-"referenced object exists in `pending` or `committed` state, i.e. not
-`blocked` and not entirely unknown," and defers the final correctness
-judgment to the real server's own acknowledgement stream, which SentinelDB
-relays transparently in this case.
+"referenced `(name, generation)` exists in `pending` or `committed` state,
+i.e. not `blocked` and not entirely unknown," and defers the final
+correctness judgment to the real server's own acknowledgement stream,
+which SentinelDB relays transparently in this case.
+
+### Mixed Simple/Extended Query state handling
+
+The first draft of this document incorrectly claimed that mixing Simple
+Query and Extended Query on the same connection "requires no special
+handling beyond shared `TxState` and `SerializedWriter`." This is wrong:
+**forwarding a Simple Query (`'Q'`) message to the real server destroys
+the server's unnamed prepared statement and unnamed portal** as a side
+effect of how the real server processes Simple Query internally (it
+always uses, and thus replaces, the unnamed statement/portal slots
+regardless of what Extended Query state existed before it). Named
+statements and named portals are **not** affected by a Simple Query.
+
+**Design:** when a `Query` message is forwarded (allowed by policy,
+exactly as today), SentinelDB's own unnamed-statement and unnamed-portal
+registry slots must be invalidated to match. Following this document's
+"commit only on backend evidence" principle, this invalidation is applied
+when the real server's response to that `Query` is fully observed — the
+existing Simple Query response sequence always ends in a real
+`ReadyForQuery` (`internal/masking/transformer.go`'s existing
+`ReadyForQuery` handling, unchanged), so **that `ReadyForQuery` is the
+evidence point**: upon observing it, SentinelDB unconditionally clears
+whatever is currently in the unnamed-statement and unnamed-portal slots
+(regardless of their state — `committed`, `pending`, or nonexistent — an
+empty slot invalidates to itself trivially). Any subsequent
+`Bind`/`Describe`/`Execute`/`Close` referencing the unnamed name resolves
+against whatever *new* unnamed object a later `Parse`/`Bind` creates, or
+is treated as unknown (fail closed) if nothing has re-created it yet —
+exactly the same treatment as any other reference to a nonexistent
+object. Named statement and portal registry entries are left completely
+untouched by this invalidation.
+
+### Object generations: safely handling duplicate names
+
+The first draft of this document left this as an **open question**
+("Should a named-statement name conflict be detected and rejected locally
+by SentinelDB... or should SentinelDB always forward and let the real
+server's own error response be relayed?") without a mechanism that would
+make either answer safe. That is an implementation hazard, not a genuinely
+open design choice, and is resolved here.
+
+**The hazard, stated precisely.** A registry keyed only by name is
+unsafe the moment a name can have more than one "candidate" state at once
+— which pipelining makes routine, not exceptional. Consider: a named
+statement `"s1"` is already `committed` (successfully `Parse`d and
+acknowledged earlier). The client, whether by design or by bug, sends
+another `Parse` naming `"s1"` again, without a preceding `Close`, and
+pipelines a `Bind`/`Execute` against `"s1"` right behind it, all before any
+acknowledgement comes back. If SentinelDB's registry is keyed only by
+name and the *first* thing it does upon forwarding the new `Parse` is
+overwrite (or mark-pending-over) the existing `"s1"` entry, then: if the
+real server rejects the duplicate `Parse` (which it will, per protocol —
+a live named statement cannot be silently replaced), SentinelDB's local
+registry has already lost track of the *old*, still-actually-live `"s1"`
+that the real server did **not** touch — a subsequent legitimate `Bind`
+against the original `"s1"` would then be incorrectly treated as
+referencing something SentinelDB believes is only `pending` (or worse,
+gone), when the real server still considers it fully valid and committed.
+This is exactly the kind of local-state-vs-upstream-state divergence this
+entire design otherwise goes to great lengths to prevent.
+
+**Chosen mechanism: per-name generation counters.** Every registry entry
+(statement or portal) is identified by a `(name, generation)` pair, not by
+name alone. `generation` is a monotonically increasing integer, scoped to
+that name, assigned **locally by SentinelDB** (it is never part of the
+wire protocol) each time a `Parse` (for statements) or `Bind` (for
+portals) is processed for that name — whether the name is brand new or
+already has an existing committed or pending generation.
+
+- **Creating a new generation never overwrites an existing one.** When
+  `Parse` arrives for name `N`, SentinelDB computes
+  `generation = (highest generation seen for N so far) + 1` and creates a
+  **new, separate** registry entry for `(N, generation)` in `pending`
+  state. Any existing `committed` entry for `(N, older-generation)` is left
+  completely untouched, in memory, unchanged, for as long as it remains
+  referenced.
+- **The pending-operation queue is tagged by `(name, generation)`, not
+  just `name`.** This is what makes the two in-flight operations on the
+  same name correlate unambiguously (§ [Proposed connection state](#proposed-connection-state)):
+  the queue entry for the new `Parse` says "generation 2 of `s1`," fully
+  distinct from any queue entry that might still reference "generation 1
+  of `s1`."
+- **On success, the new generation is promoted to `committed`** when its
+  `ParseComplete`/`BindComplete` is popped off the pending-operation
+  queue. For the **unnamed** slot specifically, promotion also retires the
+  immediately-previous generation for `""` (the unnamed slot always has
+  exactly one *current* committed generation, matching its "always
+  implicitly replaced" semantics) — but see the next point for why this
+  retirement is not destructive to anything already bound to the old
+  generation.
+- **On failure (a real `ErrorResponse` instead of the expected
+  acknowledgement), the new generation's pending entry is simply discarded
+  — nothing else changes.** For a **named** slot, this is the common case
+  in practice: a `Parse` for an already-committed named statement, sent
+  without a preceding `Close`, will be rejected by the real server exactly
+  as protocol-documented, and the mechanism above guarantees the old,
+  still-live `committed` generation is never touched by that failure —
+  SentinelDB does not need to have pre-judged whether the duplicate would
+  succeed or fail; either outcome is handled mechanically and correctly by
+  the same generation-tracking logic.
+- **Portals reference a specific `(statement name, statement generation)`
+  pair, captured at `Bind` time, immutably.** This is what already
+  correctly guarantees (independently confirmed, not newly introduced by
+  this section) that replacing the unnamed statement does not retroactively
+  affect portals bound from the *old* unnamed generation: a portal built
+  from unnamed generation 3 keeps referencing generation 3 specifically,
+  even after the unnamed slot's *current* generation moves on to 4, 5, and
+  so forth. The portal only becomes unresolvable if generation 3 itself is
+  later removed (by an explicit `Close` of that specific generation, by
+  the statement-close cascade, or — for named statements — session end;
+  the unnamed slot's old generations are simply never referenced by
+  anything once their portals are themselves gone, and can be garbage
+  collected once no portal entry points to them).
+
+**This mechanism directly satisfies every requirement this correction asks
+for:**
+
+- A failed duplicate named `Parse` leaves the old committed statement
+  intact — by construction, since the failed attempt only ever existed as
+  a separate, newly created, never-promoted generation.
+- A failed duplicate named `Bind` leaves the old committed portal intact
+  — identical mechanism, applied to the portal registry.
+- Pending pipelined operations can be correlated without ambiguous name
+  lookup — the pending-operation queue's `(name, generation)` tagging
+  removes the ambiguity a name-only queue would have.
+- Local state always matches the most recently acknowledged upstream state
+  — because nothing is ever promoted to `committed` except by an actual
+  backend acknowledgement for that specific generation, and older
+  generations are never mutated by a newer generation's outcome.
+
+**Resolution of the previously open question.** SentinelDB does **not**
+need to detect and pre-reject a named-statement/portal name conflict
+locally — it can always simply forward the operation (as a new
+generation) and let the real server's own acknowledgement or
+`ErrorResponse` decide the outcome, because the generation mechanism above
+makes that deference completely safe regardless of which way the real
+server rules. This removes the open question from
+[Open questions](#open-questions): it is resolved, not merely deferred.
 
 ## Policy evaluation design
 
@@ -651,16 +1035,24 @@ This is deliberately analyzed in full, not hand-waved:
 7. **Mixed/pipelined case:** if some *earlier* operations in the same cycle
    were legitimately forwarded (allowed `Parse`/`Bind`/`Execute` for
    statement/portal "A") before the block occurred (on statement/portal
-   "B"), those earlier operations' real backend responses continue to be
-   relayed to the client normally, interleaved in their original order,
-   completely independently of "B"'s local block — the discard-until-
-   `Sync` state only suppresses *forwarding of further frontend messages*,
-   it does not touch already-in-flight backend responses for
+   "B"), those earlier operations' real backend responses are still
+   relayed to the client — but *not* merely by an informal "interleaved in
+   original order" assumption. The precise mechanism is the
+   [response-plan queue](#client-response-ordering-model): "A"'s operations
+   already occupy pass-through units earlier in the queue than "B"'s
+   synthetic unit, so they are guaranteed (by construction, not by timing
+   luck) to be fully drained to the client before "B"'s `ErrorResponse` is
+   written, regardless of the real network's actual delivery timing. The
+   discard-until-`Sync` state only suppresses *forwarding of further
+   frontend messages* (and thus prevents new pass-through units from being
+   created); it does not touch already-enqueued pass-through units for
    already-forwarded operations. The final `Sync` (forwarded, as above)
    correctly closes out "A"'s legitimately-open cycle at the real server,
-   and the real server's single resulting `ReadyForQuery` still correctly
-   represents "the whole client-visible cycle, including the locally
-   aborted part, is now resynchronized."
+   occupies the last unit in the response plan, and the real server's
+   single resulting `ReadyForQuery` still correctly represents "the whole
+   client-visible cycle, including the locally aborted part, is now
+   resynchronized" — relayed to the client last, per the queue's ordering
+   guarantee.
 
 ## Local rejection state machine
 
@@ -717,6 +1109,269 @@ Explicit answers:
   matches `Terminate`'s existing protocol meaning (the client is ending
   the session unconditionally) and requires no special-casing beyond "the
   discard-until-`Sync` flag does not suppress `Terminate` forwarding."
+
+**Note:** the bullet above, "How is `ReadyForQuery` produced," describes
+*what* is written to the client (the real server's own `ReadyForQuery`),
+but not *when*, relative to other still-in-flight output for earlier
+operations in the same pipelined cycle. That timing question — and why a
+mutex alone does not answer it — is addressed in full in
+[Client-response ordering model](#client-response-ordering-model) below.
+
+### Client-response ordering model
+
+**The gap in the first draft of this document:** it said SentinelDB
+"writes a synthetic `ErrorResponse` to the client" the moment a `Parse` is
+blocked, while separately acknowledging that earlier, legitimately
+forwarded pipelined operations (statement/portal "A") might still have
+real backend responses in flight. It then asserted this was fine because
+`protocol.SerializedWriter` prevents "byte interleaving." **This is not
+sufficient, and treating it as sufficient is the actual bug this
+correction fixes.** `SerializedWriter` (`internal/protocol/writer.go`) is
+a mutex around a single `Write` call — it guarantees that no two `Write`
+calls' *bytes* get spliced together mid-message. It guarantees nothing
+about which of two *independent* goroutines' calls happens *first*. In the
+existing architecture, `firewall.Gate`'s goroutine (frontend-processing)
+and `masking.Transformer`'s goroutine (backend-processing) each
+independently decide when to call `clientWriter.Write(...)`. If `Gate`'s
+goroutine blocks `Parse` B and calls `Write` with B's synthetic
+`ErrorResponse` before `Transformer`'s goroutine has finished relaying
+A's still-arriving `DataRow`s/`CommandComplete`, the client would receive
+B's error **before** A's real results — a genuine reordering bug, not a
+byte-corruption bug, and one a mutex cannot prevent because a mutex only
+serializes *access*, not *intent order*.
+
+**Chosen design: a unified response-plan queue.** A single per-connection,
+strictly FIFO **response plan** is introduced, containing **response
+units** of two kinds:
+
+- A **pass-through unit**, created whenever `firewall.Gate` forwards a
+  frontend message to the real server. It records which pending operation
+  (by `(kind, name, generation)`, § [Proposed connection state](#proposed-connection-state))
+  it corresponds to, and therefore which backend message(s) will
+  eventually satisfy it (e.g. a `Parse` pass-through unit is satisfied by
+  `ParseComplete`; an `Execute` pass-through unit is satisfied by zero or
+  more `DataRow`s followed by exactly one of
+  `CommandComplete`/`EmptyQueryResponse`/`PortalSuspended`/`ErrorResponse`,
+  per [Correcting Execute response semantics](#correcting-execute-response-semantics)).
+  A pass-through unit carries **no bytes of its own** — its content is
+  whatever the real server eventually sends.
+- A **synthetic unit**, created whenever `firewall.Gate` blocks/rejects a
+  frontend message locally. It carries the **exact, already-fully-built**
+  bytes to send (the synthetic `ErrorResponse`) and depends on nothing
+  from the backend.
+
+**Who writes to the client.** `firewall.Gate`'s goroutine **no longer
+calls `clientWriter.Write` directly for synthetic bytes** — this is the
+concrete architectural change this correction requires relative to the
+first draft (and relative to today's codebase, which has no such
+distinction because Simple Query never needs one). Instead, it only ever
+*appends* units to the response plan. A single drain path — naturally,
+`masking.Transformer`'s existing backend-message-processing loop, since it
+already processes backend messages strictly in arrival order — becomes
+**the sole writer to the client for the entire Extended Query cycle**: it
+processes response-plan units strictly head-first; for a pass-through unit
+at the head, it reads and relays (masking as needed) backend messages
+until that unit's terminating message is observed, exactly as
+`masking.Transformer` already does today for each individual message, then
+pops the unit; for a synthetic unit at the head, it writes the pre-built
+bytes immediately (no backend dependency) and pops it, before looking at
+any further backend traffic. `protocol.SerializedWriter` remains in place
+underneath this — it is still the mechanism that guarantees a single
+`Write` call's bytes aren't spliced with another concurrent write — but
+with this design there is only ever **one** logical writer issuing
+ordered `Write` calls during an Extended Query cycle, so the byte-level
+guarantee and the semantic-order guarantee now both hold, for different
+reasons, at different layers.
+
+**Why this is correct (explicit argument, not just assertion).** The
+response plan is populated strictly in the order `firewall.Gate` processes
+frontend messages (single-threaded within `Gate.Run`'s read loop, exactly
+as today). Draining is strictly head-first, and a unit is only popped once
+fully satisfied (a pass-through unit needs its terminating backend
+message; a synthetic unit needs nothing and is popped immediately). Since
+blocked operations are *never* forwarded to the real server, the backend
+message stream contains bytes correlated **only** with pass-through units
+— there is no possible backend traffic that could satisfy a *later* unit
+before an *earlier* one, because pass-through units are satisfied strictly
+in the order their corresponding requests were forwarded (the real
+server's own response-ordering guarantee, § [PostgreSQL Extended Query model](#postgresql-extended-query-model)'s
+"Pipelining and response correlation"). Therefore client-visible output
+order is *exactly* the frontend processing order, with synthetic units
+substituting silently for what would otherwise have been a pass-through
+unit's (blocked, never-sent) output — which is precisely the guarantee
+required.
+
+**Worked example**, matching the scenario named in this correction: allowed
+`Parse`/`Bind`/`Execute` "A" forwarded upstream, blocked `Parse` "B"
+handled locally, `Sync` received later. The response plan, in insertion
+order, is: `[A-Parse(pass-through), A-Bind(pass-through),
+A-Execute(pass-through), B-Parse(synthetic), Sync(pass-through)]`. Draining
+proceeds: A's three pass-through units are satisfied and popped in order
+as their real backend acknowledgements/`DataRow`s/`CommandComplete`
+arrive; B's synthetic unit is then immediately popped (its bytes were
+already known); `Sync`'s pass-through unit waits for and relays the real
+`ReadyForQuery` last. The client observes A's real output, then B's
+`ErrorResponse`, then the real `ReadyForQuery` — in exactly that order,
+regardless of the real network timing of A's backend responses relative
+to when B was blocked.
+
+### Sequence diagram: response-plan ordering with a mixed pipeline
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as firewall.Gate
+    participant RP as Response plan (queue)
+    participant PG as Real PostgreSQL
+    participant T as masking.Transformer
+
+    C->>G: Parse A / Bind A / Execute A
+    G->>RP: enqueue pass-through units (A: Parse, Bind, Execute)
+    G->>PG: forward Parse A / Bind A / Execute A
+
+    C->>G: Parse B (matches blocked phrase)
+    G->>G: Policy.Evaluate -> Block
+    G->>RP: enqueue synthetic unit (B: ErrorResponse bytes)
+    Note over G,PG: Parse B is never forwarded to PG
+
+    C->>G: Sync
+    G->>RP: enqueue pass-through unit (Sync)
+    G->>PG: forward Sync (always forwarded)
+
+    PG-->>T: ParseComplete (A) / BindComplete (A) / DataRow*/CommandComplete (A)
+    T->>RP: satisfy + drain A's pass-through units, in order
+    RP-->>C: relay A's real responses (masked as needed)
+
+    RP->>RP: head is now B's synthetic unit (no backend dependency)
+    RP-->>C: write B's synthetic ErrorResponse
+
+    PG-->>T: real ReadyForQuery (for the forwarded Sync)
+    T->>RP: satisfy + drain Sync's pass-through unit
+    RP-->>C: relay real ReadyForQuery
+```
+
+**Explicit invariants:**
+
+- A synthetic unit's bytes are never written to the client before every
+  earlier unit in the response plan has been fully drained.
+- A pass-through unit is never popped before its terminating backend
+  message has actually been observed and relayed — there is no timeout or
+  best-effort skip for a pass-through unit while backend traffic for it is
+  still possible.
+- Exactly one component drains the response plan and calls
+  `clientWriter.Write` during an Extended Query cycle; `firewall.Gate`
+  never writes client-bound bytes directly once this mechanism is in
+  place.
+- The response plan's total unit count for a cycle is always finite and
+  known at `Sync`-forwarding time (every frontend message up to and
+  including `Sync` has already been classified as pass-through or
+  synthetic, or silently discarded per the client-facing discard state,
+  by the time `Sync` itself is processed) — the drain path is never left
+  waiting on an unbounded or unknowable number of future units.
+- Discarded messages (§ [Local rejection state machine](#local-rejection-state-machine)'s
+  client-facing discard-until-`Sync` state) never create a response-plan
+  unit at all — there is nothing to drain for them, by design, matching
+  the "only the first blocking event gets an `ErrorResponse`" rule.
+
+**State-machine test scenarios required:**
+
+- **Pipelined allowed-before-blocked:** exactly the worked example above —
+  A fully forwarded and completed, B blocked, confirm client sees A's
+  output fully before B's `ErrorResponse`, and the real `ReadyForQuery`
+  last.
+- **Blocked-first:** B blocked as the very first operation in the cycle
+  (no A at all) — response plan is `[B-Parse(synthetic), Sync(pass-
+  through)]`; confirm the synthetic unit drains immediately (nothing
+  earlier to wait for) and the real `ReadyForQuery` still arrives last.
+- **Multiple blocked messages before one `Sync`:** B (`Parse`) is blocked,
+  then the client (incorrectly, or as a stress test) sends a *further*
+  `Parse` C before `Sync` — confirm C is silently discarded (no second
+  response-plan unit, no second `ErrorResponse`), and the response plan
+  still ends up as `[..., B-Parse(synthetic), Sync(pass-through)]` with
+  nothing inserted for C.
+- **Interleaved backend timing:** A's real backend responses arrive
+  *after* B was blocked and its synthetic unit was already enqueued
+  (simulating a slow real server) — confirm the response plan still
+  drains A's pass-through units first, i.e. confirm the *enqueue* order
+  (frontend processing order), not backend arrival timing, is what
+  determines client-visible order.
+
+### Clarifying real upstream ErrorResponse cleanup
+
+The discard-until-`Sync` behavior described so far in this section is
+entirely about SentinelDB's own, *locally* generated `ErrorResponse`s. But
+the *real* PostgreSQL server can also emit a genuine `ErrorResponse` for an
+operation SentinelDB legitimately forwarded (a real SQL syntax error in an
+allowed `Parse`, a constraint violation during `Execute`, and so on) — and
+per the protocol documentation, **the real server itself then enters its
+own discard-until-`Sync` mode**, silently ignoring every further frontend
+message (that SentinelDB may have already forwarded or may still forward)
+until it sees `Sync`. This is a **separate concern from, and must not be
+conflated with,** SentinelDB's client-facing discard state, because the
+trigger, the messages affected, and the party doing the discarding are all
+different:
+
+- **Enter a server-discard-until-`Sync` state**, distinct from the
+  client-facing flag (§ [Proposed connection state](#proposed-connection-state)),
+  the moment a *real* `ErrorResponse` (not one SentinelDB generated itself)
+  is observed from the backend during an extended-query cycle.
+- **Invalidate/abandon all later pending operations in that same cycle
+  that the server will now silently skip.** Once the real server has
+  entered its own discard mode, it will **not** send `ParseComplete`,
+  `BindComplete`, `CloseComplete`, `ParameterDescription`, `RowDescription`,
+  `NoData`, or any `Execute` terminator for anything else already
+  forwarded and still pending in this cycle — those messages were
+  received by the real server, but it discards them without
+  acknowledgement, exactly as it would for a client talking to it
+  directly. SentinelDB's pending-operation queue must therefore
+  **immediately mark every remaining pending entry for this cycle as
+  abandoned** (never becoming `committed`) at the moment the real
+  `ErrorResponse` is observed — not wait for acknowledgements that are now
+  guaranteed never to arrive.
+- **This is why waiting is wrong, not just suboptimal:** if
+  `masking.Transformer`'s correlation logic instead treated "the head of
+  the pending-operation queue expects `ParseComplete` but an
+  `ErrorResponse` arrived" purely as a hard desynchronization (the
+  `internal/masking/transformer.go`-style fail-closed reflex used
+  elsewhere in this design for *truly* unexpected ordering), it would
+  incorrectly terminate a perfectly normal, protocol-legal error
+  scenario. A real `ErrorResponse` in place of an expected acknowledgement
+  is **not** unexpected ordering — it is one of the two always-possible
+  outcomes for any pending operation. The correlation logic must
+  distinguish "acknowledgement replaced by a real error for *this specific*
+  operation" (normal, handled by entering server-discard-until-`Sync`) from
+  "a message arrived that matches nothing at all, for any pending
+  operation, in any recognized shape" (true desynchronization, still fail
+  closed).
+- **Clear the correct state only at the matching real `ReadyForQuery`.**
+  Server-discard-until-`Sync` is cleared when — and only when — the real
+  `ReadyForQuery` that follows arrives (the one triggered by SentinelDB's
+  forwarded `Sync`, per the "always forward `Sync`" rule). This mirrors
+  the client-facing flag's own clearing rule and keeps the two states
+  structurally parallel even though they are tracked independently and can
+  be set independently of one another (a cycle could have *both* a
+  client-facing block on operation B and, entirely separately if B were
+  hypothetically forwarded rather than blocked in some other cycle, a real
+  server error on a different operation — the two mechanisms compose
+  without needing to know about each other, because both ultimately
+  resolve through the same response-plan/`Sync` machinery).
+- **Preserve committed objects from earlier, already-completed cycles.**
+  Only pending entries from **this** still-open cycle are abandoned;
+  anything already `committed` before this cycle began (from a previous
+  `Sync` boundary) is completely unaffected — a real error on a `Bind` in
+  cycle 2 does not retroactively invalidate a statement successfully
+  `Parse`d and committed in cycle 1.
+- **Preserve client-visible response ordering.** This slots directly into
+  the [response-plan queue](#client-response-ordering-model): the pass-
+  through unit for the operation that actually failed is satisfied by the
+  real `ErrorResponse` (relayed to the client in its correct position, so
+  the client correctly attributes the error to the right operation); every
+  *subsequent* pass-through unit in the same cycle (for now-abandoned
+  pending operations) is closed out with **no client-visible output at
+  all** — matching what a client talking to the real server directly would
+  see (no per-message "skipped" notification, only silence until the
+  eventual `ReadyForQuery`). The `Sync` pass-through unit, always last,
+  still relays the real `ReadyForQuery` in its correct final position.
 
 ### State diagram
 
@@ -881,6 +1536,51 @@ or otherwise.
   acknowledgement that doesn't match the expected head of the
   pending-operation queue is treated as a fatal desynchronization (fail
   closed, close the connection) rather than applied speculatively.
+  **Clarification:** a genuine `ErrorResponse` arriving in place of the
+  expected acknowledgement for the current pending head is **not** this
+  kind of unexpected ordering — it is one of the two always-possible,
+  protocol-legal outcomes for any forwarded operation, and is handled by
+  entering server-discard-until-`Sync` (§
+  [Clarifying real upstream ErrorResponse cleanup](#clarifying-real-upstream-errorresponse-cleanup)),
+  not by treating it as a desynchronization. Only a message matching
+  *nothing* recognized, for *any* pending operation, in *any* expected
+  shape, is a true desynchronization.
+- Once a real upstream `ErrorResponse` is observed, SentinelDB never waits
+  indefinitely for acknowledgements the real server has already committed
+  to never sending — every remaining pending-operation-queue entry for
+  that cycle is immediately abandoned, not left pending forever (§
+  [Clarifying real upstream ErrorResponse cleanup](#clarifying-real-upstream-errorresponse-cleanup)).
+- Closing a prepared statement always cascades to every portal built from
+  it, applied atomically with the statement's own removal at
+  `CloseComplete` — a portal is never left referencing a statement
+  SentinelDB believes no longer exists, and never silently kept alive past
+  its statement's closure (§
+  [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics)).
+- A portal is never treated as valid past the end of the transaction it
+  was created in — every portal registry entry is invalidated on the
+  shared `TxState`'s `'T'|'E' → 'I'` transition, regardless of naming (§
+  [Correcting portal lifetime semantics](#correcting-portal-lifetime-semantics)).
+  Named prepared statements are unaffected by this transition.
+- `Execute` is never treated as a potential source of `RowDescription` —
+  shape/format metadata comes only from a previously observed `Describe`
+  or is treated as permanently unknown for that portal's lifetime (§
+  [Correcting Execute response semantics](#correcting-execute-response-semantics)).
+- A duplicate named `Parse`/`Bind` never overwrites or destabilizes an
+  existing committed generation for the same name before the real server
+  has actually acknowledged the new one — enforced by the
+  per-name generation counters, not by any local pre-judgment of whether
+  the duplicate will succeed (§
+  [Object generations](#object-generations-safely-handling-duplicate-names)).
+- Forwarding a Simple Query always invalidates SentinelDB's own unnamed
+  statement/portal registry entries at that Simple Query's real
+  `ReadyForQuery`, matching the real server's own behavior — named
+  entries are never touched by this (§
+  [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling)).
+- Client-visible response bytes for an Extended Query cycle are always
+  written in frontend-processing order, never in backend-arrival-timing
+  order, regardless of which component (relayed real bytes or synthesized
+  local bytes) produced them (§
+  [Client-response ordering model](#client-response-ordering-model)).
 - Policy errors (Wasm evaluation failure, invalid verdict) block rather
   than allow — reuses the exact existing `wasm.Policy.failClosed` behavior
   (`internal/wasm/policy.go:68-76`) for `Parse`'s SQL text, unchanged.
@@ -925,9 +1625,16 @@ or otherwise.
   the same pipeline.
 - Mixing Simple Query and Extended Query on the same connection over time
   (e.g. a client that uses `Query` for some statements and
-  `Parse`/`Bind`/`Execute` for others) — this requires no special handling
-  beyond both paths sharing the same `*protocol.TxState` and
-  `*protocol.SerializedWriter`, which is already the existing architecture.
+  `Parse`/`Bind`/`Execute` for others). **Correction to this document's
+  first draft:** this is *not* free of special handling — forwarding a
+  Simple Query destroys the real server's unnamed prepared statement and
+  unnamed portal, so SentinelDB's own unnamed-slot registry entries must
+  be invalidated at the same point (on the Simple Query's real
+  `ReadyForQuery`) to stay correct; see
+  [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling).
+  Named statements/portals are unaffected and require no extra handling
+  beyond the shared `*protocol.TxState` and `*protocol.SerializedWriter`
+  infrastructure already in place today.
 
 **Explicitly deferred (not required for the first implementation, tracked
 for later):**
@@ -1037,14 +1744,16 @@ tests, and must not bundle unrelated refactors — consistent with
 | Category | Scenario | Notes |
 |---|---|---|
 | Unit | Parse/Bind/Describe/Execute/Close/ParameterDescription/NoData/PortalSuspended wire parsing (valid, truncated, oversized) | Mirrors existing `ParseDataRow`/`ParseRowDescription` test style |
-| Unit | Statement/portal registry: named creation, unnamed replacement, named-name-already-exists (not preempted locally), Close removal | |
-| Unit | Pending-operation queue: FIFO correlation, out-of-order acknowledgement detection | |
+| Unit | Statement/portal registry: named creation, unnamed replacement, generation assignment/promotion/discard, Close removal | Reflects the [object-generation model](#object-generations-safely-handling-duplicate-names), not name-only keys |
+| Unit | Pending-operation queue: FIFO correlation by `(name, generation)`, out-of-order acknowledgement detection | |
+| Unit | Response-plan queue: pass-through unit satisfaction, synthetic unit immediate drain, strict head-first ordering | § [Client-response ordering model](#client-response-ordering-model) |
 | State-machine | Unnamed Parse/Bind/Execute/Sync (happy path) | Sequence diagram 1 |
 | State-machine | Named prepared statement reuse across multiple Sync cycles, multiple portals | Sequence diagram 2 |
-| State-machine | Statement replacement (new unnamed Parse while old unnamed portal still open) | |
+| State-machine | Statement replacement (new unnamed Parse while old unnamed portal still open) | Confirms old-generation portals remain valid, per object-generation model |
 | State-machine | Portal replacement (new unnamed Bind while old unnamed portal still open) | |
-| State-machine | Close statement (portals remain usable) | |
-| State-machine | Close portal (statement remains usable) | |
+| State-machine | **Close statement cascades to its portals** | **Corrected from the first draft's "Close statement — portals remain usable."** Assert every portal bound from the closed statement is removed from the registry exactly when the matching `CloseComplete` is observed (not eagerly on `Close`), and that a later `Bind`/`Describe`/`Execute`/`Close` referencing any of those now-gone portals is treated as an unknown-object reference and fails closed. See [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics) |
+| State-machine | Close portal (statement remains usable) | Confirms the cascade is one-directional: closing a portal never affects its statement |
+| State-machine | Close statement with a portal mid-`Execute`/suspended | The in-flight/suspended portal is cascaded away; a later resuming `Execute` fails closed |
 | State-machine | Describe statement (ParameterDescription + RowDescription/NoData) | |
 | State-machine | Describe portal (RowDescription/NoData only, format-code-accurate) | |
 | State-machine | Zero parameters | |
@@ -1052,10 +1761,31 @@ tests, and must not bundle unrelated refactors — consistent with
 | State-machine | NULL parameters | |
 | State-machine | Mixed parameter format codes (0 codes / 1 code / N codes) | |
 | State-machine | Binary target result column → fail closed | |
+| State-machine | **`Execute` never emits `RowDescription`** | Confirms `Execute`'s response is limited to `DataRow*` + exactly one of `CommandComplete`/`EmptyQueryResponse`/`PortalSuspended`/`ErrorResponse`; a fixture `RowDescription` injected as if from `Execute` is rejected as unexpected ordering. See [Correcting Execute response semantics](#correcting-execute-response-semantics) |
+| State-machine | `Execute` on a portal whose shape was never `Describe`d, masking enabled → fail closed | Confirms there is no "wait for a later RowDescription" path, since none will come |
 | State-machine | Portal suspension and resume (PortalSuspended → later Execute) | |
-| State-machine | Blocked Parse → discard-until-Sync | The critical scenario, § Policy evaluation design |
+| State-machine | **Implicit transaction completion at `Sync` invalidates open portals** | New: `'T' → 'I'` transition on the shared `TxState` after a `Sync`-closed implicit transaction. See [Correcting portal lifetime semantics](#correcting-portal-lifetime-semantics) |
+| State-machine | **Explicit `COMMIT` invalidates open portals** | New: same `'T' → 'I'` detection, cause-agnostic |
+| State-machine | **Explicit `ROLLBACK` invalidates open portals** | New: same detection mechanism |
+| State-machine | **Failed-transaction completion (`ROLLBACK` from status `'E'`) invalidates open portals** | New: `'E' → 'I'` transition |
+| State-machine | **Portal reference after transaction end fails closed** | New: a `Bind`/`Describe`/`Execute`/`Close` against a portal invalidated by any of the above transitions is treated as unknown |
+| State-machine | **Named prepared statement survives a transaction boundary** | New: confirms statements are session-scoped, not transaction-scoped, distinguishing them from portals |
+| State-machine | **Unnamed statement created via Parse, then a Simple Query is issued** | New: confirms the unnamed statement is invalidated on the Simple Query's real `ReadyForQuery`. See [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling) |
+| State-machine | **Unnamed portal created via Bind, then a Simple Query is issued** | New: same invalidation, applied to the unnamed portal |
+| State-machine | **Bind/Execute referencing the unnamed slot after a Simple-Query invalidation fails closed** | New: confirms no stale reference survives |
+| State-machine | **Named statements/portals are unaffected by an interleaved Simple Query** | New: confirms the invalidation is scoped only to the unnamed slots |
+| State-machine | **Duplicate named Parse for an already-committed name: failure leaves the old committed statement intact** | New: proves the [object-generation model](#object-generations-safely-handling-duplicate-names) — a rejected duplicate `Parse` must not disturb the pre-existing, still-`committed` generation |
+| State-machine | **Duplicate named Bind for an already-committed portal name: failure leaves the old committed portal intact** | New: same proof, applied to portals |
+| State-machine | **Pipelined duplicate-name Parse/Bind resolved unambiguously by generation** | New: two operations against the same name in flight simultaneously, correlated correctly via `(name, generation)` |
+| State-machine | Blocked Parse → discard-until-Sync (client-facing) | The critical scenario, § Policy evaluation design |
 | State-machine | Bind after blocked Parse (discarded, no forwarding) | |
-| State-machine | Pipelined blocked and allowed operations in the same cycle | |
+| State-machine | Pipelined blocked and allowed operations in the same cycle | Now additionally verified via the response-plan ordering tests below |
+| State-machine | **Real upstream `ErrorResponse` triggers server-discard-until-`Sync`, abandoning later pending operations in the same cycle without waiting** | New: confirms the pending-operation queue does not hang waiting for acknowledgements the real server will never send. See [Clarifying real upstream ErrorResponse cleanup](#clarifying-real-upstream-errorresponse-cleanup) |
+| State-machine | **Objects committed in an earlier cycle survive a later cycle's real upstream error** | New: confirms only the current cycle's pending entries are abandoned |
+| State-machine | **Response-plan ordering: pipelined allowed-before-blocked** | New: allowed A (Parse/Bind/Execute) forwarded, blocked B handled locally, confirm client sees all of A's real output before B's synthetic `ErrorResponse`, and the real `ReadyForQuery` last. See [Client-response ordering model](#client-response-ordering-model) |
+| State-machine | **Response-plan ordering: blocked-first** | New: B blocked as the very first operation in the cycle, no A — confirms the synthetic unit drains immediately |
+| State-machine | **Response-plan ordering: multiple blocked messages before one `Sync`** | New: B blocked, then a further Parse C sent before `Sync` — confirms C is silently discarded with no second `ErrorResponse` and no second response-plan unit |
+| State-machine | **Response-plan ordering: interleaved backend timing** | New: A's real backend responses arrive *after* B's synthetic unit is enqueued — confirms enqueue order (not backend arrival timing) determines client-visible order |
 | Malformed-input | Truncated Parse/Bind/Describe/Execute bodies | Never panics |
 | Malformed-input | Oversized parameter counts/lengths | Fail closed, matches existing `maxMessageLength`/`maxCellValueSize` discipline |
 | Fuzz invariant | Parse/Bind/Describe/Execute body parsers never panic on arbitrary bytes | Same bounded-fuzz pattern as `docs/audit-v0.1.md`'s `FuzzParseDataRow` et al. |
@@ -1067,11 +1797,12 @@ tests, and must not bundle unrelated refactors — consistent with
 | Integration | Unknown statement / unknown portal referenced | Fail closed |
 | Integration | Transaction status I/T/E correctly reflected in ReadyForQuery after a mixed cycle | |
 | Integration | Connection termination (Terminate) during an active extended cycle, before Sync | |
-| Integration | Simple Query `Query` message issued immediately after a completed Extended Query cycle on the same connection | Confirms no cross-contamination between the two paths |
+| Integration | Simple Query `Query` message issued immediately after a completed Extended Query cycle on the same connection | Confirms no cross-contamination between the two paths, beyond the required unnamed-slot invalidation above |
 | E2E (real driver) | `pgx` (or equivalent) default parameterized-query flow end-to-end through the full Docker Compose stack | Stage 8 |
 | E2E (real driver) | A masked column (`email`) round-tripped through a real driver's Extended Query flow, text and (if in scope) binary result format | |
+| E2E (real driver) | A real driver's Close-statement-with-open-portals flow (e.g. a connection-pool driver that closes statements on release) | New: proves the cascade against real server behavior, not just a synthetic fixture |
 | Concurrency | Multiple concurrent connections each running independent Extended Query cycles | No shared-state leakage between connections |
-| Race | `go test -race` across all new/modified packages | CI's existing `go-race` job, extended to new packages |
+| Race | `go test -race` across all new/modified packages, including the response-plan queue and object-generation registries | CI's existing `go-race` job, extended to new packages |
 | Shutdown | Graceful shutdown (SIGTERM) with an Extended Query cycle in flight (mid-pipeline, pre-Sync) | Must not hang; must not corrupt the upstream connection for other in-flight connections |
 | Sensitive-log scan | Full log output across the above scenarios grepped for parameter values, statement/portal names, and query text (beyond what's already permitted for `Parse`) | Mirrors `docs/audit-v0.1.md`'s existing log-scan verification step |
 
@@ -1148,6 +1879,16 @@ milestone does not implement explicit numeric limits:
   name was "never existed" vs. "was blocked" vs. "was closed" in a way
   that differs from real PostgreSQL's own error responses for the
   equivalent cases.
+- **Duplicate-name registry confusion.** A client that repeatedly `Parse`s
+  or `Bind`s an already-in-use named object, whether by accident or as a
+  deliberate probe, could — with a naive name-only registry — desynchronize
+  SentinelDB's view of which statement/portal generation is actually live
+  upstream. This is exactly the hazard the per-name generation-counter
+  mechanism (§ [Object generations](#object-generations-safely-handling-duplicate-names))
+  is designed to close: a failed duplicate never mutates the existing
+  committed generation, so this class of probing cannot be used to trick
+  SentinelDB into forwarding a later operation against the wrong
+  server-side object.
 - **Pipelined denial of service.** A client pipelining a very large number
   of `Parse`/`Bind`/`Execute` triples before ever sending `Sync`, each
   requiring a Wasm `evaluate_query` call for its `Parse`. *Recommendation:*
@@ -1277,16 +2018,17 @@ Honestly unresolved, not disguised as settled:
   default values, nor whether they belong in `config.yaml` (following the
   existing `firewall`/`wasm`/`logging`/`masking` top-level key pattern) or
   as compiled-in constants like today's `maxMessageLength`.
-- **Should a named-statement name conflict (client `Parse`s an
-  already-committed named statement without `Close`-ing it first) be
-  detected and rejected locally by SentinelDB**, ahead of forwarding, or
-  should SentinelDB always forward and let the real server's own error
-  response be relayed? This design currently leans toward "let the real
-  server decide" (simpler, no risk of SentinelDB's bookkeeping disagreeing
-  with the real server's actual state) but this has not been fully
-  stress-tested against the pipelining model (a `Parse` for a name that
-  is only `pending`, not yet `committed`, complicates a purely
-  server-side-authoritative approach).
+- ~~Should a named-statement name conflict be detected and rejected locally
+  by SentinelDB, or should SentinelDB always forward and let the real
+  server's own error response be relayed?~~ **Resolved, no longer open:**
+  SentinelDB always forwards and lets the real server decide, made safe by
+  the per-name generation-counter mechanism (§
+  [Object generations](#object-generations-safely-handling-duplicate-names)),
+  which guarantees a rejected duplicate never disturbs the existing
+  committed generation and a pipelined duplicate is still correlated
+  unambiguously. This was previously left open without a mechanism that
+  made either answer safe — the generation model removes the hazard rather
+  than the question.
 - **How should the eventual compatibility matrix (stage 9) be tested
   against real ORMs**, not just drivers? ORM-level behavior (query
   batching, connection pooling interactions, automatic prepared-statement
@@ -1307,13 +2049,24 @@ Honestly unresolved, not disguised as settled:
 [Alternatives considered](#alternatives-considered) — a connection-aware
 Extended Query state engine built directly on and alongside
 `internal/protocol`, `internal/firewall`, and `internal/masking`, following
-the design detailed throughout this document: `Parse`-time-only,
-SQL-template-only policy evaluation; a per-connection prepared-statement
-and portal registry with pending/committed/blocked lifecycle and
+the design detailed throughout this document, **as corrected in this
+revision**: `Parse`-time-only, SQL-template-only policy evaluation; a
+per-connection prepared-statement and portal registry keyed by
+`(name, generation)` rather than name alone (§
+[Object generations](#object-generations-safely-handling-duplicate-names)),
+with pending/committed/blocked lifecycle, statement-Close cascading to
+dependent portals (§ [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics)),
+and portal invalidation at transaction-end (§ [Correcting portal lifetime semantics](#correcting-portal-lifetime-semantics))
+and at Simple Query forwarding (§ [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling));
 FIFO pending-operation correlation; a discard-until-`Sync` local rejection
-state machine that always forwards `Sync` to the real server and relays its
-real `ReadyForQuery`; and per-portal masking shape/format tracking with a
-conservative fail-closed default for binary-format targets and
+state machine, tracked separately from an independent server-discard-
+until-`Sync` state for real upstream errors (§ [Clarifying real upstream ErrorResponse cleanup](#clarifying-real-upstream-errorresponse-cleanup)),
+both always forwarding `Sync` to the real server and relaying its real
+`ReadyForQuery`; a unified response-plan queue guaranteeing client-visible
+output ordering across relayed and synthetic responses (§ [Client-response ordering model](#client-response-ordering-model));
+and per-portal masking shape/format tracking — sourced only from `Describe`,
+never from `Execute` (§ [Correcting Execute response semantics](#correcting-execute-response-semantics)) —
+with a conservative fail-closed default for binary-format targets and
 unknown-shape portals.
 
 **Recommended staged implementation order:** exactly the ten stages in

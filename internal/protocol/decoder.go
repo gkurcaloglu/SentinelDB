@@ -65,6 +65,20 @@ type Message struct {
 	// Yalnızca Query (simple query) için doldurulur.
 	Query string
 
+	// Genişletilmiş sorgu protokolü (Extended Query) frontend mesajları
+	// için tipli, doğrulanmış ayrıştırma sonucu (bkz. extended.go). Yalnızca
+	// ilgili mesaj tipi için doldurulur; diğerlerinde nil kalır.
+	//
+	// Bu alanların dolu olması, mesajın çalışma zamanında kabul edildiği
+	// anlamına GELMEZ: SentinelDB V1 Extended Query akışını hâlâ fail-closed
+	// reddeder (bkz. firewall.Gate.rejectExtendedProtocol). Bu alanlar
+	// yalnızca güvenli ayrıştırma ve ileriki aşamalar için doldurulur.
+	Parse    *ParseMessage
+	Bind     *BindMessage
+	Describe *DescribeMessage
+	Execute  *ExecuteMessage
+	Close    *CloseMessage
+
 	// Raw, mesajın tam ham baytlarıdır (varsa tag + length + payload, ya da
 	// startup aşamasında length + body). Aktif müdahale eden bileşenlerin
 	// (ör. firewall.Gate) mesajı yeniden kodlamadan olduğu gibi iletebilmesi
@@ -243,8 +257,56 @@ func (d *Decoder) consumeNormal() bool {
 		Length:    length,
 		Raw:       append([]byte(nil), d.buf[0:total]...),
 	}
-	if d.dir == Frontend && msgType == MsgQuery {
-		msg.Query = trimNullTerminator(payload)
+	if d.dir == Frontend {
+		switch msgType {
+		case MsgQuery:
+			msg.Query = trimNullTerminator(payload)
+		case MsgParse:
+			parsed, err := ParseFrontendParse(payload)
+			if err != nil {
+				d.fail(err)
+				return false
+			}
+			msg.Parse = parsed
+		case MsgBind:
+			parsed, err := ParseFrontendBind(payload)
+			if err != nil {
+				d.fail(err)
+				return false
+			}
+			msg.Bind = parsed
+		case MsgDescribe:
+			parsed, err := ParseFrontendDescribe(payload)
+			if err != nil {
+				d.fail(err)
+				return false
+			}
+			msg.Describe = parsed
+		case MsgExecute:
+			parsed, err := ParseFrontendExecute(payload)
+			if err != nil {
+				d.fail(err)
+				return false
+			}
+			msg.Execute = parsed
+		case MsgClose:
+			parsed, err := ParseFrontendClose(payload)
+			if err != nil {
+				d.fail(err)
+				return false
+			}
+			msg.Close = parsed
+		case MsgFlush:
+			if err := ParseFrontendFlush(payload); err != nil {
+				d.fail(err)
+				return false
+			}
+		case MsgSync:
+			if err := ParseFrontendSync(payload); err != nil {
+				d.fail(err)
+				return false
+			}
+		}
 	}
 	d.emit(msg)
 

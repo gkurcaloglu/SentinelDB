@@ -36,15 +36,67 @@ Parsed by `internal/protocol.Decoder` (client decoder) and evaluated by
 This is deliberate: these messages can carry arbitrary SQL (in `Parse`)
 or execute previously-parsed statements (`Bind`/`Execute`) without ever
 appearing as a `Query` message. Forwarding them unevaluated would let a
-client bypass the firewall policy entirely. Implementing them correctly
-— including the "skip to next `Sync`" resynchronization semantics
-required after an error mid-extended-protocol — is out of scope for V1;
-see the [README roadmap](../README.md#roadmap).
+client bypass the firewall policy entirely. Implementing the full
+protocol correctly — including the "skip to next `Sync`" resynchronization
+semantics required after an error mid-extended-protocol, connection-scoped
+prepared-statement/portal tracking, and masking across the Extended Query
+flow — is out of scope for V1; see
+[docs/design/0001-extended-query.md](design/0001-extended-query.md) for
+the full design and the [README roadmap](../README.md#roadmap).
 
 **Practical impact:** clients/drivers that default to prepared-statement
 execution (e.g. `pgx`, `psycopg`'s prepared-statement mode) must be
 configured to use simple-protocol execution, or every query will fail
 with the error above.
+
+### Typed parsing (no behavior change)
+
+`internal/protocol.Decoder` now typed-parses the body of each of these
+seven message types (`internal/protocol/extended.go`:
+`ParseFrontendParse`, `ParseFrontendBind`, `ParseFrontendDescribe`,
+`ParseFrontendExecute`, `ParseFrontendClose`, `ParseFrontendFlush`,
+`ParseFrontendSync`) into typed structs (`ParseMessage`, `BindMessage`,
+`DescribeMessage`, `ExecuteMessage`, `CloseMessage`) exposed on
+`protocol.Message`'s `Parse`/`Bind`/`Describe`/`Execute`/`Close` fields.
+This is **parsing only** — it exists so later implementation stages (see
+the design document linked above) don't have to add wire-format parsing
+at the same time as protocol-state, forwarding, and policy changes.
+
+**This does not change runtime behavior.** `firewall.Gate` still checks
+`isExtendedProtocolMessage` before any policy decision and rejects every
+Extended Query message exactly as described above, whether or not it
+parsed successfully. A message that now parses cleanly is **not**
+thereby allowed through — the typed struct is simply attached to the
+`Message` value that `Gate` immediately rejects.
+
+**Malformed input fails closed the same way oversized/corrupt messages
+already did:** if a `Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/
+`Sync` message's body fails wire-format validation (bad boundaries,
+missing NUL terminators, a declared count/length that doesn't match the
+actual payload, an out-of-range format code, a `Bind` parameter
+format-code count that is neither `0`, `1`, nor equal to the parameter
+count, etc.), the decoder does not emit a message at all — it calls the
+same `onError`/fail-closed path used for any other undecodable message
+(`Decoder.fail`, surfaced to callers as `firewall.ErrDecodeFailed`, see
+[Fragmentation handling](#fragmentation-handling)). Errors returned by
+these parsers (`protocol.ExtendedParseError`) never include the raw
+payload, parameter values, or SQL text — only the message type and a
+fixed validation-failure category.
+
+**Two fields deliberately match PostgreSQL's real server behavior rather
+than a naive reading of the wire format:**
+
+- `Bind`'s parameter format-code count is validated against the
+  documented PostgreSQL rule (`backend/tcop/postgres.c`,
+  `exec_bind_message`): `0` (all parameters default to text), `1` (one
+  code applies to every parameter, valid even when there are zero
+  parameters), or exactly equal to the parameter count are all accepted;
+  any other value is rejected (`CategoryInvalidFormatCount`).
+- `Execute`'s maximum-row-count field is read as a full signed `Int32`
+  and never rejected for being negative — PostgreSQL's own backend
+  (`backend/tcop/pquery.c`, `PortalRun`) treats any `count <= 0`,
+  negative or zero, as `FETCH_ALL`. `ExecuteMessage.MaxRows` preserves
+  the wire value exactly as sent.
 
 ## SSLRequest / GSSENCRequest rejection
 

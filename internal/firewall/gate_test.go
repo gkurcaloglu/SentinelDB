@@ -44,6 +44,45 @@ func encodeParse(statementName, query string) []byte {
 // mesaji uretir. Gate'in Decoder'i phaseStartup'ta baslar, bu yuzden test
 // akislari Query'lerden once bunu icermeli (tipki gercek bir psql
 // baglantisinda oldugu gibi).
+// encodeEmptyBind, gecerli (wire-format acisindan iyi bicimli) ama
+// parametresiz/isimsiz bir Bind mesaji uretir - portal/statement adi "",
+// parametre format kodu/parametre/sonuc format kodu sayilari 0.
+func encodeEmptyBind() []byte {
+	payload := []byte{0, 0, 0, 0, 0, 0, 0, 0} // "" + "" + 0 + 0 + 0
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(len(payload)+4))
+	return append(append([]byte{byte(protocol.MsgBind)}, length...), payload...)
+}
+
+// encodeDescribe, gecerli bir Describe mesaji uretir (selector + isim).
+func encodeDescribe(selector byte, name string) []byte {
+	payload := append([]byte{selector}, []byte(name)...)
+	payload = append(payload, 0)
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(len(payload)+4))
+	return append(append([]byte{byte(protocol.MsgDescribe)}, length...), payload...)
+}
+
+// encodeExecute, gecerli bir Execute mesaji uretir (portal adi + maxRows).
+func encodeExecute(portalName string, maxRows int32) []byte {
+	payload := append([]byte(portalName), 0)
+	rows := make([]byte, 4)
+	binary.BigEndian.PutUint32(rows, uint32(maxRows))
+	payload = append(payload, rows...)
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(len(payload)+4))
+	return append(append([]byte{byte(protocol.MsgExecute)}, length...), payload...)
+}
+
+// encodeClose, gecerli bir Close mesaji uretir (selector + isim).
+func encodeClose(selector byte, name string) []byte {
+	payload := append([]byte{selector}, []byte(name)...)
+	payload = append(payload, 0)
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(len(payload)+4))
+	return append(append([]byte{byte(protocol.MsgClose)}, length...), payload...)
+}
+
 func encodeStartupMessage() []byte {
 	body := []byte{0, 3, 0, 0} // protokol 3.0
 	body = append(body, []byte("user")...)
@@ -244,15 +283,28 @@ func TestGate_ParseMessageCannotBypassInspection(t *testing.T) {
 
 // TestGate_ExtendedProtocolMessages_AllRejected, Parse disindaki tum
 // genisletilmis protokol mesaj tiplerinin de (Bind/Describe/Execute/Close/
-// Flush/Sync) ayni sekilde reddedildigini dogrular.
+// Flush/Sync) ayni sekilde reddedildigini dogrular. Her mesaj, tipe gore
+// gecerli (wire-format acisindan iyi bicimli) bir govdeyle kodlanir, boylece
+// test Gate'in reddini (ErrUnsupportedProtocol) dogrular - govde
+// dogrulamasindan kaynaklanan bir decode hatasini degil (bkz.
+// internal/protocol/extended.go, tipli ayristirma artik Decoder'a
+// entegre - govdesi bozuk/eksik bir mesaj bu noktada zaten ErrDecodeFailed
+// ile reddedilir, ayri bir yoldan).
 func TestGate_ExtendedProtocolMessages_AllRejected(t *testing.T) {
-	msgTypes := []protocol.MessageType{
-		protocol.MsgBind, protocol.MsgDescribe, protocol.MsgExecute,
-		protocol.MsgClose, protocol.MsgFlush, protocol.MsgSync,
+	cases := []struct {
+		name string
+		msg  []byte
+	}{
+		{"Bind", encodeEmptyBind()},
+		{"Describe", encodeDescribe('S', "")},
+		{"Execute", encodeExecute("", 0)},
+		{"Close", encodeClose('S', "")},
+		{"Flush", append([]byte{byte(protocol.MsgFlush)}, 0, 0, 0, 4)},
+		{"Sync", append([]byte{byte(protocol.MsgSync)}, 0, 0, 0, 4)},
 	}
 
-	for _, mt := range msgTypes {
-		t.Run(string(rune(mt)), func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			var target, respond bytes.Buffer
 			g := NewGate(DenyKeywords("DROP TABLE"), &target, &respond,
 				func(m protocol.Message, v Verdict, reason string, duration time.Duration) {},
@@ -260,18 +312,48 @@ func TestGate_ExtendedProtocolMessages_AllRejected(t *testing.T) {
 			)
 
 			startup := encodeStartupMessage()
-			// Govdesi bos, sadece tag+length'i test edilen tipe ait bir mesaj.
-			msg := append([]byte{byte(mt)}, 0, 0, 0, 4)
-			stream := append(append([]byte{}, startup...), msg...)
+			stream := append(append([]byte{}, startup...), tc.msg...)
 
 			err := g.Run(bytes.NewReader(stream))
 			if !errors.Is(err, ErrUnsupportedProtocol) {
-				t.Fatalf("expected ErrUnsupportedProtocol for message type %q, got %v", mt, err)
+				t.Fatalf("expected ErrUnsupportedProtocol for message %s, got %v", tc.name, err)
 			}
 			if !bytes.Equal(target.Bytes(), startup) {
-				t.Fatalf("expected message type %q to never reach target, got %v", mt, target.Bytes())
+				t.Fatalf("expected message %s to never reach target, got %v", tc.name, target.Bytes())
 			}
 		})
+	}
+}
+
+// TestGate_MalformedExtendedProtocolMessage_FailsClosedThroughDecoder,
+// bozuk (wire-format acisindan gecersiz) bir genisletilmis protokol
+// mesajinin, Gate'in tip-bazli reddi (ErrUnsupportedProtocol) yerine
+// Decoder'in mevcut hata yolundan (ErrDecodeFailed) fail-closed
+// reddedildigini dogrular - ayristirma, mesaji asla sessizce izin
+// verilir hale getirmez.
+func TestGate_MalformedExtendedProtocolMessage_FailsClosedThroughDecoder(t *testing.T) {
+	var target, respond bytes.Buffer
+	var decodeErrs int
+	g := NewGate(DenyKeywords("DROP TABLE"), &target, &respond,
+		func(m protocol.Message, v Verdict, reason string, duration time.Duration) {},
+		func(err error) { decodeErrs++ },
+	)
+
+	startup := encodeStartupMessage()
+	// Govdesi bos bir Bind: portal/statement adi icin NUL sonlandirici bile
+	// yok - gecersiz.
+	malformedBind := append([]byte{byte(protocol.MsgBind)}, 0, 0, 0, 4)
+	stream := append(append([]byte{}, startup...), malformedBind...)
+
+	err := g.Run(bytes.NewReader(stream))
+	if !errors.Is(err, ErrDecodeFailed) || !IsFailClosed(err) {
+		t.Fatalf("expected ErrDecodeFailed (fail-closed), got %v", err)
+	}
+	if decodeErrs != 1 {
+		t.Fatalf("expected onError to be called once, got %d", decodeErrs)
+	}
+	if !bytes.Equal(target.Bytes(), startup) {
+		t.Fatalf("expected malformed Bind to never reach target, got %v", target.Bytes())
 	}
 }
 

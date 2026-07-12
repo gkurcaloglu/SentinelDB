@@ -140,6 +140,88 @@ out of the internally owned map/queue entry — including slice fields
 returned value can never corrupt `State`'s internal data; the only way to
 change `State` is through its own methods.
 
+### Backend-response correlator (no runtime wiring)
+
+`internal/protocol/extended_correlation.go` adds a standalone
+`protocol.BackendCorrelator` that accepts decoded backend `protocol.Message`
+values, identifies the current pending Extended Query operation from
+`protocol.State`'s FIFO queue, validates the backend response shape
+(`ParseComplete`/`BindComplete`/`CloseComplete`/`NoData`/
+`EmptyQueryResponse`/`PortalSuspended` empty bodies, `ReadyForQuery`'s status
+byte, `ParameterDescription`'s OID list, `CommandComplete`'s tag framing,
+`ErrorResponse`'s field framing), and applies the correct transition to
+`State`. Like `protocol.State` itself, it is a pure, connection-local
+component: no I/O, no goroutines, no logging, no retained raw frames, SQL,
+or Bind parameter values — every method call is synchronous and every
+returned `CorrelationResult` is a bounded, safe value (message type,
+disposition flags, operation/cycle IDs, and operation snapshots — never raw
+bytes, SQL text, names, or server error/command-tag strings).
+
+**A real backend `ErrorResponse` abandons later same-cycle pending
+operations.** Per the documented protocol contract, once PostgreSQL emits an
+`ErrorResponse`, it silently discards every later frontend command in that
+same `Sync`-delimited cycle until the matching `Sync`. `State.ApplyErrorResponseAndAbandonCycle`
+models this atomically: it fails the genuinely-erroring head operation,
+removes every later same-cycle pending operation (stopping before that
+cycle's own `Sync`, which is always preserved), leaves every other cycle
+untouched, and returns independent snapshots of both the failed and the
+abandoned operations.
+
+**Skipped unnamed replacements are rolled back, because PostgreSQL never
+processed them.** An unnamed `Parse`/`Bind` that gets abandoned this way
+was never processed by the real server — unlike a normal `ErrorResponse`
+for that exact operation, which means the server *did* process it and
+already destroyed the previous unnamed object. `State` therefore records an
+immutable rollback snapshot of the previous unnamed statement/portal
+generation at unnamed-`Parse`/`Bind`-creation time, and restores it when
+(and only when) the newer replacement is itself abandoned as
+server-skipped — correctly unwinding multiple speculative unnamed
+replacements in reverse (LIFO) order. A generation that is still a live
+rollback target is kept alive through cleanup even when nothing else
+references it, and the restore is always defensive (it never restores a
+target that has since been legitimately destroyed by some other event,
+such as `ReadyForQuery('I')` transaction-boundary portal invalidation —
+falling back to "empty" is always safe, a dangling pointer never is).
+
+**`Sync -> ErrorResponse -> ReadyForQuery` is a valid sequence, not a
+failure.** PostgreSQL can emit an `ErrorResponse` while processing `Sync`
+itself; per the protocol documentation this does **not** begin
+discard-until-`Sync` (the message being processed is already `Sync`), and
+PostgreSQL still emits exactly one `ReadyForQuery` for that `Sync`. The
+correlator recognizes a structurally valid `ErrorResponse` received while
+`Sync` is the pending head as valid: it neither pops nor completes the
+`Sync`, abandons nothing, and mutates no statement/portal/cycle/transaction
+state — it returns an intermediate result identifying the still-pending
+`Sync`, and the following `ReadyForQuery` completes that same `Sync`
+normally. A second `ErrorResponse` for the same still-pending `Sync` is
+rejected as impossible backend ordering, without mutation.
+
+**`CorrelationResult` never carries client-supplied names.**
+`FailedOperation` and `AbandonedOperations` use a dedicated
+`CorrelatedOperation` snapshot type (operation ID, cycle, kind, and target
+generation ID only) rather than `State`'s own `PendingOperation`, which
+carries the statement/portal name the client supplied. Every value
+returned this way is an independent copy — mutating a returned
+`CorrelatedOperation` or its containing slice can never affect `State` or
+a later correlation result.
+
+**Asynchronous backend messages (`NoticeResponse`/`ParameterStatus`/
+`NotificationResponse`) are structurally validated, never retained.** The
+correlator checks each message's wire framing (field framing for
+`NoticeResponse`, exactly two NUL-terminated strings for
+`ParameterStatus`, a process ID followed by two NUL-terminated strings for
+`NotificationResponse`) and rejects malformed bodies without touching any
+pending operation or `Describe` substate — but the field/string/PID
+*values* themselves are never read into a Go string, returned, or stored;
+only their framing (NUL-terminator positions) is inspected.
+
+**None of this is wired into runtime networking or client output.**
+`BackendCorrelator` is not constructed or called anywhere in
+`cmd/gateway`, `firewall.Gate`, or `masking.Transformer`. Extended Query
+is still rejected fail-closed at runtime, exactly as described above —
+this component exists purely so the correlation logic a later stage needs
+can be built and tested in isolation.
+
 ## SSLRequest / GSSENCRequest rejection
 
 SentinelDB always answers `SSLRequest` and `GSSENCRequest` with a single

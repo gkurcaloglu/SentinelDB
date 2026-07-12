@@ -239,6 +239,22 @@ type State struct {
 	namedPortalCommitted map[string]GenerationID
 	unnamedPortalCurrent GenerationID
 
+	// unnamedStatementRollback/unnamedPortalRollback, isimsiz slot icin
+	// "geri alma" (rollback) hedeflerini tasir: yeni (henuz pending) bir
+	// isimsiz statement/portal generation ID'sinden, o generation
+	// olusturulmadan HEMEN ONCE "current" olan eski generation ID'sine
+	// (yoksa NoGeneration) eslenir. Bu, PostgreSQL'in gercekte HIC
+	// ISLEMEDIGI (bkz. ApplyErrorResponseAndAbandonCycle - ayni cycle'daki
+	// daha sonraki, "atlanmis/skipped" islemler) bir isimsiz Parse/Bind'in
+	// yerel etkisinin dogru sekilde GERI ALINABILMESI icin gereklidir -
+	// gercek sunucu, o islemi hic gormedigi icin eski isimsiz nesneyi asla
+	// yok etmemistir. Yalnizca dahili kullanim icindir; hicbir public API
+	// bu haritalari ya da degerlerini dogrudan disari sizdirmaz (bkz.
+	// ApplyErrorResponseAndAbandonCycle'in donen degerleri - yalnizca
+	// PendingOperation anlik goruntuleri, rollback hedefleri degil).
+	unnamedStatementRollback map[GenerationID]GenerationID
+	unnamedPortalRollback    map[GenerationID]GenerationID
+
 	// pendingOps, FIFO bekleyen-islem kuyrugudur; index 0 kuyruk basidir
 	// (bir sonraki backend onayinin eslesmesi gereken islem).
 	pendingOps []*PendingOperation
@@ -256,11 +272,13 @@ type State struct {
 // gecerli ve sifirdan farklidir (NoCycle degildir).
 func NewState() *State {
 	s := &State{
-		statements:              make(map[GenerationID]*StatementGeneration),
-		namedStatementCommitted: make(map[string]GenerationID),
-		portals:                 make(map[GenerationID]*PortalGeneration),
-		namedPortalCommitted:    make(map[string]GenerationID),
-		txStatus:                TxStatusIdle,
+		statements:               make(map[GenerationID]*StatementGeneration),
+		namedStatementCommitted:  make(map[string]GenerationID),
+		portals:                  make(map[GenerationID]*PortalGeneration),
+		namedPortalCommitted:     make(map[string]GenerationID),
+		unnamedStatementRollback: make(map[GenerationID]GenerationID),
+		unnamedPortalRollback:    make(map[GenerationID]GenerationID),
+		txStatus:                 TxStatusIdle,
 	}
 	// Ilk cycle tahsisi (1'den baslar) asla identifier tukenmesine yol
 	// acmaz; hata donmesi imkansizdir, bu yuzden goz ardi edilir.
@@ -497,6 +515,12 @@ func (s *State) CreateParse(name, query string, paramOIDs []uint32) (PendingOper
 	}
 	s.statements[genID] = gen
 	if name == "" {
+		// Rollback goruntusu: bu generation'in ErrorResponse yerine
+		// "atlanmis/skipped" olarak terk edilmesi (ApplyErrorResponseAndAbandonCycle)
+		// durumunda geri donulecek onceki current generation (yoksa
+		// NoGeneration). Bu, onceki current isaretcisi degistirilmeden HEMEN
+		// ONCE yakalanir.
+		s.unnamedStatementRollback[genID] = s.unnamedStatementCurrent
 		s.unnamedStatementCurrent = genID
 	}
 
@@ -543,6 +567,8 @@ func (s *State) CreateBind(portalName, statementName string, paramFormats []int1
 	}
 	s.portals[genID] = gen
 	if portalName == "" {
+		// CreateParse'daki isimsiz-statement rollback yorumuyla ayni ilke.
+		s.unnamedPortalRollback[genID] = s.unnamedPortalCurrent
 		s.unnamedPortalCurrent = genID
 	}
 
@@ -680,7 +706,14 @@ func (s *State) CurrentCycle() CycleID {
 // "wantKinds" kumesinden biriyle eslestigini dogrulayarak kuyruktan
 // cikarir. Kuyruk bosysa ya da ID eslesmiyorsa ErrAckOrderMismatch,
 // ID eslesip tur eslesmiyorsa ErrAckKindMismatch doner.
-func (s *State) popHead(id PendingOperationID, wantKinds ...OperationKind) (*PendingOperation, error) {
+// peekHead, kuyruk basindaki islemin ID VE tur uyusmasini dogrular ve
+// DONDURUR ama KUYRUGU DEGISTIRMEZ (mutasyon yapmaz). Cagiran, gerekiyorsa
+// (ör. hedef generation'in hala var olup olmadigi gibi) EK dogrulamalari
+// bu donen deger uzerinde yaptiktan SONRA, hepsi basarili olursa ayri bir
+// adimda commitPopHead ile kuyruktan cikarmalidir - boylece "once pop et,
+// sonra basarisiz ol" tarzi kismi (non-atomik) mutasyonlar yapisal olarak
+// imkansiz hale gelir.
+func (s *State) peekHead(id PendingOperationID, wantKinds ...OperationKind) (*PendingOperation, error) {
 	if len(s.pendingOps) == 0 {
 		return nil, ErrAckOrderMismatch
 	}
@@ -698,7 +731,25 @@ func (s *State) popHead(id PendingOperationID, wantKinds ...OperationKind) (*Pen
 	if !matched {
 		return nil, ErrAckKindMismatch
 	}
+	return head, nil
+}
+
+// commitPopHead, kuyruk basini (peekHead ile zaten dogrulanmis oldugu
+// varsayilarak) kuyruktan cikarir.
+func (s *State) commitPopHead() {
 	s.pendingOps = s.pendingOps[1:]
+}
+
+// popHead, peekHead + commitPopHead'i tek adimda birlestirir - hedef
+// generation'in var olup olmadigi gibi EK bir dogrulama gerektirmeyen
+// cagiranlar (ör. CompleteOperation, ApplyErrorResponse - "ok" bulunamazsa
+// bile zarafetle atlanabilirler) icin uygundur.
+func (s *State) popHead(id PendingOperationID, wantKinds ...OperationKind) (*PendingOperation, error) {
+	head, err := s.peekHead(id, wantKinds...)
+	if err != nil {
+		return nil, err
+	}
+	s.commitPopHead()
 	return head, nil
 }
 
@@ -708,7 +759,11 @@ func (s *State) popHead(id PendingOperationID, wantKinds ...OperationKind) (*Pen
 //
 // Donen deger, dahili durumun bagimsiz bir kopyasidir.
 func (s *State) ApplyParseComplete(id PendingOperationID) (StatementGeneration, error) {
-	op, err := s.popHead(id, OpParse)
+	// Atomiklik: hedef generation'in hala var oldugu, kuyruktan cikarmadan
+	// (commitPopHead) ONCE dogrulanir - aksi halde bir dogrulama
+	// basarisizligi kismi (yalnizca kuyruktan cikarilmis ama hicbir sey
+	// commit edilmemis) bir mutasyon birakirdi.
+	op, err := s.peekHead(id, OpParse)
 	if err != nil {
 		return StatementGeneration{}, err
 	}
@@ -716,6 +771,18 @@ func (s *State) ApplyParseComplete(id PendingOperationID) (StatementGeneration, 
 	if !ok {
 		return StatementGeneration{}, ErrUnknownGeneration
 	}
+	if gen.State != LifecyclePending {
+		// Hedef generation zaten (ör. onu referans veren bir portal'in
+		// pending Bind'i hala kuyrukta oldugu icin cleanup tarafindan
+		// kaldirilmamis, ama BASKA bir yoldan - ör. bir Close cascade'i -
+		// zaten LifecycleFailed'e getirilmis) baglayici olmayan bir duruma
+		// gecmis - bunu "committed" olarak terfi ettirmek imkansiz bir
+		// yasam-dongusu gecisidir. Boyle bir onay gercek protokolde asla
+		// olusmaz (bkz. ApplyCloseComplete'in cascade notu), ancak bu saf
+		// model yine de guvenli sekilde reddetmelidir.
+		return StatementGeneration{}, ErrInvalidLifecycleTransition
+	}
+	s.commitPopHead()
 	gen.State = LifecycleCommitted
 	if gen.Name != "" {
 		s.namedStatementCommitted[gen.Name] = gen.ID
@@ -729,7 +796,9 @@ func (s *State) ApplyParseComplete(id PendingOperationID) (StatementGeneration, 
 //
 // Donen deger, dahili durumun bagimsiz bir kopyasidir.
 func (s *State) ApplyBindComplete(id PendingOperationID) (PortalGeneration, error) {
-	op, err := s.popHead(id, OpBind)
+	// Atomiklik: ApplyParseComplete ile ayni ilke - hedef generation
+	// kuyruktan cikarmadan ONCE dogrulanir.
+	op, err := s.peekHead(id, OpBind)
 	if err != nil {
 		return PortalGeneration{}, err
 	}
@@ -737,6 +806,11 @@ func (s *State) ApplyBindComplete(id PendingOperationID) (PortalGeneration, erro
 	if !ok {
 		return PortalGeneration{}, ErrUnknownGeneration
 	}
+	if gen.State != LifecyclePending {
+		// ApplyParseComplete ile ayni koruma - bkz. oradaki aciklama.
+		return PortalGeneration{}, ErrInvalidLifecycleTransition
+	}
+	s.commitPopHead()
 	gen.State = LifecycleCommitted
 	if gen.Name != "" {
 		s.namedPortalCommitted[gen.Name] = gen.ID
@@ -752,12 +826,26 @@ func (s *State) ApplyBindComplete(id PendingOperationID) (PortalGeneration, erro
 // sirada zaten commit/fail olmus olsa bile) - isim BURADA YENIDEN
 // COZUMLENMEZ, yalnizca yakalanmis TargetGeneration kullanilir.
 //
-//   - Statement kapatma basarili olursa: statement kaldirilir VE o TAM
-//     generation'dan olusturulmus her portal da kaldirilir (cascade).
-//   - Portal kapatma basarili olursa: yalnizca o portal kaldirilir.
+//   - Statement kapatma basarili olursa: statement "current"/isimli
+//     eslemeden AYRILIR (detach) VE o TAM generation'dan olusturulmus her
+//     portal da ayni sekilde ayrilir (cascade).
+//   - Portal kapatma basarili olursa: yalnizca o portal ayrilir.
 //   - Hedef NoGeneration ise (Close, var olmayan bir adi hedeflemisti):
-//     hicbir sey kaldirilmaz - bu bir hata degildir (gercek sunucu
+//     hicbir sey degismez - bu bir hata degildir (gercek sunucu
 //     davranisiyla ayni).
+//
+// GUVENLIK NOTU: ayrilan (detached) generation'lar DOGRUDAN silinmez -
+// LifecycleFailed olarak isaretlenir ve gercek kaldirma s.cleanup()'a
+// birakilir (applyOperationFailure/abandonOperation ile AYNI ilke).
+// Pipelining sirasinda, kapatilan TAM bu generation'i (ya da ondan
+// olusturulmus bir portal'i) hedefleyen BASKA bir bekleyen islem (ör.
+// Close'dan ONCE gonderilmis ama henuz onaylanmamis bir Bind/Describe)
+// hala kuyrukta olabilir - dogrudan silmek, o bekleyen islemin
+// TargetGeneration'ini "hicbir yere isaret etmeyen" hale getirirdi.
+// cleanup()'in mevcut koruyuculari (pendingOpTargets, portalReferencesStatement,
+// rollback-hedefi kontrolu, current-esleme kontrolu) - portal'lar ONCE,
+// statement'lar SONRA temizlenecek sekilde - bu generation'lari yalnizca
+// GERCEKTEN artik hicbir sekilde erisilemez olduklarinda kaldirir.
 func (s *State) ApplyCloseComplete(id PendingOperationID) error {
 	op, err := s.popHead(id, OpCloseStatement, OpClosePortal)
 	if err != nil {
@@ -772,18 +860,18 @@ func (s *State) ApplyCloseComplete(id PendingOperationID) error {
 	case OpCloseStatement:
 		if gen, ok := s.statements[op.TargetGeneration]; ok {
 			s.detachStatementPointer(gen)
-			delete(s.statements, op.TargetGeneration)
+			gen.State = LifecycleFailed
 		}
-		for pid, p := range s.portals {
+		for _, p := range s.portals {
 			if p.StatementID == op.TargetGeneration {
 				s.detachPortalPointer(p)
-				delete(s.portals, pid)
+				p.State = LifecycleFailed
 			}
 		}
 	case OpClosePortal:
 		if p, ok := s.portals[op.TargetGeneration]; ok {
 			s.detachPortalPointer(p)
-			delete(s.portals, op.TargetGeneration)
+			p.State = LifecycleFailed
 		}
 	}
 	s.cleanup()
@@ -856,27 +944,226 @@ func (s *State) ApplyErrorResponse(id PendingOperationID) error {
 		return ErrInvalidLifecycleTransition
 	}
 	s.pendingOps = s.pendingOps[1:]
+	s.applyOperationFailure(head)
+	s.cleanup()
+	return nil
+}
 
-	switch head.Kind {
+// applyOperationFailure, GERCEKTEN basarisiz olan (kendi ErrorResponse'unu
+// alan) bir islemin generation durumuna failure semantigini uygular: Parse/
+// Bind icin generation "failed" olur; isimsizse "current" isaretci GERI
+// ALINMAZ (gercek sunucu, bu islemi FIILEN ISLEDIGI icin eski nesneyi zaten
+// yok etmisti) - rollback goruntusu de artik gereksiz oldugundan silinir.
+// Close/Describe/Execute icin hicbir generation durumu degismez. Bu, hem
+// ApplyErrorResponse (dogrudan, tek basina) hem de
+// ApplyErrorResponseAndAbandonCycle (yalnizca GERCEKTEN basarisiz olan
+// BAS islem icin) tarafindan paylasilir - "atlanan" (abandoned) islemler
+// icin KULLANILMAZ, onlar icin bkz. abandonOperation.
+func (s *State) applyOperationFailure(op *PendingOperation) {
+	switch op.Kind {
 	case OpParse:
-		if gen, ok := s.statements[head.TargetGeneration]; ok {
+		if gen, ok := s.statements[op.TargetGeneration]; ok {
 			gen.State = LifecycleFailed
 			if gen.Name == "" && s.unnamedStatementCurrent == gen.ID {
 				s.unnamedStatementCurrent = NoGeneration
 			}
 		}
+		delete(s.unnamedStatementRollback, op.TargetGeneration)
 	case OpBind:
-		if gen, ok := s.portals[head.TargetGeneration]; ok {
+		if gen, ok := s.portals[op.TargetGeneration]; ok {
 			gen.State = LifecycleFailed
 			if gen.Name == "" && s.unnamedPortalCurrent == gen.ID {
 				s.unnamedPortalCurrent = NoGeneration
 			}
 		}
+		delete(s.unnamedPortalRollback, op.TargetGeneration)
 	case OpCloseStatement, OpClosePortal, OpDescribeStatement, OpDescribePortal, OpExecute:
 		// Hicbir generation durumu degismez - bkz. yukaridaki dokumantasyon.
 	}
+}
+
+// abandonOperation, PostgreSQL'in GERCEKTE HIC ISLEMEDIGI (bkz.
+// ApplyErrorResponseAndAbandonCycle - ayni cycle'da, gercekten basarisiz
+// olan baس islemden SONRA gelen, Sync'e kadar sessizce yok sayilan
+// islemler) bir islemin yerel etkisini TAMAMEN geri alir:
+//
+//   - Parse/Bind: olusturulan generation SILINIR (gercek sunucu onu hic
+//     var etmedi). Isimsizse VE bir rollback goruntusu varsa, "current"
+//     isaretci o goruntudeki (islemden hemen once gecerli olan) generation'a
+//     GERI YUKLENIR - cunku gercek sunucu bu islemi hic islemedigi icin
+//     ESKI nesneyi asla yok etmemisti. Isimliyse hicbir isaretci dokunulmaz
+//     (isimli generation'lar hic bir "current" isaretciyi hic degistirmez).
+//   - Close/Describe/Execute: hicbir generation'a sahip olmadiklarindan
+//     (yalnizca VAR OLAN bir generation'a referans verirler) baska hicbir
+//     yan etkileri yoktur - cagiran taraf zaten bu islemi kuyruktan
+//     cikarmis olur.
+func (s *State) abandonOperation(op *PendingOperation) {
+	switch op.Kind {
+	case OpParse:
+		if gen, ok := s.statements[op.TargetGeneration]; ok {
+			// LifecycleFailed olarak isaretlenir ve GERCEK silme islemi
+			// s.cleanup()'a birakilir (applyOperationFailure'in kendi
+			// basarisizlik yoluyla AYNI ilke) - DOGRUDAN silmek GUVENSIZDIR:
+			// bu generation, baska bir (terk edilmemis, ör. daha sonraki bir
+			// cycle'a ait) portal tarafindan HALA referans veriliyor olabilir
+			// (pipelining sirasinda henuz-committed-olmayan bir statement'a
+			// Bind yapmak protokol acisindan gecerlidir - bkz. ResolveStatement).
+			// cleanup(), yalnizca gercekten hicbir portal/pending islem/
+			// current-esleme kalmadiginda kaldirir - "hicbir statement asla
+			// hala referans verilen bir portal'i saglksiz birakacak sekilde
+			// kaldirilmaz" degismezini boylece korur.
+			gen.State = LifecycleFailed
+			// Yalnizca bu generation HALA "current" isaretciyse geri yukleme
+			// yapilir - aksi halde, ondan SONRA olusturulmus BASKA (terk
+			// EDILMEMIS, ör. daha sonraki bir cycle'a ait) bir generation
+			// zaten "current" olabilir; bu durumda rollback'i kosulsuzca
+			// uygulamak, o TAMAMEN ILGISIZ, gecerli current isaretciyi
+			// yanlislikla ezerdi (bkz. detachStatementPointer ile AYNI
+			// koruma).
+			if gen.Name == "" && s.unnamedStatementCurrent == gen.ID {
+				if prev, hasRollback := s.unnamedStatementRollback[gen.ID]; hasRollback {
+					// Savunmaci varlik kontrolu: rollback hedefi, BASKA
+					// gecerli bir nedenle (ör. bu arada gerceklesen bir
+					// ReadyForQuery('I') - statement'lar icin gecerli
+					// degil ama simetri/gelecekteki genisletmeler icin
+					// aynı desen korunur) zaten kaldirilmis olabilir.
+					// Boyle bir durumda NoGeneration'a (bos) geri donmek
+					// HER ZAMAN guvenlidir - sarkan (dangling) bir
+					// isaretciden iyidir.
+					if _, stillExists := s.statements[prev]; stillExists {
+						s.unnamedStatementCurrent = prev
+					} else {
+						s.unnamedStatementCurrent = NoGeneration
+					}
+				}
+			}
+		}
+		delete(s.unnamedStatementRollback, op.TargetGeneration)
+	case OpBind:
+		// Ayni ilke: portal'lar hicbir baska yapi tarafindan referans
+		// verilmedigi icin pratikte cleanup() bunu HEMEN (bu ayni
+		// ApplyErrorResponseAndAbandonCycle cagrisi icindeki cleanup()
+		// adiminda) kaldirir - ama yine de ayni GUVENLI, tek bir "retirement"
+		// yolunu (LifecycleFailed + cleanup) kullanmak icin buraya da
+		// uygulanir, dogrudan silme yerine.
+		if gen, ok := s.portals[op.TargetGeneration]; ok {
+			gen.State = LifecycleFailed
+			// Ayni koruma: yalnizca hala "current" ise geri yukle (bkz.
+			// yukaridaki OpParse durumundaki aciklama).
+			if gen.Name == "" && s.unnamedPortalCurrent == gen.ID {
+				if prev, hasRollback := s.unnamedPortalRollback[gen.ID]; hasRollback {
+					// Savunmaci varlik kontrolu (bkz. OpParse durumundaki
+					// ayni aciklama) - burada GERCEKTEN onemlidir: rollback
+					// hedefi bir portal, ReadyForQuery('I') tarafindan
+					// (bkz. invalidatePortalsThroughCycle) TAMAMEN GECERLI
+					// bir nedenle - transaction sona erdigi icin -
+					// kosulsuzca kaldirilmis olabilir, tam da bu abandon
+					// islemi gerceklesmeden ONCE. Boyle bir durumda
+					// NoGeneration'a geri donmek dogru davranistir: o
+					// portal gercekten yok, "geri yuklenecek" hicbir sey
+					// kalmamistir.
+					if _, stillExists := s.portals[prev]; stillExists {
+						s.unnamedPortalCurrent = prev
+					} else {
+						s.unnamedPortalCurrent = NoGeneration
+					}
+				}
+			}
+		}
+		delete(s.unnamedPortalRollback, op.TargetGeneration)
+	case OpCloseStatement, OpClosePortal, OpDescribeStatement, OpDescribePortal, OpExecute:
+		// Bu islemler hicbir generation'a "sahip" degildir (yalnizca
+		// referans verirler) - kuyruktan cikarilmalari disinda geri
+		// alinacak baska bir yan etki yoktur.
+	}
+}
+
+// ApplyErrorResponseAndAbandonCycle, kuyruk basindaki islemin GERCEK bir
+// ErrorResponse aldigini bildirir VE PostgreSQL'in bu noktadan sonra ayni
+// Sync-sinirli cycle'daki (kendi Sync'i haric) TUM sonraki frontend
+// komutlarini Sync'e kadar sessizce yok saydigi protokol kuralini
+// (bkz. https://www.postgresql.org/docs/current/protocol-flow.html,
+// "Extended Query") uygular.
+//
+// "operationID" kuyruk basindaki islemin ID'si OLMALIDIR (aksi halde
+// ErrAckOrderMismatch) ve OpSync OLAMAZ (aksi halde
+// ErrInvalidLifecycleTransition; Sync kendi ErrorResponse'unu asla almaz -
+// her zaman bir ReadyForQuery ile sonuclanir).
+//
+// Dogrulama TAMAMEN mutasyondan ONCE yapilir - basarisiz bir cagri State'i
+// HICBIR sekilde degistirmez (atomiklik).
+//
+// Basarili olursa:
+//  1. Kuyruk basindaki (GERCEKTEN basarisiz olan) islem "failed" isaretlenir
+//     (bkz. applyOperationFailure) - normal ApplyErrorResponse ile birebir
+//     ayni semantik.
+//  2. Ayni CycleID'ye sahip, HEMEN SONRAKI tum kuyruk girdileri - o
+//     cycle'in KENDI Sync girdisine kadar (o Sync KORUNUR, kuyrukta kalir) -
+//     "terk edilmis" (abandoned) sayilir ve geri alinir (bkz.
+//     abandonOperation) - isimsiz Parse/Bind rollback'leri TERS (en son
+//     olusturulandan en eskiye) sirada uygulanir, boylece birden fazla
+//     spekülatif isimsiz degisim dogru sekilde geri sarilir (LIFO).
+//  3. Sonraki (farkli/daha yeni) cycle'lara ait hicbir girdiye dokunulmaz.
+//  4. Deterministik generation/referans temizligi (cleanup) calistirilir.
+//
+// Donen "failed" ve "abandoned" degerleri bagimsiz kopyalardir (bkz. dosya
+// basi "Degismezlik sozlesmesi").
+func (s *State) ApplyErrorResponseAndAbandonCycle(operationID PendingOperationID) (PendingOperation, []PendingOperation, error) {
+	if len(s.pendingOps) == 0 {
+		return PendingOperation{}, nil, ErrAckOrderMismatch
+	}
+	head := s.pendingOps[0]
+	if head.ID != operationID {
+		return PendingOperation{}, nil, ErrAckOrderMismatch
+	}
+	if head.Kind == OpSync {
+		return PendingOperation{}, nil, ErrInvalidLifecycleTransition
+	}
+
+	failedCycle := head.Cycle
+	abandonedCount := 0
+	for i := 1; i < len(s.pendingOps); i++ {
+		op := s.pendingOps[i]
+		if op.Cycle != failedCycle || op.Kind == OpSync {
+			break
+		}
+		abandonedCount++
+	}
+
+	// Dogrulama bitti - buradan sonrasi mutasyondur.
+	s.pendingOps = s.pendingOps[1:]
+
+	abandonedOps := make([]*PendingOperation, abandonedCount)
+	copy(abandonedOps, s.pendingOps[:abandonedCount])
+	s.pendingOps = s.pendingOps[abandonedCount:]
+
+	s.applyOperationFailure(head)
+
+	// Isimsiz rollback zincirlerinin dogru sekilde (LIFO) cozulmesi icin
+	// TERS (en son olusturulandan en eskiye) sirada terk et.
+	for i := len(abandonedOps) - 1; i >= 0; i-- {
+		s.abandonOperation(abandonedOps[i])
+	}
+
 	s.cleanup()
-	return nil
+
+	failedSnap := copyPendingOperation(head)
+	abandonedSnaps := make([]PendingOperation, len(abandonedOps))
+	for i, op := range abandonedOps {
+		abandonedSnaps[i] = copyPendingOperation(op)
+	}
+	return failedSnap, abandonedSnaps, nil
+}
+
+// HeadPendingOperation, bekleyen-islem kuyrugunun basindaki (varsa) islemin
+// bagimsiz bir KOPYASINI O(1) surede dondurur - tam PendingOperations()
+// dilimini kopyalamadan yalnizca basi incelemek icin kullanilir. State'i
+// degistirmez, dahili kuyrugu disari sizdirmaz.
+func (s *State) HeadPendingOperation() (PendingOperation, bool) {
+	if len(s.pendingOps) == 0 {
+		return PendingOperation{}, false
+	}
+	return copyPendingOperation(s.pendingOps[0]), true
 }
 
 // ApplyReadyForQuery, "id" degil, gercek sunucudan gelen bir ReadyForQuery
@@ -1002,6 +1289,9 @@ func (s *State) cleanupStatements() {
 		if s.portalReferencesStatement(id) {
 			continue
 		}
+		if s.isUnnamedStatementRollbackTarget(id) {
+			continue
+		}
 		if gen.Name == "" {
 			if s.unnamedStatementCurrent == id {
 				continue
@@ -1016,6 +1306,9 @@ func (s *State) cleanupStatements() {
 func (s *State) cleanupPortals() {
 	for id, gen := range s.portals {
 		if s.pendingOpTargets(id, OpBind, OpDescribePortal, OpExecute, OpClosePortal) {
+			continue
+		}
+		if s.isUnnamedPortalRollbackTarget(id) {
 			continue
 		}
 		if gen.Name == "" {
@@ -1046,6 +1339,49 @@ func (s *State) pendingOpTargets(id GenerationID, kinds ...OperationKind) bool {
 func (s *State) portalReferencesStatement(id GenerationID) bool {
 	for _, p := range s.portals {
 		if p.StatementID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnnamedStatementRollbackTarget, "id"nin, KENDI OLUSTURAN Parse islemi
+// hala BEKLEYEN-ISLEM KUYRUGUNDA olan bir isimsiz statement generation'in
+// rollback (geri alma) hedefi olup olmadigini dondurur. Boyle bir hedef,
+// kendisi artik "current" olmasa ve hicbir portal referans vermese bile,
+// olasi bir ApplyErrorResponseAndAbandonCycle geri yuklemesi icin CANLI
+// tutulmalidir (bkz. dosya basi unnamedStatementRollback alani).
+//
+// ONEMLI: burada newGen'in KENDI .State alanina (LifecyclePending mi)
+// DEGIL, kuyrukta HALA bir bekleyen Parse islemi olup olmadigina
+// bakilir. Nedeni: bir Close cascade'i (bkz. ApplyCloseComplete), newGen'in
+// .State'ini - kendi Parse'i hala kuyrukta bekliyor olsa BILE - baska bir
+// nedenle (ör. o statement'i barindiran BASKA bir generation kapatildigi
+// icin degil, dogrudan kendisi hedeflendigi icin) LifecycleFailed'e
+// getirebilir; newGen'in KENDI Parse'i hala kuyrukta oldugu surece,
+// abandonOperation onu daha sonra terk edip rollback hedefini geri
+// yuklemeyi hala deneyebilir - bu yuzden rollback hedefi (prevGen) o ana
+// kadar CANLI kalmalidir, newGen'in .State'i ne olursa olsun.
+func (s *State) isUnnamedStatementRollbackTarget(id GenerationID) bool {
+	for newGen, prevGen := range s.unnamedStatementRollback {
+		if prevGen != id {
+			continue
+		}
+		if s.pendingOpTargets(newGen, OpParse) {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnnamedPortalRollbackTarget, isUnnamedStatementRollbackTarget ile ayni
+// kurali (ve ayni gerekceyi) portal'lar icin uygular.
+func (s *State) isUnnamedPortalRollbackTarget(id GenerationID) bool {
+	for newGen, prevGen := range s.unnamedPortalRollback {
+		if prevGen != id {
+			continue
+		}
+		if s.pendingOpTargets(newGen, OpBind) {
 			return true
 		}
 	}

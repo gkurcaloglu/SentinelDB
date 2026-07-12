@@ -42,6 +42,11 @@ const (
 	MsgCloseComplete      MessageType = '3'
 	MsgNoData             MessageType = 'n'
 	MsgPortalSuspended    MessageType = 's'
+	// MsgParameterDescription ve MsgNotificationResponse, Extended Query
+	// backend-yanit korelasyonu (bkz. internal/protocol/extended_correlation.go)
+	// icin gereklidir; V1'in Simple Query yolunda hic gorulmezler.
+	MsgParameterDescription MessageType = 't'
+	MsgNotificationResponse MessageType = 'A'
 	// COPY protokolünü başlatan backend mesajları. SentinelDB V1, COPY
 	// protokolünü desteklemez (bkz. internal/masking.Transformer); bu
 	// sabitler yalnızca bu mesajları tanıyıp güvenli şekilde
@@ -66,6 +71,7 @@ var backendNames = map[MessageType]string{
 	MsgNoticeResponse: "NoticeResponse", MsgEmptyQueryResponse: "EmptyQueryResponse",
 	MsgParseComplete: "ParseComplete", MsgBindComplete: "BindComplete",
 	MsgCloseComplete: "CloseComplete", MsgNoData: "NoData", MsgPortalSuspended: "PortalSuspended",
+	MsgParameterDescription: "ParameterDescription", MsgNotificationResponse: "NotificationResponse",
 	MsgCopyData: "CopyData", MsgCopyDone: "CopyDone",
 	MsgCopyInResponse: "CopyInResponse", MsgCopyOutResponse: "CopyOutResponse", MsgCopyBothResponse: "CopyBothResponse",
 }

@@ -63,14 +63,22 @@ be verified from the document as written, it should be treated as unchecked.
 - [ ] The proposed state model distinguishes `pending` (forwarded,
       unacknowledged), `committed` (backend-acknowledged), and `blocked`
       (never forwarded) for both statements and portals.
-- [ ] State is committed only on the corresponding backend acknowledgement
+- [ ] State (a generation's `pending`/`committed`/`blocked` status) is
+      committed only on the corresponding backend acknowledgement
       (`ParseComplete`/`BindComplete`/`CloseComplete`), never optimistically
-      at forward-time.
+      at forward-time. **The design explicitly carves out *resolvability*
+      of the unnamed slot as a distinct, narrower exception to this rule**
+      (the "current pointer" moves at forward time for `""`, not at
+      acknowledgement time) and states why — this is not a violation of
+      the general principle, but it must be explicit, not silently
+      inconsistent with it.
 - [ ] The pending-operation queue's FIFO correlation model is consistent
       with pipelining (multiple in-flight, unacknowledged operations).
 - [ ] Replacement semantics for the unnamed statement/portal slot are
       described, including the effect (or explicit non-effect) on portals
-      already bound from a since-replaced unnamed statement.
+      already bound from a since-replaced unnamed statement, **and are
+      explicitly distinguished from named-object semantics — not treated
+      as the same rule** (§ below).
 - [ ] **`Close` behavior is asymmetric and correctly stated**: closing a
       statement cascades to implicitly close every portal built from it
       (this is official, documented PostgreSQL behavior, not an optional
@@ -90,12 +98,44 @@ be verified from the document as written, it should be treated as unchecked.
 - [ ] The design states explicitly what happens to a failed duplicate
       named `Parse`/`Bind`: the pre-existing committed statement/portal
       must remain intact and usable.
+- [ ] **Named and unnamed replacement-failure semantics are explicitly
+      described as different, not as one shared rule:**
+      - A conflicting **named** `Parse`/`Bind` is rejected without ever
+        replacing/touching the old object — a failed named generation
+        therefore leaves the previously committed named object intact.
+      - A new **unnamed** `Parse`/`Bind`, once *forwarded* (allowed by
+        policy), immediately retires the previous unnamed statement's/
+        portal's resolvability — **before** `ParseComplete`/`BindComplete`
+        is known — because the real server destroys the old unnamed
+        object as an early side effect of merely processing the new one,
+        regardless of whether the new one succeeds. A failed unnamed
+        replacement (`ErrorResponse` instead of the expected
+        acknowledgement) does **not** restore the previous unnamed
+        object — the slot is left empty/unresolvable.
+      - A **locally blocked** (never-forwarded) new unnamed `Parse`/`Bind`
+        does not disturb the previous unnamed object at all, since the
+        real server never saw it.
+- [ ] Historical (superseded) statement/portal generations are specified
+      to be retained internally, immutably, only as long as a portal entry
+      still references them at `Bind` time — and are explicitly never
+      "the current slot" again once superseded.
 
 ## Local rejection recovery
 
 - [ ] The discard-until-`Sync` state is entered on any locally-generated
       `ErrorResponse` during an Extended Query cycle, not just on a
       blocked `Parse`.
+- [ ] **Discard-until-`Sync` begins atomically at the moment the local
+      block/rejection *decision* is accepted and its synthetic unit is
+      *submitted* (enqueued) — not when that unit's `ErrorResponse` bytes
+      are actually drained and become client-visible.** These two moments
+      must be treated as different in the design, since a synthetic unit
+      can sit queued behind unfinished earlier pass-through units for an
+      arbitrary amount of time.
+- [ ] A test scenario proves this: an allowed operation A is still
+      pending; a blocked operation B is queued behind it; further
+      frontend messages (C) that arrive **before** B's `ErrorResponse` is
+      client-visible are still discarded and never forwarded.
 - [ ] Exactly one `ErrorResponse` is generated per local rejection event;
       subsequent discarded messages generate no further response.
 - [ ] `Terminate` is explicitly exempted from discard-mode suppression.
@@ -163,6 +203,49 @@ be verified from the document as written, it should be treated as unchecked.
 - [ ] The resource-exhaustion discussion accounts for unbounded
       *outstanding cycle count* as a distinct risk from registry size or
       per-cycle pending-operation-queue depth.
+
+## Event-driven sequencer
+
+- [ ] **The design does not rely on `masking.Transformer`'s (or any
+      backend-socket-reading component's) blocking read loop as the sole
+      mechanism for noticing newly enqueued synthetic units.** A loop
+      whose only wake-up source is backend traffic cannot notice a unit
+      enqueued while the backend socket is idle.
+- [ ] An explicit, dedicated response sequencer component is designed,
+      woken by **either** of two independent event sources: new
+      response-plan units from `firewall.Gate`, or decoded backend frames
+      from a dedicated backend reader.
+- [ ] **Exactly one goroutine owns the response-plan queue and the
+      pending-operation queue**, and is the only component that writes
+      client-bound Extended Query bytes — `firewall.Gate` and the backend
+      reader only ever submit events, never mutate either queue directly.
+- [ ] Event types, channel ownership (single writer, single reader per
+      channel), and queue ownership are all stated explicitly, not implied.
+- [ ] Backpressure is addressed explicitly: the backend reader's `Read()`
+      must never be blocked by a stalled client write, and `Gate`'s client
+      read must never be blocked by a stalled client write either — the
+      actual bound on unconsumed work is the already-recommended
+      pending-operation/outstanding-cycle caps, not an accidental deadlock
+      from a blocked channel send.
+- [ ] What happens on client-socket failure, backend-socket failure (while
+      a synthetic unit is pending, and while a pass-through unit is
+      pending), and client disconnect while both event sources are active
+      is each specified explicitly.
+- [ ] **Shutdown and cancellation ownership is explicit**: the sequencer's
+      termination is derived from its two input channels closing, which in
+      turn follows from the existing shutdown mechanism (force-closing
+      tracked connections) unblocking `Gate`'s and the backend reader's
+      socket reads — no new, separate cancellation primitive is silently
+      assumed or left unstated.
+- [ ] A Mermaid component/sequence diagram illustrates the three
+      cooperating components (Gate, backend reader, sequencer) and the two
+      event channels.
+- [ ] Test scenarios exist for: blocked-first with no backend traffic;
+      a synthetic unit enqueued while the backend reader's `Read()` is
+      blocked; a synthetic unit queued behind an unfinished pass-through
+      unit; backend disconnect while a synthetic unit is pending; client
+      disconnect while both event sources are active; and shutdown without
+      goroutine leaks.
 
 ## Response ordering
 
@@ -307,10 +390,21 @@ be verified from the document as written, it should be treated as unchecked.
       "must be rejected fail-closed" are three distinct, non-overlapping
       lists.
 - [ ] Mixing Simple Query and Extended Query on the same connection over
-      time is explicitly addressed, **including that a forwarded Simple
-      Query destroys the real server's unnamed statement and unnamed
-      portal**, and that SentinelDB's own unnamed-slot registry entries
-      are invalidated to match (named entries must be unaffected).
+      time is explicitly addressed, **including that an *allowed* (not
+      locally blocked) Simple Query destroys the real server's unnamed
+      statement and unnamed portal**, and that SentinelDB's own
+      unnamed-slot registry entries are invalidated to match (named
+      entries must be unaffected either way).
+- [ ] **This invalidation is specified to happen atomically, immediately
+      before the `Query` bytes are forwarded upstream — not deferred to
+      that query's own `ReadyForQuery`, and not conditioned on the query's
+      own success/failure.** A locally blocked Simple Query (never
+      forwarded) is explicitly specified to invalidate nothing.
+- [ ] The design states that in-flight response-correlation snapshots
+      (pass-through units/pending-operation entries already forwarded
+      before the Simple Query, referencing an older statement/portal
+      generation) do not depend on the mutable "current" unnamed pointer
+      and remain valid until their own responses complete.
 
 ## Tests
 
@@ -332,6 +426,17 @@ be verified from the document as written, it should be treated as unchecked.
       invalidation itself and a later reference to the invalidated object.
 - [ ] Named test entries exist for a duplicate named `Parse`/`Bind` whose
       failure must leave the pre-existing committed object intact.
+- [ ] Named test entries exist for: an allowed Simple Query immediately
+      followed by a pipelined `Bind`/`Execute` referencing the *former*
+      unnamed statement/portal (sent before that Simple Query's own
+      `ReadyForQuery`); a Simple Query that later returns `ErrorResponse`
+      still having invalidated the unnamed slots; a locally blocked Simple
+      Query preserving the upstream-backed unnamed objects; and named
+      objects surviving both allowed and blocked Simple Query messages.
+- [ ] Named test entries exist for: successful and failed unnamed `Parse`
+      replacement, successful and failed unnamed `Bind` replacement, and
+      historical generations retained only while a live portal reference
+      exists.
 
 ## Documentation truthfulness
 
@@ -362,6 +467,16 @@ be verified from the document as written, it should be treated as unchecked.
       frontend message necessarily produces a backend response (`Flush`
       and `Terminate` do not); every backend message must correlate to
       the pending-operation head (asynchronous messages do not).
+- [ ] **No section still claims**, from the third review pass: that
+      `masking.Transformer`'s (or any) blocking backend-socket-read loop
+      alone can observe newly enqueued response-plan units; that discard-
+      until-`Sync` begins only after the synthetic `ErrorResponse` is
+      physically written to the client; that all generation-replacement
+      failures (named and unnamed alike) preserve the previous object;
+      that unnamed-slot replacement commits (becomes resolvable) only on
+      `ParseComplete`/`BindComplete`; that Simple Query's unnamed-slot
+      invalidation waits for that query's `ReadyForQuery`; or that named
+      and unnamed replacement semantics are the same rule applied twice.
 
 ## Sign-off
 

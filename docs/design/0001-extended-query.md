@@ -2,27 +2,36 @@
 
 ## Status
 
-**Draft.** This revision corrects four further correctness gaps found
-during a **second** review pass, on top of the seven already corrected in
-the first review pass (prepared-statement `Close` cascading to portals,
-portal transaction-scoping, `Execute` response shape, mixed
-Simple/Extended Query state invalidation, client-response ordering,
-upstream-`ErrorResponse` cleanup, and duplicate-name registry safety). The
-four second-pass corrections: (1) transaction-end detection was fixed to
-trigger on the *reported* `ReadyForQuery` status value rather than a
-transition, since a transition-only rule misses the ordinary `I → I` case
-of an implicit Extended Query cycle; (2) the response-plan design was
-corrected so a real upstream error suppresses every later synthetic error
-in the same cycle, matching genuine PostgreSQL behavior; (3) explicit,
-monotonically increasing per-connection cycle IDs were introduced,
-replacing the insufficient single global discard boolean, so multiple
-pipelined `Sync`-delimited cycles in flight simultaneously are tracked and
-correlated unambiguously; and (4) frontend messages with no corresponding
-backend acknowledgement (`Flush`, `Terminate`) and asynchronous backend
-messages (`NoticeResponse`, `ParameterStatus`, `NotificationResponse`) now
-have explicitly documented handling, distinct from the operation-
-correlated response-plan units. Each correction is marked inline where it
-applies. **Still not approved for implementation.**
+**Draft.** This revision corrects four **implementation-blocking state and
+concurrency gaps** found during a **third** review pass, on top of
+corrections from the first review pass (prepared-statement `Close`
+cascading to portals, portal transaction-scoping, `Execute` response
+shape, mixed Simple/Extended Query state invalidation, client-response
+ordering, upstream-`ErrorResponse` cleanup, and duplicate-name registry
+safety) and the second review pass (corrected transaction-end detection,
+real-error precedence over synthetic errors, explicit cycle IDs, and
+no-response/asynchronous message handling). The four third-pass
+corrections: (1) the passive "reuse `masking.Transformer`'s backend loop
+as the drain path" design was replaced with an explicit **event-driven
+response sequencer**, because a loop that only wakes on backend traffic
+can never notice a synthetic unit enqueued while the backend socket is
+idle (the blocked-first case); (2) the client-facing discard-until-`Sync`
+transition was corrected to begin the instant a block/rejection decision
+is accepted and its synthetic unit is *submitted*, not when that unit's
+bytes are eventually *written* — the two can now be arbitrarily far apart
+in time once a sequencer/queue sits between them; (3) the object-
+generation model's "failed generation leaves the old one untouched" rule
+was corrected to apply to **named** objects only — PostgreSQL destroys the
+previous **unnamed** statement/portal early, as a side effect of merely
+*processing* a new unnamed `Parse`/`Bind`, regardless of whether that new
+one succeeds, so a failed unnamed replacement must **not** restore the old
+one; and (4) Simple Query's invalidation of the unnamed statement/portal
+was moved from "at that query's real `ReadyForQuery`" to "atomically,
+immediately before forwarding the `Query` bytes," since the real server
+destroys its own unnamed objects at the same early point, and waiting for
+`ReadyForQuery` is too late for a client that pipelines further Extended
+Query messages without waiting for it. Each correction is marked inline
+where it applies. **Still not approved for implementation.**
 
 **No implementation exists yet.** This document is a design proposal only.
 Nothing described below — no connection-state model, no policy-evaluation
@@ -780,12 +789,21 @@ Evaluated structures:
   `Query`, never the parameter values), and a creation status of one of:
   `pending` (forwarded, awaiting `ParseComplete`), `committed`
   (acknowledged by the real server), or `blocked` (evaluated locally and
-  never forwarded).
+  never forwarded). **The unnamed slot (`""`) additionally carries a
+  "current" pointer**, distinct from any individual generation's status,
+  identifying which generation later frontend messages naming `""`
+  resolve against — this pointer moves at *forward* time for the unnamed
+  slot specifically, not at acknowledgement time, per
+  [Object generations](#object-generations-safely-handling-duplicate-names)'s
+  unnamed-statement rules. Named slots have no such pointer — a named
+  entry's resolvability is simply "does a `committed` entry for this name
+  exist," unaffected by any later, still-pending duplicate attempt.
 - **Portal registry** — keyed by `(name, generation)` on the same
-  principle (`""` for the unnamed slot). Per entry: portal name,
-  generation, a reference to the **specific `(statement name, statement
-  generation)`** it was bound from (not just a name — see
-  [Object generations](#object-generations-safely-handling-duplicate-names)),
+  principle (`""` for the unnamed slot, with the same "current pointer"
+  concept as the unnamed statement, moved at `Bind`-forward time). Per
+  entry: portal name, generation, a reference to the **specific
+  `(statement name, statement generation)`** it was bound from (not just
+  a name — see [Object generations](#object-generations-safely-handling-duplicate-names)),
   parameter format codes, **not** the parameter values themselves (see
   [Policy evaluation design](#policy-evaluation-design)), result format
   codes, creation status (`pending`/`committed`/`blocked`, same meaning as
@@ -979,6 +997,22 @@ discarded (never committed) and **any previously committed generation for
 that same name is completely unaffected** — see
 [Object generations](#object-generations-safely-handling-duplicate-names).
 
+**Named-versus-unnamed exception to the rule above.** The "don't commit
+until backend evidence" principle governs a generation's own
+`pending`/`committed`/`blocked` *status*, and that part is unconditional
+for both named and unnamed objects alike. What is *not* uniform is
+**resolvability** — i.e., which generation a later frontend message naming
+the same name resolves against. For a **named** slot, resolvability
+follows status exactly (a name resolves to its `committed` generation, if
+any; a `pending` duplicate doesn't change that). For the **unnamed** slot,
+resolvability is governed by the separate "current pointer" described
+above, which moves at *forward* time, **not** at acknowledgement time —
+this is a deliberate, narrow exception to the general rule, required
+because the real server itself destroys the previous unnamed object at
+that same forward-adjacent moment (§ [Object generations](#object-generations-safely-handling-duplicate-names)'s
+unnamed-statement and unnamed-portal sections), not because the general
+principle is wrong.
+
 **Pipelining implication.** Because multiple operations can be pending
 (forwarded, unacknowledged) simultaneously, the pending-operation queue
 must support multiple in-flight entries, and a later message referencing
@@ -1003,24 +1037,67 @@ always uses, and thus replaces, the unnamed statement/portal slots
 regardless of what Extended Query state existed before it). Named
 statements and named portals are **not** affected by a Simple Query.
 
-**Design:** when a `Query` message is forwarded (allowed by policy,
-exactly as today), SentinelDB's own unnamed-statement and unnamed-portal
-registry slots must be invalidated to match. Following this document's
-"commit only on backend evidence" principle, this invalidation is applied
-when the real server's response to that `Query` is fully observed — the
-existing Simple Query response sequence always ends in a real
-`ReadyForQuery` (`internal/masking/transformer.go`'s existing
-`ReadyForQuery` handling, unchanged), so **that `ReadyForQuery` is the
-evidence point**: upon observing it, SentinelDB unconditionally clears
-whatever is currently in the unnamed-statement and unnamed-portal slots
-(regardless of their state — `committed`, `pending`, or nonexistent — an
-empty slot invalidates to itself trivially). Any subsequent
-`Bind`/`Describe`/`Execute`/`Close` referencing the unnamed name resolves
-against whatever *new* unnamed object a later `Parse`/`Bind` creates, or
-is treated as unknown (fail closed) if nothing has re-created it yet —
-exactly the same treatment as any other reference to a nonexistent
-object. Named statement and portal registry entries are left completely
-untouched by this invalidation.
+**Design — corrected in this revision.** The previous revision applied
+this document's general "commit only on backend evidence" principle here
+too literally: it deferred invalidating the unnamed-statement/unnamed-
+portal slots until the Simple Query's real `ReadyForQuery` was observed.
+**This is too late** for a client that pipelines a Simple Query followed
+immediately by Extended Query messages without waiting for
+`ReadyForQuery` — real PostgreSQL destroys/reuses its unnamed objects as
+part of *beginning* Simple Query processing (mirroring exactly how a new
+unnamed `Parse`/`Bind` destroys the previous unnamed object early, per
+[Object generations](#object-generations-safely-handling-duplicate-names)),
+not at the end of it, and not conditioned on the query's own success.
+Waiting for `ReadyForQuery` would leave a window where SentinelDB still
+considers the pre-Simple-Query unnamed objects valid while the real server
+has already discarded them.
+
+**Corrected rule:**
+
+1. **First, evaluate the Simple Query using the existing policy path**
+   (unchanged — `firewall.Gate`'s existing `Query`-handling, evaluated
+   exactly as today).
+2. **If the Simple Query is blocked locally** (policy verdict `Block`,
+   never forwarded to the real server): **do not invalidate anything.**
+   The real server never saw this `Query`, so its own unnamed-object state
+   — and therefore SentinelDB's local view of it — is completely
+   unaffected. This mirrors exactly the "blocked, never forwarded" carve-
+   out already established for unnamed `Parse`/`Bind` in
+   [Object generations](#object-generations-safely-handling-duplicate-names).
+3. **If the Simple Query is allowed:** **atomically invalidate the local
+   current unnamed-statement and current unnamed-portal slots immediately
+   before forwarding the `Query` bytes upstream** — not after, and not
+   waiting for any response. This models the real server's own behavior
+   precisely: it destroys/reuses the unnamed objects as an early side
+   effect of *beginning* to process the query, regardless of whether the
+   query text later turns out to be valid, executes successfully, or
+   itself returns `ErrorResponse`. SentinelDB's local invalidation must
+   therefore not wait for `ReadyForQuery`, or even for the query's own
+   `CommandComplete`/`ErrorResponse` — it happens at the same moment the
+   bytes are handed to the real server, exactly like the unnamed
+   `Parse`/`Bind` forward-time rule.
+4. **Do not wait for `ReadyForQuery` to make the invalidation visible to
+   later frontend-message resolution.** Any `Bind`/`Describe`/`Execute`/
+   `Close` referencing the (now-invalidated) unnamed name that arrives
+   *after* the allowed `Query` was forwarded — even if it arrives well
+   before that `Query`'s own `ReadyForQuery` — resolves against whatever
+   *new* unnamed object a later `Parse`/`Bind` creates, or is treated as
+   unknown (fail closed) if nothing has re-created it yet.
+5. **Named statement and portal registry entries are left completely
+   untouched**, whether the Simple Query is allowed or blocked.
+6. **In-flight response-correlation snapshots must not depend on the
+   mutable current unnamed slots.** A pass-through unit or pending-
+   operation-queue entry that was already forwarded *before* this Simple
+   Query (referencing whatever the unnamed statement/portal was at the
+   time it was created) captured its own `(name, generation)` snapshot at
+   that time (§ [Object generations](#object-generations-safely-handling-duplicate-names)) —
+   invalidating the *current* pointer does not retroactively invalidate
+   an already-in-flight correlation for an *older* generation; that
+   generation's own response is still correctly delivered when its
+   backend acknowledgement arrives, exactly as the existing "portals
+   reference a specific `(statement name, statement generation)` pair,
+   captured immutably" rule already guarantees for unnamed-statement
+   replacement generally.
 
 ### Object generations: safely handling duplicate names
 
@@ -1051,74 +1128,166 @@ gone), when the real server still considers it fully valid and committed.
 This is exactly the kind of local-state-vs-upstream-state divergence this
 entire design otherwise goes to great lengths to prevent.
 
-**Chosen mechanism: per-name generation counters.** Every registry entry
-(statement or portal) is identified by a `(name, generation)` pair, not by
-name alone. `generation` is a monotonically increasing integer, scoped to
-that name, assigned **locally by SentinelDB** (it is never part of the
-wire protocol) each time a `Parse` (for statements) or `Bind` (for
-portals) is processed for that name — whether the name is brand new or
-already has an existing committed or pending generation.
+**Chosen mechanism: per-name generation counters — with genuinely
+different lifecycle rules for named versus unnamed objects.** Every
+registry entry (statement or portal) is identified by a `(name,
+generation)` pair, not by name alone. `generation` is a monotonically
+increasing integer, scoped to that name, assigned **locally by
+SentinelDB** (it is never part of the wire protocol) each time a `Parse`
+(for statements) or `Bind` (for portals) is processed for that name —
+whether the name is brand new or already has an existing committed or
+pending generation. **Corrected in this revision:** an earlier version of
+this design applied the *named*-object failure rule ("a failed new
+generation leaves the previous committed generation untouched") uniformly
+to the unnamed slot as well. This is wrong — PostgreSQL's real server
+processes unnamed replacement differently from named-object conflicts, and
+the two must be modeled separately, not as one shared rule.
 
-- **Creating a new generation never overwrites an existing one.** When
-  `Parse` arrives for name `N`, SentinelDB computes
-  `generation = (highest generation seen for N so far) + 1` and creates a
-  **new, separate** registry entry for `(N, generation)` in `pending`
-  state. Any existing `committed` entry for `(N, older-generation)` is left
-  completely untouched, in memory, unchanged, for as long as it remains
-  referenced.
 - **The pending-operation queue is tagged by `(name, generation)`, not
   just `name`.** This is what makes the two in-flight operations on the
   same name correlate unambiguously (§ [Proposed connection state](#proposed-connection-state)):
-  the queue entry for the new `Parse` says "generation 2 of `s1`," fully
+  the queue entry for a new `Parse` says "generation 2 of `s1`," fully
   distinct from any queue entry that might still reference "generation 1
-  of `s1`."
-- **On success, the new generation is promoted to `committed`** when its
-  `ParseComplete`/`BindComplete` is popped off the pending-operation
-  queue. For the **unnamed** slot specifically, promotion also retires the
-  immediately-previous generation for `""` (the unnamed slot always has
-  exactly one *current* committed generation, matching its "always
-  implicitly replaced" semantics) — but see the next point for why this
-  retirement is not destructive to anything already bound to the old
-  generation.
-- **On failure (a real `ErrorResponse` instead of the expected
-  acknowledgement), the new generation's pending entry is simply discarded
-  — nothing else changes.** For a **named** slot, this is the common case
-  in practice: a `Parse` for an already-committed named statement, sent
-  without a preceding `Close`, will be rejected by the real server exactly
-  as protocol-documented, and the mechanism above guarantees the old,
-  still-live `committed` generation is never touched by that failure —
-  SentinelDB does not need to have pre-judged whether the duplicate would
-  succeed or fail; either outcome is handled mechanically and correctly by
-  the same generation-tracking logic.
+  of `s1`." This tagging applies uniformly to named and unnamed alike —
+  what differs between them is described below.
 - **Portals reference a specific `(statement name, statement generation)`
-  pair, captured at `Bind` time, immutably.** This is what already
-  correctly guarantees (independently confirmed, not newly introduced by
-  this section) that replacing the unnamed statement does not retroactively
-  affect portals bound from the *old* unnamed generation: a portal built
-  from unnamed generation 3 keeps referencing generation 3 specifically,
-  even after the unnamed slot's *current* generation moves on to 4, 5, and
-  so forth. The portal only becomes unresolvable if generation 3 itself is
-  later removed (by an explicit `Close` of that specific generation, by
-  the statement-close cascade, or — for named statements — session end;
-  the unnamed slot's old generations are simply never referenced by
-  anything once their portals are themselves gone, and can be garbage
-  collected once no portal entry points to them).
+  pair, captured at `Bind` time, immutably.** A portal built from unnamed
+  generation 3 keeps referencing generation 3 specifically, regardless of
+  what the unnamed slot's *current* generation later becomes. A historical
+  generation — named or unnamed — that is no longer the current resolvable
+  object for its name may still be retained internally, immutably, for as
+  long as any portal entry still references it specifically (it is not
+  presented to the client, not resolvable by name for new frontend
+  messages, and not "the current slot" — it exists purely so an
+  already-bound portal keeps working); once no portal references it, it
+  can be discarded.
 
-**This mechanism directly satisfies every requirement this correction asks
-for:**
+#### Named statement/portal: failed duplicate leaves the old object untouched
 
-- A failed duplicate named `Parse` leaves the old committed statement
-  intact — by construction, since the failed attempt only ever existed as
-  a separate, newly created, never-promoted generation.
-- A failed duplicate named `Bind` leaves the old committed portal intact
-  — identical mechanism, applied to the portal registry.
+Real PostgreSQL rejects a `Parse`/`Bind` for a name that already has a
+live, named object, **without ever touching the existing one** — the
+conflict check happens before any destruction, so a rejected duplicate
+simply never gets to replace anything.
+
+- Creating a new generation never overwrites an existing one: SentinelDB
+  computes `generation = (highest generation seen for N so far) + 1` and
+  creates a **new, separate** registry entry for `(N, generation)` in
+  `pending` state, forwarded to the real server. Any existing `committed`
+  entry for `(N, older-generation)` is left completely untouched, in
+  memory, unchanged, for as long as it remains referenced — and, unlike
+  the unnamed case below, **remains fully resolvable by name** for any
+  frontend message that arrives while the new generation is still pending.
+- **On success** (`ParseComplete`/`BindComplete` observed for the new
+  generation), it is promoted to `committed` and becomes the (only) live
+  object for that name — the real server's own conflict check guarantees
+  this only happens when there *was* no pre-existing live object to
+  conflict with.
+- **On failure** (a real `ErrorResponse` instead of the expected
+  acknowledgement), the new generation's pending entry is simply
+  discarded — **the old committed generation for that name, if any, is
+  completely unaffected** and remains the current, resolvable object.
+  This is the common case in practice: a `Parse` for an already-committed
+  named statement, sent without a preceding `Close`, is rejected by the
+  real server exactly as protocol-documented, and this mechanism
+  guarantees SentinelDB's local view never diverges from the real
+  server's — it does not need to have pre-judged whether the duplicate
+  would succeed or fail.
+
+#### Unnamed prepared statement: forwarding a new one immediately retires the old one
+
+Real PostgreSQL processes a new unnamed `Parse` differently: **it destroys
+the previous unnamed prepared statement as an early side effect of
+beginning to process the new one — before parsing or semantic analysis of
+the new SQL text completes, and regardless of whether that parsing
+ultimately succeeds.** There is no conflict check to fail before
+destruction, because there is nothing to conflict with — the unnamed slot
+is always silently reusable, and reuse itself is what destroys the
+previous occupant.
+
+- **The unnamed slot has a distinct "current" pointer**, separate from
+  any individual generation's `pending`/`committed` status. This pointer
+  identifies which generation later frontend messages naming `""` resolve
+  against.
+- **The moment `firewall.Gate` forwards an *allowed* new unnamed `Parse`**
+  (policy evaluation passed, so the bytes are actually sent upstream) —
+  **not** when `ParseComplete` is later observed — the current pointer
+  moves to the new (not-yet-acknowledged) generation, and **the
+  previously-current generation immediately stops being resolvable** for
+  any later frontend message naming `""`. This must happen at forward
+  time, synchronously, because the real server will have already begun
+  destroying the old one by the time it even starts parsing the new SQL —
+  waiting for `ParseComplete` to move the pointer would leave a window
+  where SentinelDB still considers the old generation valid/resolvable
+  while the real server no longer does, reopening exactly the
+  "operating against the wrong prepared statement" hazard this whole
+  generation mechanism exists to close.
+- **If the new unnamed `Parse` is instead locally *blocked*** (never
+  forwarded), none of the above applies: the real server never saw it, so
+  its own unnamed slot — and therefore whatever SentinelDB's current
+  pointer was already tracking — is completely unaffected.
+- **If `ParseComplete` arrives** for the new generation, it is promoted to
+  `committed` and remains the current generation (already true by virtue
+  of the pointer having moved at forward time).
+- **If a real `ErrorResponse` arrives instead**, the new generation's
+  pending entry is discarded — but **the unnamed slot's current pointer is
+  *not* reverted to the previous generation.** It becomes empty (resolves
+  to "unknown" for any later frontend message naming `""`) until a further
+  `Parse` creates a new one. This is the specific point where unnamed
+  semantics diverge from named ones: a failed named duplicate restores
+  nothing because nothing was ever disturbed; a failed unnamed replacement
+  cannot "restore" the old generation, because the real server already
+  destroyed it regardless of the new `Parse`'s outcome.
+- **Historical generations** (the old, no-longer-current unnamed
+  generation, and any earlier ones before it) may still be retained
+  internally, immutably, for as long as a portal entry captured a
+  reference to one of them at `Bind` time (per the portals rule above) —
+  but they are never "the current unnamed slot" again, and are never
+  resolvable by a bare `""` reference once superseded.
+
+#### Unnamed portal: forwarding a new one immediately retires the old one
+
+The same shape of rule applies to the unnamed portal, driven by `Bind`
+instead of `Parse`: processing a new unnamed `Bind` **silently replaces
+the previous unnamed portal** as an early side effect of beginning to
+process the new one, before all parameter conversion/planning steps have
+necessarily succeeded.
+
+- The unnamed portal slot has its own "current" pointer, analogous to the
+  unnamed statement's.
+- The moment `firewall.Gate` forwards an *allowed* new unnamed `Bind`, the
+  current pointer moves to the new (not-yet-acknowledged) portal
+  generation, and the previously-current unnamed portal generation
+  immediately stops being resolvable for any later frontend message
+  naming `""` (as a portal).
+- If the new unnamed `Bind` is locally blocked (never forwarded), the
+  previous unnamed portal is unaffected, for the same reason as above.
+- If `BindComplete` arrives, the new generation is promoted to `committed`
+  and remains current.
+- If a real `ErrorResponse` arrives instead, the new generation is
+  discarded and the unnamed portal slot becomes empty — the prior portal
+  generation is **not** restored, for the same reason as the unnamed
+  statement case: the real server already destroyed it regardless of this
+  `Bind`'s own outcome.
+
+**This corrected, two-track mechanism satisfies every requirement this
+correction asks for:**
+
+- A failed duplicate **named** `Parse`/`Bind` leaves the old committed
+  named statement/portal intact — by construction, since named conflicts
+  are rejected before any destruction occurs.
+- A failed **unnamed** `Parse`/`Bind` does **not** restore the previous
+  unnamed statement/portal — the slot is simply empty afterward, matching
+  the real server's own destroy-early behavior.
 - Pending pipelined operations can be correlated without ambiguous name
   lookup — the pending-operation queue's `(name, generation)` tagging
-  removes the ambiguity a name-only queue would have.
-- Local state always matches the most recently acknowledged upstream state
-  — because nothing is ever promoted to `committed` except by an actual
-  backend acknowledgement for that specific generation, and older
-  generations are never mutated by a newer generation's outcome.
+  removes the ambiguity a name-only queue would have, for both named and
+  unnamed alike.
+- Local state always matches the most recently observed upstream reality
+  — named objects because nothing is ever promoted to `committed` except
+  by an actual backend acknowledgement, and unnamed objects because the
+  current pointer moves at the same moment (forwarding) the real server
+  itself commits to destroying the old one, rather than lagging behind it
+  until an acknowledgement arrives.
 
 **Resolution of the previously open question.** SentinelDB does **not**
 need to detect and pre-reject a named-statement/portal name conflict
@@ -1191,12 +1360,21 @@ This is deliberately analyzed in full, not hand-waved:
 2. `firewall.Gate`'s Extended-Query handling (the proposed successor to
    today's blanket `isExtendedProtocolMessage` rejection) evaluates the
    query text via `Policy.Evaluate`, gets `Block`.
-3. SentinelDB writes a synthetic `ErrorResponse` to the client via the
-   shared `clientWriter` (same mechanism as today's blocked `Query`
-   handling), **does not forward the `Parse` message to the real
-   PostgreSQL server at all**, marks the statement registry entry
-   `blocked` (not `pending`, not `committed`), and sets the connection's
-   discard-until-`Sync` flag.
+3. **Corrected in this revision:** SentinelDB does **not** wait for the
+   synthetic `ErrorResponse` bytes to actually become client-visible before
+   entering discard mode — see
+   [Correcting the local discard transition trigger](#correcting-the-local-discard-transition-trigger)
+   for why that would be too late once the sequencer (§
+   [Event-driven response sequencer](#event-driven-response-sequencer))
+   can hold a synthetic unit queued behind still-unfinished earlier
+   pass-through units. Instead, the moment `firewall.Gate` *decides* to
+   block: it marks the statement registry entry `blocked` (not `pending`,
+   not `committed`), **does not forward** the `Parse` message to the real
+   PostgreSQL server at all, submits the synthetic unit (pre-built
+   `ErrorResponse` bytes) to the sequencer via `PlanUnitAdded`, and sets
+   the connection's discard-until-`Sync` flag for the current cycle —
+   **all as one atomic frontend-side decision**, not gated on when the
+   sequencer eventually drains and writes those bytes.
 4. The client — per the PostgreSQL protocol's own documented recovery
    contract, which real drivers already implement for *real* server-side
    errors — is expected to keep sending `Bind`, `Describe`, `Execute` (and
@@ -1255,10 +1433,15 @@ This is deliberately analyzed in full, not hand-waved:
 
 Explicit answers:
 
-- **Does SentinelDB enter discard-until-`Sync`?** Yes, immediately upon
-  writing any locally-generated `ErrorResponse` during an Extended Query
-  cycle (a blocked `Parse`, or a `Bind`/`Describe`/`Execute` referencing an
-  unknown or `blocked` statement/portal).
+- **Does SentinelDB enter discard-until-`Sync`?** Yes — **corrected in
+  this revision:** atomically at the moment the local block/rejection
+  *decision* is accepted and its synthetic response unit is submitted to
+  the sequencer (a blocked `Parse`, or a `Bind`/`Describe`/`Execute`
+  referencing an unknown or `blocked` statement/portal), **not** when the
+  `ErrorResponse` bytes actually become client-visible. See
+  [Correcting the local discard transition trigger](#correcting-the-local-discard-transition-trigger)
+  for the full analysis of why the two are different once a synthetic unit
+  can be queued behind still-unfinished earlier pass-through units.
 - **Which subsequent frontend messages are ignored?** All of `Parse`,
   `Bind`, `Describe`, `Execute`, `Close`, `Flush` — evaluated against
   nothing, forwarded to nowhere, and generating no further response —
@@ -1314,6 +1497,61 @@ operations in the same pipelined cycle. That timing question — and why a
 mutex alone does not answer it — is addressed in full in
 [Client-response ordering model](#client-response-ordering-model) below.
 
+### Correcting the local discard transition trigger
+
+**The gap this corrects.** Earlier text in this document sometimes phrased
+the client-facing discard-until-`Sync` transition as happening "when
+SentinelDB writes a synthetic `ErrorResponse`" — conflating *deciding* to
+block with the `ErrorResponse` bytes actually becoming *client-visible*.
+Once the [event-driven response sequencer](#event-driven-response-sequencer)
+exists, these two moments are no longer the same instant: a synthetic
+unit for a blocked operation can sit queued behind one or more earlier,
+still-unfinished pass-through units (operation "A" from an earlier part of
+the same pipelined cycle) for an arbitrary amount of time before the
+sequencer actually drains and writes it. If discard-mode entry were gated
+on the *write* rather than the *decision*, `firewall.Gate` would keep
+evaluating and potentially forwarding further frontend messages — `Bind`/
+`Execute`/further `Parse`s referencing the blocked statement or anything
+downstream of it — during that window, which is exactly the bypass this
+whole mechanism exists to prevent (§ [The critical scenario](#the-critical-scenario-parse-blocked-then-bindexecutesync-continue)).
+
+**Corrected rule.** Client-facing discard-until-`Sync` begins **atomically
+at the moment `firewall.Gate` accepts the local block/rejection decision
+and submits the corresponding synthetic unit to the sequencer** — not when
+that unit is later drained and its bytes become client-visible. Concretely,
+within the same synchronous step in `Gate`'s frontend-message-processing
+loop: mark the object `blocked` in the registry, submit the synthetic unit
+via `PlanUnitAdded`, and set the discard flag for the current cycle — none
+of this depends on, or waits for, the sequencer's eventual drain of that
+unit. From that point on, for the remainder of the same cycle:
+
+- Every subsequent `Parse`, `Bind`, `Describe`, `Execute`, `Close`, or
+  `Flush` is discarded immediately by `Gate` — evaluated against nothing,
+  forwarded to nowhere — regardless of whether the earlier synthetic
+  unit's `ErrorResponse` has reached the client yet.
+- `Sync` is still forwarded (unconditionally, per the existing rule) and
+  still closes out the cycle.
+- `Terminate` is still honored immediately, exactly as already specified.
+- **The synthetic unit itself can remain queued, for ordering purposes,
+  even though frontend discard is already active** — the discard flag
+  governs what `Gate` does with *further incoming frontend bytes*; it has
+  no bearing on when the sequencer gets around to draining a unit that was
+  already fully decided and submitted. These are two independent
+  mechanisms (frontend decision-time gating vs. client-visible-output
+  ordering) that happen to be triggered by the same event, not one
+  mechanism standing in for the other.
+
+**Scenario this specifically must cover:** allowed operation "A" is still
+pending (forwarded, awaiting its backend acknowledgement); `Parse` "B" is
+evaluated, blocked, and its synthetic unit is submitted and queued behind
+A's still-outstanding pass-through units; **before** B's `ErrorResponse`
+has become client-visible (the sequencer is still draining A), the client
+sends `Bind`/`Execute` "C" referencing B's (blocked) statement. Because
+discard-until-`Sync` was entered the instant B was blocked — not deferred
+until B's bytes were written — `Gate` discards C immediately: C is never
+evaluated, never forwarded, and never creates any response-plan unit of
+its own, regardless of A's or B's current drain state.
+
 ### Client-response ordering model
 
 **The gap in the first draft of this document:** it said SentinelDB
@@ -1362,33 +1600,34 @@ units** of two kinds:
   bytes to send (the synthetic `ErrorResponse`) and depends on nothing
   from the backend.
 
-**Who writes to the client.** `firewall.Gate`'s goroutine **no longer
-calls `clientWriter.Write` directly for synthetic bytes** — this is the
-concrete architectural change this correction requires relative to the
-first draft (and relative to today's codebase, which has no such
-distinction because Simple Query never needs one). Instead, it only ever
-*appends* units to the response plan. A single drain path — naturally,
-`masking.Transformer`'s existing backend-message-processing loop, since it
-already processes backend messages strictly in arrival order — becomes
-**the sole writer to the client for the entire Extended Query cycle**: it
-processes response-plan units strictly head-first; for a pass-through unit
-at the head, it reads and relays (masking as needed) backend messages
-until that unit's terminating message is observed, exactly as
-`masking.Transformer` already does today for each individual message, then
-pops the unit **— unless that terminating message is a real
-`ErrorResponse`, in which case see "Real-error precedence" below before
-moving to the next unit**; for a synthetic unit at the head, it first
-checks whether this cycle has already recorded an earlier real failure
-(see below); if not, it writes the pre-built bytes immediately (no backend
-dependency) and pops it, before looking at any further backend traffic.
+**Who writes to the client — corrected in this revision.** `firewall.Gate`'s
+goroutine **no longer calls `clientWriter.Write` directly for synthetic
+bytes** — this is unchanged from the prior revision. What is corrected
+here is *which* component drains the response plan and writes to the
+client: the prior revision proposed reusing `masking.Transformer`'s
+existing backend-message-processing loop as "the sole drain path," on the
+reasoning that it already processes backend messages in arrival order.
+**This is incomplete and is corrected below** (§
+[Event-driven response sequencer](#event-driven-response-sequencer)): a
+loop whose only wake-up source is "a backend frame arrived" can never
+notice a *synthetic* unit that was enqueued while no backend frame is
+arriving — which is exactly the blocked-first case (a locally blocked
+`Parse` with no earlier pipelined operation at all) this whole mechanism
+exists to handle correctly. The corrected design introduces a dedicated
+**response sequencer** goroutine, woken by *either* of two independent
+event sources (new response-plan units from `firewall.Gate`, or decoded
+backend frames from a dedicated backend reader), so a synthetic unit can
+always be drained and written the moment it becomes the queue head,
+regardless of whether any backend traffic is happening at all.
 `protocol.SerializedWriter` remains in place underneath this — it is still
 the mechanism that guarantees a single `Write` call's bytes aren't spliced
 with another concurrent write — but with this design there is only ever
-**one** logical writer issuing ordered `Write` calls during an Extended
-Query cycle, so the byte-level guarantee and the semantic-order guarantee
-now both hold, for different reasons, at different layers.
+**one** logical writer (the sequencer) issuing ordered `Write` calls during
+an Extended Query cycle, so the byte-level guarantee and the semantic-order
+guarantee now both hold, for different reasons, at different layers.
 
-**Why this is correct (explicit argument, not just assertion).** The
+**Why the draining order itself is correct (explicit argument, not just
+assertion — unaffected by which component does the draining).** The
 response plan is populated strictly in the order `firewall.Gate` processes
 frontend messages (single-threaded within `Gate.Run`'s read loop, exactly
 as today). Draining is strictly head-first, and a unit is only popped once
@@ -1404,7 +1643,259 @@ server's own response-ordering guarantee, § [PostgreSQL Extended Query model](#
 order is *exactly* the frontend processing order, with synthetic units
 substituting silently for what would otherwise have been a pass-through
 unit's (blocked, never-sent) output — which is precisely the guarantee
-required.
+required. **This argument is about ordering alone; it says nothing about
+*timeliness* — the event-driven sequencer design below is what guarantees
+a ready unit is drained promptly, not just correctly-ordered whenever it
+eventually gets drained.**
+
+### Event-driven response sequencer
+
+**The gap this corrects.** The prior revision's "who writes to the client"
+design named `masking.Transformer`'s existing backend-message-processing
+loop as the sole drain path, because it already processes backend messages
+in arrival order. This is incomplete: that loop's only source of
+wake-ups is its blocking `Read()` call on the upstream PostgreSQL socket
+(`internal/masking/transformer.go:Run`, today's equivalent). If
+`firewall.Gate` enqueues a synthetic unit (a locally blocked `Parse`, with
+no earlier pipelined operation at all — the "blocked-first" case) while
+the backend socket has no data to deliver, a loop that only wakes up on
+backend `Read()` returning has **no way to notice the new unit** — it is
+still blocked inside `Read()`, waiting on the real PostgreSQL server,
+which owes it nothing, because the blocked operation was never forwarded
+upstream in the first place. The client would never see the blocked
+`Parse`'s `ErrorResponse` until *something else* (unrelated backend
+traffic, or the client's own `Sync`, which itself might never come if the
+client is correctly waiting for a response first) happened to unblock that
+`Read()` — a real, protocol-visible hang.
+
+**Corrected design: three cooperating components, not two.**
+
+1. **Backend reader** (replaces the read/decode half of today's
+   `masking.Transformer.Run`). Continuously reads bytes from the upstream
+   PostgreSQL socket and decodes them into backend `protocol.Message`
+   frames (reusing `protocol.NewServerDecoder`, unchanged). For each
+   decoded frame, it enqueues a `BackendFrame` event for the sequencer (see
+   "Event types" below) and immediately resumes reading — it never waits
+   for the sequencer to consume the event before reading the next frame.
+   When its `Read()` returns an error (upstream closed, or force-closed
+   during shutdown), it enqueues a terminal `BackendClosed` event and
+   exits.
+2. **`firewall.Gate`** (unchanged responsibility: read the client socket,
+   decode frontend messages, evaluate policy, forward allowed raw bytes
+   upstream — all exactly as today). The one addition: for every frontend
+   message that creates a response-plan unit (§ [Client-response ordering model](#client-response-ordering-model)),
+   `Gate` enqueues a `PlanUnitAdded` event for the sequencer — a
+   pass-through marker for a forwarded operation, or a synthetic unit
+   carrying pre-built bytes for a locally blocked/rejected one — instead of
+   writing anything to the client itself or touching the response-plan
+   queue directly. When `Gate.Run` ends (client EOF, decode failure, fail-
+   closed rejection), it enqueues a terminal `GateClosed` event and exits.
+3. **Response sequencer** (new). A single goroutine per connection that
+   owns the response-plan queue and the pending-operation queue
+   **exclusively** — no other goroutine ever reads or mutates either
+   structure. It waits on *both* event sources at once (a `select` over two
+   channels, in Go terms) and, after processing **any** event from
+   **either** source, immediately attempts to drain every currently-ready
+   unit at the queue head in a tight loop before waiting again. It is the
+   **only** component that calls `clientWriter.Write` for Extended-Query-
+   cycle traffic.
+
+**Event types:**
+
+- `PlanUnitAdded{cycleID, unit}` — from `Gate` to the sequencer. `unit` is
+  either a pass-through marker (`kind`, `name`, `generation`) or a
+  synthetic unit (pre-built bytes ready to write), per
+  [Client-response ordering model](#client-response-ordering-model).
+- `GateClosed{err}` — from `Gate` to the sequencer, terminal, sent exactly
+  once when `Gate.Run` returns.
+- `BackendFrame{message}` — from the backend reader to the sequencer, one
+  per decoded backend `protocol.Message`.
+- `BackendClosed{err}` — from the backend reader to the sequencer,
+  terminal, sent exactly once when its `Read()` loop ends.
+
+**Channel ownership.** Two event sources, each with a single writer and a
+single reader:
+
+- `planEvents`: written only by `Gate`, read only by the sequencer.
+- `backendEvents`: written only by the backend reader, read only by the
+  sequencer.
+
+Neither `Gate` nor the backend reader ever reads from a channel the other
+writes to, and neither ever touches the response-plan or pending-operation
+queues directly — those are sequencer-private state, eliminating any need
+for a separate mutex around them (unlike `protocol.SerializedWriter`, which
+protects the client *socket*, not this in-memory state).
+
+**Queue ownership.** The response-plan queue and the pending-operation
+queue are both owned exclusively by the sequencer goroutine. This is a
+refinement of, not a change to, the ownership already described in
+[Proposed connection state](#proposed-connection-state) — that section
+described *what* these structures contain; this section fixes *which
+goroutine* is allowed to touch them, closing the gap where the prior
+revision implied `masking.Transformer`'s loop would do so despite that
+loop's only wake-up condition being backend socket traffic.
+
+**Backpressure behavior.** Two independent concerns, kept separate on
+purpose:
+
+- **The backend reader must never be slowed down by a stalled client
+  write.** If the sequencer's `clientWriter.Write` call is currently
+  blocked (a slow or non-reading client), the backend reader must keep
+  reading and decoding upstream frames regardless — otherwise a slow
+  client could eventually stall the gateway's reads from the *real
+  PostgreSQL server*, which (via ordinary TCP flow control) could stall
+  the real server's own writes, a head-of-line-blocking hazard distinct
+  from anything client-facing. Concretely: the backend reader appends each
+  decoded frame to its own internal, unbounded-until-capped queue and
+  signals the sequencer via a coalescing, non-blocking notification (e.g.
+  a capacity-1 "wake" channel — multiple pending signals collapse to one,
+  since the sequencer always drains everything ready on each wake-up
+  rather than one event at a time) — the backend reader's `Read()` call is
+  the *only* place it ever blocks.
+- **`Gate` must never be slowed down by a stalled client write either**,
+  for the same reason applied to the client-facing side: a slow client
+  must not stop `Gate` from continuing to read and evaluate *further*
+  pipelined frontend messages (which is necessary to keep making policy
+  decisions and, per [Security analysis](#security-analysis), to enforce
+  the recommended pending-operation and outstanding-cycle caps in the
+  first place — `Gate` cannot enforce a cap it can no longer see the far
+  side of if it stalls). The same non-blocking, coalescing-notification
+  pattern applies to `planEvents`.
+- **The actual bound on unconsumed work is the existing, already-
+  recommended caps** — per-cycle pending-operation depth and outstanding
+  cycle count (§ [Security analysis](#security-analysis)) — not an
+  unbounded channel. Once a cap is reached, `Gate` deliberately stops
+  accepting further pipelined work (a real backpressure point, chosen
+  deliberately, as opposed to an accidental deadlock from a blocked
+  channel send).
+
+**What happens when either socket fails:**
+
+- **Client socket fails** (`Gate.Run`'s read returns an error, or the
+  sequencer's write to `clientWriter` fails): whichever side detects it
+  triggers the same force-close coordination `cmd/gateway/main.go`'s
+  `handleConn` already performs today (closing both tracked `net.Conn`s
+  for the connection) — this unblocks the backend reader's `Read()`
+  (upstream socket force-closed) and `Gate.Run`'s read (client socket
+  force-closed) if either was still blocked. Both then send their terminal
+  events and exit; the sequencer, seeing both `GateClosed` and
+  `BackendClosed`, stops looping and exits.
+- **Backend socket fails while a synthetic unit is at the head or still
+  pending:** the backend reader's `Read()` returns an error; it sends
+  `BackendClosed` and exits. A synthetic unit at the head is **not**
+  backend-dependent, so it is still drained and written normally — the
+  backend's disconnection does not by itself suppress a synthetic unit
+  that was already fully known. If the sequencer subsequently reaches a
+  **pass-through** unit that can never now be satisfied (its terminating
+  backend message will never arrive), it fails closed exactly as any other
+  unrecoverable mid-response disconnection is already handled today (a
+  final `FATAL` `ErrorResponse` if one hasn't already been sent for this
+  connection, then close) — this is a generalization of, not a departure
+  from, today's existing disconnect handling.
+- **Client disconnects while both event sources are still active:**
+  `Gate.Run`'s read returns `io.EOF`; `Gate` sends `GateClosed` (nil error)
+  and exits normally (today's existing graceful-shutdown path). The
+  sequencer may still have pass-through units awaiting backend traffic;
+  once it next attempts to write to the (now-closed) client socket, that
+  write fails, which is treated identically to the "client socket fails"
+  case above — there is no special-casing needed beyond "a write error is
+  itself the failure signal."
+
+**Shutdown and cancellation ownership.** No new cancellation primitive is
+required. The sequencer never blocks on a socket — only on its `select`
+over `planEvents`/`backendEvents` — so it terminates automatically once
+*both* channels are closed, which happens as a direct consequence of
+`Gate.Run` and the backend reader's `Run` both exiting. Both of those, in
+turn, are unblocked by the existing shutdown mechanism unchanged:
+`cmd/gateway/main.go`'s `activeConns.closeAll()` (invoked on `SIGINT`/
+`SIGTERM`, per `docs/audit-v0.1.md`'s confirmed-safe connection-shutdown
+behavior) force-closes both tracked `net.Conn`s, unblocking whichever of
+`Gate.Run`'s client-read or the backend reader's upstream-read was still
+blocked. The per-connection `sync.WaitGroup` in `handleConn` extends from
+today's two tracked goroutines (`gate.Run`, `transformer.Run`) to three
+(`gate.Run`, the backend reader's `Run`, the sequencer's `Run`) for
+Extended-Query-capable connections — no goroutine is left un-joined, and
+no goroutine can block forever independent of the two socket-close events
+that already terminate the connection today.
+
+### Mermaid diagram: event-driven sequencer components
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as firewall.Gate
+    participant Seq as Response sequencer
+    participant BR as Backend reader
+    participant PG as Real PostgreSQL
+
+    Note over G,Seq: planEvents channel (Gate -> sequencer)
+    Note over BR,Seq: backendEvents channel (backend reader -> sequencer)
+
+    par Gate reads client, forwards allowed bytes
+        C->>G: Parse A / Bind A / Execute A
+        G->>PG: forward Parse A / Bind A / Execute A
+        G->>Seq: PlanUnitAdded (A: pass-through units)
+        C->>G: Parse B (blocked by policy)
+        G->>Seq: PlanUnitAdded (B: synthetic unit, bytes ready)
+        Note over PG: no backend traffic yet for A
+    and Backend reader reads upstream independently
+        PG-->>BR: (nothing yet - A still processing)
+    and Sequencer drains whatever is ready, on every event
+        Seq->>Seq: event: PlanUnitAdded(B, synthetic)<br/>head is still A's pass-through unit -> not ready, wait
+    end
+
+    PG-->>BR: ParseComplete (A) / BindComplete (A) / CommandComplete (A)
+    BR->>Seq: BackendFrame events
+    Seq->>Seq: drain A's pass-through units as satisfied
+    Seq-->>C: relay A's real responses
+
+    Seq->>Seq: head is now B's synthetic unit -> ready immediately,<br/>no backend dependency
+    Seq-->>C: write B's synthetic ErrorResponse
+
+    C->>G: Sync
+    G->>PG: forward Sync (always forwarded)
+    G->>Seq: PlanUnitAdded (Sync: pass-through unit)
+    PG-->>BR: real ReadyForQuery
+    BR->>Seq: BackendFrame event
+    Seq-->>C: relay real ReadyForQuery
+```
+
+**Test scenarios required:**
+
+- **Blocked-first with no backend traffic:** a `Parse` is blocked as the
+  very first operation in a cycle, with the upstream socket completely
+  idle (no prior operations, nothing for the backend reader to deliver).
+  Confirm the synthetic unit's `ErrorResponse` is written promptly, purely
+  from the `PlanUnitAdded` event, without waiting for any backend frame or
+  for the client's own `Sync`.
+- **Synthetic unit enqueued while backend `Read()` is blocked:** an earlier
+  operation is forwarded and its backend response is deliberately delayed
+  (test double/fake upstream that withholds a reply); confirm the
+  sequencer still notices and drains a synthetic unit enqueued for a later
+  blocked operation only once it becomes the head (i.e., only after the
+  earlier pass-through unit resolves) — this confirms ordering is
+  preserved *and* liveness holds once it's the synthetic unit's turn.
+- **Synthetic unit behind an unfinished pass-through unit:** confirms the
+  synthetic unit is correctly held (not drained early) until the earlier
+  pass-through unit is satisfied, even though the `PlanUnitAdded` event for
+  the synthetic unit arrives well before that satisfaction.
+- **Backend disconnect while a synthetic unit is pending:** the upstream
+  connection is closed while a synthetic unit sits at (or behind) the
+  queue head; confirm the synthetic unit is still drained/written
+  normally, and any later pass-through unit that can no longer be
+  satisfied triggers fail-closed connection termination rather than
+  hanging.
+- **Client disconnect while both event sources are active:** the client
+  socket closes while the backend reader is still delivering frames for
+  in-flight pass-through units; confirm the sequencer's next write attempt
+  fails cleanly, triggering full connection teardown, with no goroutine
+  left blocked.
+- **Shutdown without goroutine leaks:** a `SIGTERM`-triggered shutdown
+  occurs mid-cycle (pending pass-through and/or synthetic units still
+  queued); confirm `Gate.Run`, the backend reader's `Run`, and the
+  sequencer's `Run` all terminate and are all joined by `handleConn`'s
+  `sync.WaitGroup`, with no dangling goroutine and no write attempted after
+  either socket is closed.
 
 **Worked example**, matching the scenario named in this correction: allowed
 `Parse`/`Bind`/`Execute` "A" forwarded upstream, blocked `Parse` "B"
@@ -1732,8 +2223,8 @@ different:
 stateDiagram-v2
     [*] --> Normal
     Normal --> Normal: Parse/Bind/Describe/Execute/Close/Flush (allowed, forwarded)
-    Normal --> DiscardUntilSync: Parse blocked by policy\n(synthetic ErrorResponse written)
-    Normal --> DiscardUntilSync: Bind/Describe/Execute references\nan unknown or blocked object\n(synthetic ErrorResponse written)
+    Normal --> DiscardUntilSync: Parse blocked by policy\n(synthetic unit submitted to sequencer;\ndiscard begins here, not at write time)
+    Normal --> DiscardUntilSync: Bind/Describe/Execute references\nan unknown or blocked object\n(synthetic unit submitted to sequencer;\ndiscard begins here, not at write time)
     DiscardUntilSync --> DiscardUntilSync: Parse/Bind/Describe/Execute/Close/Flush\n(silently discarded, no response)
     DiscardUntilSync --> Normal: Sync\n(forwarded to real server;\nreal ReadyForQuery relayed to client)
     Normal --> Normal: Sync\n(forwarded to real server;\nreal ReadyForQuery relayed to client)
@@ -2037,17 +2528,44 @@ or otherwise.
   shape/format metadata comes only from a previously observed `Describe`
   or is treated as permanently unknown for that portal's lifetime (§
   [Correcting Execute response semantics](#correcting-execute-response-semantics)).
-- A duplicate named `Parse`/`Bind` never overwrites or destabilizes an
+- A duplicate **named** `Parse`/`Bind` never overwrites or destabilizes an
   existing committed generation for the same name before the real server
-  has actually acknowledged the new one — enforced by the
-  per-name generation counters, not by any local pre-judgment of whether
-  the duplicate will succeed (§
+  has actually acknowledged the new one — enforced by the per-name
+  generation counters, not by any local pre-judgment of whether the
+  duplicate will succeed (§
   [Object generations](#object-generations-safely-handling-duplicate-names)).
-- Forwarding a Simple Query always invalidates SentinelDB's own unnamed
-  statement/portal registry entries at that Simple Query's real
-  `ReadyForQuery`, matching the real server's own behavior — named
-  entries are never touched by this (§
+  **This invariant is named-object-specific and does not extend to the
+  unnamed slot** — the next invariant states the unnamed rule, which is
+  deliberately different.
+- Forwarding an *allowed* new **unnamed** `Parse`/`Bind` always retires the
+  previous unnamed statement/portal generation's resolvability
+  immediately, at forward time — never restoring it if the new generation
+  subsequently fails. A *blocked* (never-forwarded) new unnamed `Parse`/
+  `Bind` never touches the previous unnamed object at all (§
+  [Object generations](#object-generations-safely-handling-duplicate-names)).
+  Named and unnamed replacement-failure semantics are never treated as the
+  same rule.
+- Forwarding an *allowed* Simple Query always invalidates SentinelDB's own
+  unnamed statement/portal registry entries **immediately, before the
+  `Query` bytes are forwarded** — not deferred to that Simple Query's real
+  `ReadyForQuery` — matching the real server's own early-destruction
+  behavior. A *blocked* (never-forwarded) Simple Query invalidates
+  nothing. Named entries are never touched by this either way (§
   [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling)).
+- The response-plan and pending-operation queues are owned exclusively by
+  the response sequencer goroutine — `firewall.Gate` and the backend
+  reader only ever submit events to it, never mutate either queue directly
+  (§ [Event-driven response sequencer](#event-driven-response-sequencer)).
+- Client-facing discard-until-`Sync` begins the instant a local block/
+  rejection decision is accepted and its synthetic unit is submitted to
+  the sequencer — never deferred until that unit's bytes are actually
+  drained and written to the client (§
+  [Correcting the local discard transition trigger](#correcting-the-local-discard-transition-trigger)).
+- A synthetic response unit is never left undrained solely because the
+  backend socket has no traffic to deliver — the sequencer wakes on
+  *either* a new plan-unit event or a decoded backend frame, so a
+  blocked-first synthetic unit is written promptly even with a completely
+  idle upstream connection (§ [Event-driven response sequencer](#event-driven-response-sequencer)).
 - Client-visible response bytes for an Extended Query cycle are always
   written in frontend-processing order, never in backend-arrival-timing
   order, regardless of which component (relayed real bytes or synthesized
@@ -2103,12 +2621,13 @@ or otherwise.
 - Mixing Simple Query and Extended Query on the same connection over time
   (e.g. a client that uses `Query` for some statements and
   `Parse`/`Bind`/`Execute` for others). **Correction to this document's
-  first draft:** this is *not* free of special handling — forwarding a
-  Simple Query destroys the real server's unnamed prepared statement and
-  unnamed portal, so SentinelDB's own unnamed-slot registry entries must
-  be invalidated at the same point (on the Simple Query's real
-  `ReadyForQuery`) to stay correct; see
-  [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling).
+  first draft:** this is *not* free of special handling — forwarding an
+  *allowed* Simple Query destroys the real server's unnamed prepared
+  statement and unnamed portal, so SentinelDB's own unnamed-slot registry
+  entries must be invalidated **atomically, immediately before forwarding
+  the `Query` bytes** — not deferred to that query's own `ReadyForQuery`,
+  which would be too late for a pipelined client that doesn't wait for it;
+  see [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling).
   Named statements/portals are unaffected and require no extra handling
   beyond the shared `*protocol.TxState` and `*protocol.SerializedWriter`
   infrastructure already in place today.
@@ -2181,11 +2700,18 @@ tests, and must not bundle unrelated refactors — consistent with
    forwarding/blocking accordingly, while every *other* Extended Query
    message type remains rejected exactly as today (a deliberately narrow,
    independently reviewable slice).
-5. **Local rejection and `Sync` recovery.** Implement the full
-   discard-until-`Sync` state machine (§
+5. **Local rejection, `Sync` recovery, and the response sequencer.**
+   Implement the full discard-until-`Sync` state machine (§
    [Local rejection state machine](#local-rejection-state-machine)) for
    the case established in stage 4 (a blocked `Parse`), including the
-   always-forward-`Sync` rule and relaying the real `ReadyForQuery`.
+   always-forward-`Sync` rule and relaying the real `ReadyForQuery`. This
+   stage is also where the event-driven response sequencer (§
+   [Event-driven response sequencer](#event-driven-response-sequencer))
+   must first exist — splitting today's `masking.Transformer.Run` into a
+   decode-only backend reader plus the new sequencer goroutine — since a
+   blocked `Parse` with no forwarded operation at all (blocked-first)
+   already requires the sequencer to deliver its synthetic `ErrorResponse`
+   without depending on any backend traffic.
 6. **`Bind`/`Execute` forwarding.** Extend `Gate` to forward
    `Bind`/`Describe`/`Execute`/`Close`/`Flush` for known, non-blocked
    statements/portals, using the registries from stages 2-3, with the
@@ -2225,10 +2751,19 @@ tests, and must not bundle unrelated refactors — consistent with
 | Unit | Pending-operation queue: FIFO correlation by `(name, generation, cycle ID)`, out-of-order acknowledgement detection | Reflects cycle-ID tagging, § [Explicit pipeline-cycle identities](#explicit-pipeline-cycle-identities) |
 | Unit | Response-plan queue: pass-through unit satisfaction, synthetic unit conditional drain (suppressed if the cycle already failed), strict head-first ordering, cycle-ID tagging | § [Client-response ordering model](#client-response-ordering-model), [Real-error precedence over later synthetic errors](#real-error-precedence-over-later-synthetic-errors) |
 | Unit | Cycle-ID assignment and increment: stamped on every frontend message, incremented specifically at `Sync` | § [Explicit pipeline-cycle identities](#explicit-pipeline-cycle-identities) |
+| Unit/State-machine | **Event-driven sequencer: blocked-first with no backend traffic** | Confirms a synthetic unit is drained and written from a `PlanUnitAdded` event alone, with the upstream socket completely idle. See [Event-driven response sequencer](#event-driven-response-sequencer) |
+| Unit/State-machine | **Event-driven sequencer: synthetic unit enqueued while backend `Read()` is blocked** | Confirms the sequencer notices and later drains the synthetic unit once it becomes the head, independent of when the backend reader's `Read()` unblocks |
+| Unit/State-machine | **Event-driven sequencer: synthetic unit behind an unfinished pass-through unit** | Confirms the synthetic unit is held, not drained early, despite its `PlanUnitAdded` event arriving well before the earlier pass-through unit's satisfaction |
+| Unit/State-machine | **Event-driven sequencer: backend disconnect while a synthetic unit is pending** | Confirms the synthetic unit still drains normally; a later pass-through unit that can never be satisfied triggers fail-closed termination |
+| Unit/State-machine | **Event-driven sequencer: client disconnect while both event sources are active** | Confirms the sequencer's next write failure triggers full, clean connection teardown |
+| Shutdown | **Event-driven sequencer: shutdown without goroutine leaks** | Confirms `Gate.Run`, the backend reader's `Run`, and the sequencer's `Run` all terminate and are joined by `handleConn`'s `sync.WaitGroup` on `SIGTERM` mid-cycle |
 | State-machine | Unnamed Parse/Bind/Execute/Sync (happy path) | Sequence diagram 1 |
 | State-machine | Named prepared statement reuse across multiple Sync cycles, multiple portals | Sequence diagram 2 |
-| State-machine | Statement replacement (new unnamed Parse while old unnamed portal still open) | Confirms old-generation portals remain valid, per object-generation model |
-| State-machine | Portal replacement (new unnamed Bind while old unnamed portal still open) | |
+| State-machine | **Successful unnamed `Parse` replacement** | New/corrected: the new generation's current pointer moves at forward time; `ParseComplete` promotes it to `committed`; old-generation portals bound before the replacement remain valid via their captured `(name, generation)` snapshot. See [Object generations](#object-generations-safely-handling-duplicate-names) |
+| State-machine | **Failed unnamed `Parse` after an existing unnamed statement: slot stays empty, old statement is not restored** | **Corrected** — the prior revision incorrectly applied the named-object "failure preserves the old object" rule here; a failed unnamed `Parse` leaves the unnamed slot empty (unresolvable), since the real server already destroyed the old one regardless of the new `Parse`'s outcome |
+| State-machine | **Successful unnamed `Bind` replacement** | New/corrected: same pointer-moves-at-forward-time rule applied to portals |
+| State-machine | **Failed unnamed `Bind` after an existing unnamed portal: slot stays empty, old portal is not restored** | **Corrected** — same fix as the unnamed `Parse` case, applied to portals |
+| State-machine | **Historical unnamed generations retained only while a portal still references them** | New: confirms a superseded unnamed generation is kept internally, immutably, only as long as a portal entry captured it at `Bind` time, and is never resolvable as "the current slot" again |
 | State-machine | **Close statement cascades to its portals** | **Corrected from the first draft's "Close statement — portals remain usable."** Assert every portal bound from the closed statement is removed from the registry exactly when the matching `CloseComplete` is observed (not eagerly on `Close`), and that a later `Bind`/`Describe`/`Execute`/`Close` referencing any of those now-gone portals is treated as an unknown-object reference and fails closed. See [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics) |
 | State-machine | Close portal (statement remains usable) | Confirms the cascade is one-directional: closing a portal never affects its statement |
 | State-machine | Close statement with a portal mid-`Execute`/suspended | The in-flight/suspended portal is cascaded away; a later resuming `Execute` fails closed |
@@ -2251,15 +2786,17 @@ tests, and must not bundle unrelated refactors — consistent with
 | State-machine | **Portal invalidation fires on every real `ReadyForQuery(I)`, unconditionally** | New: a single rule covers all `I`-reporting scenarios above, not one rule per cause |
 | State-machine | **Named prepared statements survive every `ReadyForQuery`, regardless of reported status** | New: confirms statements are session-scoped, never invalidated by any transaction-status value, distinguishing them from portals |
 | State-machine | **Portal reference after transaction end fails closed** | A `Bind`/`Describe`/`Execute`/`Close` against a portal invalidated by a `ReadyForQuery(I)` is treated as unknown |
-| State-machine | **Unnamed statement created via Parse, then a Simple Query is issued** | New: confirms the unnamed statement is invalidated on the Simple Query's real `ReadyForQuery`. See [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling) |
-| State-machine | **Unnamed portal created via Bind, then a Simple Query is issued** | New: same invalidation, applied to the unnamed portal |
-| State-machine | **Bind/Execute referencing the unnamed slot after a Simple-Query invalidation fails closed** | New: confirms no stale reference survives |
-| State-machine | **Named statements/portals are unaffected by an interleaved Simple Query** | New: confirms the invalidation is scoped only to the unnamed slots |
-| State-machine | **Duplicate named Parse for an already-committed name: failure leaves the old committed statement intact** | New: proves the [object-generation model](#object-generations-safely-handling-duplicate-names) — a rejected duplicate `Parse` must not disturb the pre-existing, still-`committed` generation |
-| State-machine | **Duplicate named Bind for an already-committed portal name: failure leaves the old committed portal intact** | New: same proof, applied to portals |
+| State-machine | **Allowed Simple Query followed immediately by a pipelined `Bind` referencing the former unnamed statement** | **Corrected timing**: the `Bind` (sent before the Simple Query's `ReadyForQuery` arrives) must already resolve against the invalidated slot (fail closed / against whatever new object exists), proving invalidation happens at forward time, not at `ReadyForQuery`. See [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling) |
+| State-machine | **Allowed Simple Query followed immediately by `Execute` referencing the former unnamed portal** | Same corrected-timing proof, applied to the unnamed portal |
+| State-machine | **Simple Query that later returns `ErrorResponse` still has invalidated the unnamed slots** | New: confirms invalidation is unconditional on the query's own outcome — it already happened at forward time, before the query's result was known |
+| State-machine | **Locally blocked Simple Query preserves the upstream-backed unnamed objects** | New: confirms a policy-blocked (never-forwarded) Simple Query does not invalidate anything, since the real server never saw it |
+| State-machine | **Named statements/portals survive both allowed and blocked Simple Query messages** | New: confirms the invalidation is scoped only to the unnamed slots, regardless of the Simple Query's own verdict |
+| State-machine | **Duplicate named Parse for an already-committed name: failure leaves the old committed statement intact** | Proves the **named** object rule — a rejected duplicate `Parse` must not disturb the pre-existing, still-`committed` generation. Contrast directly with the **unnamed** `Parse`-failure row above, which must *not* preserve the old object — named and unnamed replacement failure semantics are deliberately different, not the same rule applied twice. See [Object generations](#object-generations-safely-handling-duplicate-names) |
+| State-machine | **Duplicate named Bind for an already-committed portal name: failure leaves the old committed portal intact** | Same proof, applied to portals; same contrast with the unnamed `Bind`-failure row |
 | State-machine | **Pipelined duplicate-name Parse/Bind resolved unambiguously by generation** | New: two operations against the same name in flight simultaneously, correlated correctly via `(name, generation)` |
 | State-machine | Blocked Parse → discard-until-Sync (client-facing) | The critical scenario, § Policy evaluation design |
 | State-machine | Bind after blocked Parse (discarded, no forwarding) | |
+| State-machine | **Discard begins at block-decision/enqueue time, not at write time: allowed A still pending, B blocked and queued behind A, C (Bind/Execute) arrives before B's `ErrorResponse` is client-visible** | **Corrected scenario** — C must be discarded and never forwarded, proving discard-until-`Sync` is entered the instant B is blocked and its synthetic unit is submitted, not deferred until the sequencer actually drains and writes B's bytes. See [Correcting the local discard transition trigger](#correcting-the-local-discard-transition-trigger) |
 | State-machine | Pipelined blocked and allowed operations in the same cycle | Now additionally verified via the response-plan ordering tests below |
 | State-machine | **Real upstream `ErrorResponse` triggers server-discard-until-`Sync`, abandoning later pending operations in the same cycle without waiting** | New: confirms the pending-operation queue does not hang waiting for acknowledgements the real server will never send. See [Clarifying real upstream ErrorResponse cleanup](#clarifying-real-upstream-errorresponse-cleanup) |
 | State-machine | **Objects committed in an earlier cycle survive a later cycle's real upstream error** | New: confirms only the current cycle's pending entries are abandoned |
@@ -2559,21 +3096,33 @@ Honestly unresolved, not disguised as settled:
 [Alternatives considered](#alternatives-considered) — a connection-aware
 Extended Query state engine built directly on and alongside
 `internal/protocol`, `internal/firewall`, and `internal/masking`, following
-the design detailed throughout this document, **as corrected across both
-review passes**: explicit, monotonically increasing per-connection
-**cycle IDs** stamping every pending-operation entry and response-plan
-unit, replacing a single insufficient global discard boolean (§
+the design detailed throughout this document, **as corrected across all
+three review passes**: a dedicated **event-driven response sequencer**
+goroutine (§ [Event-driven response sequencer](#event-driven-response-sequencer)),
+woken by either new plan-unit events from `firewall.Gate` or decoded
+backend frames from a dedicated backend reader, exclusively owning the
+response-plan and pending-operation queues, so a synthetic unit is always
+promptly drained regardless of backend traffic; client-facing discard-
+until-`Sync` beginning atomically at block-decision/enqueue time, not at
+write time (§ [Correcting the local discard transition trigger](#correcting-the-local-discard-transition-trigger));
+explicit, monotonically increasing per-connection **cycle IDs** stamping
+every pending-operation entry and response-plan unit, replacing a single
+insufficient global discard boolean (§
 [Explicit pipeline-cycle identities](#explicit-pipeline-cycle-identities));
 `Parse`-time-only, SQL-template-only policy evaluation; a per-connection
 prepared-statement and portal registry keyed by `(name, generation)`
-rather than name alone (§
-[Object generations](#object-generations-safely-handling-duplicate-names)),
-with pending/committed/blocked lifecycle, statement-`Close` cascading to
-dependent portals (§ [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics)),
-and portal invalidation triggered by the *reported value* `'I'` of any
-real `ReadyForQuery` — not a transition, which would miss an ordinary
+rather than name alone, with **named-object duplicate failures leaving the
+old committed object untouched, and unnamed-slot replacement failures
+never restoring the previous generation** — two deliberately different
+rules, not one shared rule (§
+[Object generations](#object-generations-safely-handling-duplicate-names));
+statement-`Close` cascading to dependent portals (§ [Correcting prepared-statement Close semantics](#correcting-prepared-statement-close-semantics));
+portal invalidation triggered by the *reported value* `'I'` of any real
+`ReadyForQuery` — not a transition, which would miss an ordinary
 implicit-transaction cycle (§ [Correcting portal lifetime semantics](#correcting-portal-lifetime-semantics)) —
-and at Simple Query forwarding (§ [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling));
+and at Simple Query forwarding, applied **atomically before the `Query`
+bytes are sent upstream**, not deferred to that query's own `ReadyForQuery`
+(§ [Mixed Simple/Extended Query state handling](#mixed-simpleextended-query-state-handling));
 FIFO pending-operation correlation, scoped per cycle ID; a discard-until-
 `Sync` local rejection state machine, tracked separately from an
 independent, per-cycle-ID server-discard-until-`Sync` state for real

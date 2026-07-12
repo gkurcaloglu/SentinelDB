@@ -289,6 +289,15 @@ docker-compose.yml     postgres + sentineldb + prometheus + grafana + dashboard
 - [docs/audit-v0.1.md](docs/audit-v0.1.md) — final V0.1 internal audit:
   confirmed fixes, confirmed-safe behaviors, known V1 limitations, V2
   recommendations
+- [docs/design/0001-extended-query.md](docs/design/0001-extended-query.md) —
+  **draft design proposal, not implemented** — Extended Query Protocol
+  support: connection-state model, policy-evaluation and fail-closed
+  recovery design, masking implications, and a staged implementation plan.
+  See also the accompanying
+  [review checklist](docs/design/0001-extended-query-review-checklist.md).
+  Extended Query remains **unsupported** today — see
+  [V1 limitations](#v1-limitations-be-aware-of-these-before-using-this-anywhere-real)
+  and the [protocol table](#supported--unsupported-protocol) above.
 - [CHANGELOG.md](CHANGELOG.md) / [docs/release-notes-v0.1.0.md](docs/release-notes-v0.1.0.md) / [docs/release-notes-v0.1.1.md](docs/release-notes-v0.1.1.md)
   — what changed, release by release
 - [CONTRIBUTING.md](CONTRIBUTING.md) — local setup, testing, PR process

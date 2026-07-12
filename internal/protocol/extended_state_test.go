@@ -1160,19 +1160,35 @@ func TestState_CreateClosePortal_NonexistentIsSuccessfulNoOp(t *testing.T) {
 // Close, karsilik gelen Parse henuz onaylanmadan (pending iken) yakalanmis
 // olsa bile - o statement generation'indan olusturulan portal'lara
 // (pipeline edilmis bir Bind ile) cascade hala dogru sekilde uygulanir.
+// TestState_PendingStatementClose_StillCascadesToPortals dogrular: Parse,
+// Bind ve Close hicbir onay beklenmeden pipeline edildiginde (bkz.
+// docs/design/0001-extended-query.md, "Pipelining ve pozisyonel yanit
+// korelasyonu") - Close, hala PENDING olan (henuz ParseComplete
+// almamis) bir statement'i yakalasa bile - gercek FIFO onay sirasiyla
+// (ParseComplete, sonra BindComplete, sonra CloseComplete) islendiginde
+// cascade hala dogru calisir.
 func TestState_PendingStatementClose_StillCascadesToPortals(t *testing.T) {
 	s := NewState()
 	sop, sgen, _ := s.CreateParse("s1", "SELECT 1", nil)
-	// Close, ParseComplete'den ONCE yakalanir.
+	// Bind, henuz pending olan statement'i hedefler (bkz. "provisionally
+	// valid for forwarding purposes" kurali) - hala gecerlidir.
+	bop, pgen, err := s.CreateBind("p1", "s1", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Close de ayni sekilde, hala pending olan statement'i yakalar.
 	cop, err := s.CreateCloseStatement("s1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	s.ApplyParseComplete(sop.ID)
 
-	bop, pgen, _ := s.CreateBind("p1", "s1", nil, nil, nil)
-	s.ApplyBindComplete(bop.ID)
-
+	// Gercek FIFO sirasiyla onaylanir: Parse, sonra Bind, sonra Close.
+	if _, err := s.ApplyParseComplete(sop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyBindComplete(bop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if err := s.ApplyCloseComplete(cop.ID); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

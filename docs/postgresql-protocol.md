@@ -98,6 +98,48 @@ than a naive reading of the wire format:**
   negative or zero, as `FETCH_ALL`. `ExecuteMessage.MaxRows` preserves
   the wire value exactly as sent.
 
+### Connection-local state model (no runtime wiring)
+
+`internal/protocol/extended_state.go` adds a standalone, connection-local
+state model (`protocol.State`) that tracks prepared-statement and portal
+*generations*, a FIFO pending-operation queue for future backend-
+acknowledgement correlation, and `Sync`-delimited cycle identities, per
+the design document's "Object generations" and "Explicit pipeline-cycle
+identities" sections linked above.
+
+**This is a pure data structure, not a running component.** It performs no
+I/O, starts no goroutines, does no logging, and is **not constructed or
+called anywhere in `cmd/gateway`, `firewall.Gate`, or
+`masking.Transformer`**. It exists purely so the connection-state
+machinery a later stage needs (pending-operation correlation, `Parse`
+policy evaluation, local rejection/`Sync` recovery — see the design
+document's "Implementation decomposition") can be built and tested in
+isolation, without touching anything that affects a live connection today.
+
+**Extended Query is still rejected fail-closed at runtime, exactly as
+before.** Nothing described in this section changes `firewall.Gate`'s
+behavior: `isExtendedProtocolMessage` still rejects every `Parse`/`Bind`/
+`Describe`/`Execute`/`Close`/`Flush`/`Sync` message before any policy
+decision, unconditionally. Building `protocol.State` does not change
+anything described elsewhere in this document — it remains a groundwork
+data structure for a future stage, not a currently supported feature.
+
+**`Close` may capture a still-pending target.** `CreateCloseStatement`/
+`CreateClosePortal` resolve their target the same committed-or-pending way
+`Describe`/`Bind`/`Execute` do, not committed-only — this correctly
+supports a pipelined `Parse`/`Bind` immediately followed by a `Close` for
+the same name, sent before the real server's `ParseComplete`/`BindComplete`
+has been observed. The captured generation is an immutable snapshot; a
+later name-mapping change never retargets an already-created `Close`.
+
+**Every value `protocol.State` returns is an independent deep copy.**
+`Resolve*`/`Committed*`/`Statement`/`Portal`/`PendingOperations`, and every
+`Create*`/`ApplyParseComplete`/`ApplyBindComplete` return value, is copied
+out of the internally owned map/queue entry — including slice fields
+(`ParamOIDs`, `ParamFormats`, `ParamNulls`, `ResultFormats`). Mutating a
+returned value can never corrupt `State`'s internal data; the only way to
+change `State` is through its own methods.
+
 ## SSLRequest / GSSENCRequest rejection
 
 SentinelDB always answers `SSLRequest` and `GSSENCRequest` with a single

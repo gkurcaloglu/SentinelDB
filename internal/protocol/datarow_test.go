@@ -187,3 +187,28 @@ func TestParseDataRow_NeverPanics(t *testing.T) {
 		}()
 	}
 }
+
+// FuzzParseDataRow, ParseDataRow'un guvenilmeyen govde baytlari uzerinde
+// -asla panic etmeme- degismezini korur (bkz. gorev C/I). Tohum
+// (seed) kumesi, mevcut tablo tabanli TestParseDataRow_* durumlarindan
+// alinmistir; fuzzer bunlari mutasyona ugratarak ek kesilmis/bozuk
+// govde sekilleri arar.
+func FuzzParseDataRow(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0x00})
+	f.Add([]byte{0xFF, 0xFF})
+	f.Add([]byte{0x00, 0x01, 0x00, 0x00})
+	f.Add([]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x05})
+	f.Add(encodeDataRowBody([]DataCell{{Value: []byte("john@example.com")}, {Null: true}}))
+	f.Add([]byte{0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFE})
+	f.Add([]byte{0x00, 0x01, 0x00, 0x20, 0x00, 0x00})
+
+	f.Fuzz(func(t *testing.T, body []byte) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("ParseDataRow panicked on input %v: %v", body, r)
+			}
+		}()
+		_, _ = ParseDataRow(body)
+	})
+}

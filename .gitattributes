@@ -1,0 +1,9 @@
+# Repository dosyalari her platformda ayni bayt icerigiyle checkout
+# edilsin diye (bkz. docs/audit-v0.1.md): bu olmadan, Git for Windows'un
+# yaygin varsayilani core.autocrlf=true ile yapilan bir klonlama, tum
+# metin dosyalarini CRLF'e cevirir. Depodaki tum .go blob'lari zaten
+# yalnizca LF icerir (CI'nin Linux'ta calisan `gofmt -l .` adimi bunu
+# dogrular); CRLF'e donusturulmus bir checkout ise ayni komutu neredeyse
+# butun depoyu "bicimlendirilmemis" olarak sahte-pozitif raporlamaya
+# iter (gofmt her zaman yalnizca LF uretir).
+* text=auto eol=lf

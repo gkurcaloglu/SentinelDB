@@ -24,13 +24,13 @@ const (
 	phaseNormal
 	// phasePassthrough: mesaj sınırları artık güvenilir şekilde takip
 	// edilemiyor (ör. bozuk/parçalanmış veri sonrası fail hali). Bu
-	// noktadan sonra Decoder hiçbir şey ayrıştırmaz; SniffReader baytları
-	// olduğu gibi akıtmaya devam eder (salt gözlemci, genuine raw
-	// forwarding), sadece gözlem durur. firewall.Gate gibi aktif
+	// noktadan sonra Decoder hiçbir şey ayrıştırmaz ve Write basitçe geri
+	// döner (bkz. Write) - hiçbir bayt ne yönlendirilir ne de
+	// yorumlanır. firewall.Gate ve masking.Transformer gibi aktif
 	// müdahale eden bileşenler bu duruma geçişi kendi onError
 	// callback'lerinde yakalayıp bağlantıyı güvenli şekilde kapatır
-	// (bkz. firewall.NewGate) — bu Decoder seviyesinde baytları asla
-	// sessizce yutup unutmaz.
+	// (bkz. firewall.NewGate, masking.NewTransformer) — bu yüzden bu faz
+	// pratikte hiçbir zaman veri sessizce yutup ileri akıtmaz.
 	phasePassthrough
 )
 
@@ -77,13 +77,16 @@ type Handler func(Message)
 
 // Decoder, bir bağlantı yönünden akan ham baytları PostgreSQL wire
 // protokolü mesajlarına ayrıştıran, duruma sahip (stateful) bir ayrıştırıcıdır.
-// Trafiği değiştirmez ya da geciktirmez: SniffReader tarafından yalnızca
-// gözlem amacıyla beslenir.
+// Kendisi hiçbir baytı ileri yönlendirmez/yazmaz - bu, çağıranın (bkz.
+// firewall.Gate.Run, masking.Transformer.Run) Write'a beslediği veriyi
+// handler/onError geri çağrıları üzerinden yorumlayıp kendi yazma
+// mantığını uygulamasıyla olur.
 //
 // buf yalnızca bu Decoder'ı besleyen goroutine tarafından dokunulur
-// (SniffReader/Gate tek bir okuma döngüsünden çağrılır). phase yine de
-// atomic tutulur: gelecekte birden fazla goroutine'in aynı Decoder'ı
-// gözlemlemesi (ör. metrik/debug amaçlı) durumunda veri yarışını önler.
+// (Gate.Run/Transformer.Run, kendi tek okuma döngülerinden çağırır). phase
+// yine de atomic tutulur: gelecekte birden fazla goroutine'in aynı
+// Decoder'ı gözlemlemesi (ör. metrik/debug amaçlı) durumunda veri
+// yarışını önler.
 type Decoder struct {
 	dir     Direction
 	phase   atomic.Int32

@@ -3,7 +3,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -82,8 +85,19 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config dosyasi okunamadi (%s): %w", path, err)
 	}
 
+	// yaml.Unmarshal bilinmeyen alanlari sessizce yok sayar (ör. bir yazim
+	// hatasi iceren anahtar hicbir hataya yol acmadan goz ardi edilirdi).
+	// Bunun yerine sıkı bir Decoder kullanarak bilinmeyen her alani acik
+	// bir hata olarak reddediyoruz - operatorun config.yaml'daki bir yazim
+	// hatasi ya da gecersiz anahtar yuzunden beklediginden farkli bir
+	// davranisi sessizce almasini onlemek icin.
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	// Bos bir dosya (ör. sifir bayt) gecerli, tum alanlari sifir-degerli bir
+	// Config olarak kabul edilir - yaml.Unmarshal'in onceki davranisiyla
+	// birebir ayni (bkz. TestLoad_EmptyBlockedPhrasesIsValid gibi testler).
+	if err := dec.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("config dosyasi ayristirilamadi (%s): %w", path, err)
 	}
 

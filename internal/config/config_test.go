@@ -193,6 +193,44 @@ func TestLoad_MalformedYAMLReturnsError(t *testing.T) {
 	}
 }
 
+func TestLoad_UnknownTopLevelFieldIsRejected(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+unknown_top_level_field: 123
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for an unknown top-level config field")
+	}
+}
+
+func TestLoad_UnknownNestedFieldIsRejected(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+  unknown_nested_field: "oops"
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for an unknown nested config field")
+	}
+}
+
+func TestLoad_EmptyFileIsValid(t *testing.T) {
+	path := writeTempConfig(t, "")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error for an empty config file: %v", err)
+	}
+	if cfg.Masking.Enabled {
+		t.Fatal("expected a zero-value Config (Masking.Enabled=false) for an empty file")
+	}
+}
+
 func TestLoad_EmptyBlockedPhrasesIsValid(t *testing.T) {
 	path := writeTempConfig(t, "firewall:\n  blocked_phrases: []\n")
 

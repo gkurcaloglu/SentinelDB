@@ -125,3 +125,39 @@ func TestDecoder_InvalidLengthStopsParsingWithoutPanicking(t *testing.T) {
 		t.Fatalf("expected passthrough phase after invalid length, got %v", dec.getPhase())
 	}
 }
+
+// FuzzDecoderWrite, hem client (Startup-first) hem server (Normal-first)
+// Decoder'in guvenilmeyen, keyfi bayt akislari uzerinde -asla panic
+// etmeme- degismezini korur (bkz. gorev C/I). Girdi rastgele iki parcaya
+// bolunup ayri Write cagrilariyla beslenir; boylece parcali (fragmented)
+// TCP okumalarini taklit eden yol da fuzz kapsamina girer.
+func FuzzDecoderWrite(f *testing.F) {
+	f.Add(encodeStartupMessage(map[string]string{"user": "sentinel"}), 3)
+	f.Add(encodeQuery("SELECT 1"), 1)
+	f.Add([]byte{byte(MsgErrorResponse), 0xFF, 0xFF, 0xFF, 0xFF}, 0)
+	f.Add([]byte{0x00, 0x00, 0x00, 0x04}, 2)
+	f.Add([]byte{}, 0)
+
+	f.Fuzz(func(t *testing.T, data []byte, split int) {
+		run := func(dec *Decoder) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Decoder.Write panicked on input %v (split=%d): %v", data, split, r)
+				}
+			}()
+			if len(data) == 0 {
+				dec.Write(nil)
+				return
+			}
+			at := split % len(data)
+			if at < 0 {
+				at = -at
+			}
+			dec.Write(data[:at])
+			dec.Write(data[at:])
+		}
+
+		run(NewClientDecoder(func(Message) {}, func(error) {}))
+		run(NewServerDecoder(func(Message) {}, func(error) {}))
+	})
+}

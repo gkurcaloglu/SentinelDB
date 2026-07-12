@@ -14,6 +14,45 @@ contributor/security docs, technical documentation (`docs/`), Go
 benchmarks, GitHub Actions CI, and repository templates. No product
 behavior changed.
 
+## [0.1.1] - 2026-07-11
+
+Patch release covering the final V0.1 internal audit
+(`docs/audit-v0.1.md`). This release **adds no product capabilities** and
+does **not** change the documented V1 protocol support
+(`docs/postgresql-protocol.md`) — it is hardening and repository-hygiene
+only.
+
+### Fixed
+
+- **Config parsing now strictly rejects unknown YAML fields.**
+  `config.Load` (`internal/config/config.go`) previously used a lenient
+  YAML unmarshal that silently ignored unrecognized keys (e.g. a typo in
+  `config.yaml`); it now uses a strict decoder that fails loudly on any
+  unknown top-level or nested field.
+- **HTTP servers now have read/write/header/idle timeouts.** The metrics
+  (`/metrics`) and status API (`/api/status`) `http.Server` instances in
+  `cmd/gateway/main.go` previously had no timeouts configured, leaving them
+  exposed to slow-client resource exhaustion; both now set
+  `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, and `IdleTimeout`.
+- **Repository-wide LF line-ending normalization.** Added `.gitattributes`
+  so Go source and other text files always check out with `LF` line
+  endings, regardless of the checking-out machine's Git configuration —
+  previously, a common Windows Git default could check files out as
+  `CRLF`, causing the documented `gofmt -l .` verification step to report
+  false positives.
+
+### Added
+
+- **Bounded fuzz coverage for the PostgreSQL wire-protocol parsers.** Added
+  small, bounded `go test -fuzz` targets for `ParseDataRow`,
+  `ParseRowDescription`, and `Decoder.Write`, seeded from the existing test
+  corpus, to guard the "never panics on untrusted input" invariant.
+- **Final V0.1 internal audit report** (`docs/audit-v0.1.md`): a
+  full-repository compile/API-consistency, runtime-safety, protocol,
+  security, memory/performance, HTTP/dashboard, and documentation-accuracy
+  audit, including confirmed-safe findings, intentionally-unfixed V1
+  limitations, and V2 recommendations.
+
 ## [0.1.0] - 2026-07-11
 
 Initial released version of SentinelDB: a PostgreSQL wire-protocol gateway
@@ -79,5 +118,6 @@ sandboxed WebAssembly for the decision/masking logic.
   story. See [SECURITY.md](SECURITY.md) and
   [docs/threat-model.md](docs/threat-model.md).
 
-[Unreleased]: https://github.com/gkurcaloglu/SentinelDB/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/gkurcaloglu/SentinelDB/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/gkurcaloglu/SentinelDB/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/gkurcaloglu/SentinelDB/releases/tag/v0.1.0

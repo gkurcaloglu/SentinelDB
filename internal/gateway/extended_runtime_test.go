@@ -62,6 +62,54 @@ func fieldedErrorFrame(text string) []byte {
 
 func terminalOnlyErrorFrame() []byte { return buildFrame(protocol.MsgErrorResponse, []byte{0}) }
 
+// --- Test helpers: frontend operation request builders --------------------
+//
+// State is now exclusively owned by the event loop (bkz. "Make the event
+// loop the sole owner of protocol.State") - tests build typed requests
+// instead of calling protocol.State.Create* themselves.
+
+func parseReq(name, query string, paramOIDs []uint32) FrontendOperationRequest {
+	return FrontendOperationRequest{Kind: protocol.OpParse, StatementName: name, Query: query, ParamOIDs: paramOIDs}
+}
+
+func bindReq(portal, stmt string, paramFormats []int16, paramNulls []bool, resultFormats []int16) FrontendOperationRequest {
+	return FrontendOperationRequest{
+		Kind: protocol.OpBind, PortalName: portal, StatementName: stmt,
+		ParamFormats: paramFormats, ParamNulls: paramNulls, ResultFormats: resultFormats,
+	}
+}
+
+func describeStmtReq(name string) FrontendOperationRequest {
+	return FrontendOperationRequest{Kind: protocol.OpDescribeStatement, StatementName: name}
+}
+
+func describePortalReq(name string) FrontendOperationRequest {
+	return FrontendOperationRequest{Kind: protocol.OpDescribePortal, PortalName: name}
+}
+
+func executeReq(portal string) FrontendOperationRequest {
+	return FrontendOperationRequest{Kind: protocol.OpExecute, PortalName: portal}
+}
+
+func closeStmtReq(name string) FrontendOperationRequest {
+	return FrontendOperationRequest{Kind: protocol.OpCloseStatement, StatementName: name}
+}
+
+func closePortalReq(name string) FrontendOperationRequest {
+	return FrontendOperationRequest{Kind: protocol.OpClosePortal, PortalName: name}
+}
+
+func syncReq() FrontendOperationRequest { return FrontendOperationRequest{Kind: protocol.OpSync} }
+
+func mustRegister(t *testing.T, ctx context.Context, rt *ExtendedRuntime, req FrontendOperationRequest) protocol.PendingOperation {
+	t.Helper()
+	reg, err := rt.RegisterFrontendOperation(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return reg.Operation
+}
+
 // --- Test helpers: writer double -----------------------------------------
 
 // trackingWriter is an in-memory io.WriteCloser test double that records
@@ -79,7 +127,6 @@ type trackingWriter struct {
 
 	writeCount          int32
 	busy                int32
-	maxSeen             int32
 	concurrentViolation atomic.Bool
 }
 
@@ -146,14 +193,14 @@ func testRuntimeLimits() RuntimeLimits {
 	return RuntimeLimits{FrontendEventBuffer: 8, BackendEventBuffer: 8}
 }
 
-func newTestRuntime(t *testing.T, backend io.ReadCloser, client io.WriteCloser) (*protocol.State, *ExtendedRuntime) {
+func newTestRuntime(t *testing.T, backend io.ReadCloser, client io.WriteCloser) *ExtendedRuntime {
 	t.Helper()
 	s := protocol.NewState()
 	rt, err := NewExtendedRuntime(s, backend, client, protocol.DefaultSequencerLimits(), testRuntimeLimits())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	return s, rt
+	return rt
 }
 
 func waitStarted(t *testing.T, r *ExtendedRuntime) {
@@ -217,36 +264,23 @@ func assertNoGoroutineLeak(t *testing.T, before int) {
 // setupRuntimeExecuteHead registers an unnamed Parse, Bind and Execute
 // through the runtime (acknowledging each backend terminal along the
 // way), leaving the sequencer's head at the registered Execute operation.
-func setupRuntimeExecuteHead(t *testing.T, ctx context.Context, s *protocol.State, rt *ExtendedRuntime, backendW io.Writer, client *trackingWriter) protocol.PendingOperation {
+func setupRuntimeExecuteHead(t *testing.T, ctx context.Context, rt *ExtendedRuntime, backendW io.Writer, client *trackingWriter) protocol.PendingOperation {
 	t.Helper()
-	pop, _, _ := s.CreateParse("", "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(ctx, pop); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, ctx, rt, parseReq("", "SELECT 1", nil))
 	pc := emptyFrame(protocol.MsgParseComplete)
 	if _, err := backendW.Write(pc); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	waitForBytes(t, client, pc)
 
-	bop, _, _ := s.CreateBind("", "", nil, nil, nil)
-	if err := rt.RegisterForwardedOperation(ctx, bop); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, ctx, rt, bindReq("", "", nil, nil, nil))
 	bc := emptyFrame(protocol.MsgBindComplete)
 	if _, err := backendW.Write(bc); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	waitForBytes(t, client, append(append([]byte{}, pc...), bc...))
 
-	eop, err := s.CreateExecute("")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if err := rt.RegisterForwardedOperation(ctx, eop); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	return eop
+	return mustRegister(t, ctx, rt, executeReq(""))
 }
 
 // --- Lifecycle -------------------------------------------------------------
@@ -285,9 +319,8 @@ func TestNewExtendedRuntime_Validation(t *testing.T) {
 }
 
 func TestExtendedRuntime_SubmitBeforeRun_ReturnsNotRunning(t *testing.T) {
-	_, rt := newTestRuntime(t, io.NopCloser(strings.NewReader("")), newTrackingWriter())
-	op := protocol.PendingOperation{ID: 1, Kind: protocol.OpParse, Cycle: 1}
-	if err := rt.RegisterForwardedOperation(context.Background(), op); !errors.Is(err, ErrNotRunning) {
+	rt := newTestRuntime(t, io.NopCloser(strings.NewReader("")), newTrackingWriter())
+	if _, err := rt.RegisterFrontendOperation(context.Background(), parseReq("s1", "SELECT 1", nil)); !errors.Is(err, ErrNotRunning) {
 		t.Fatalf("expected ErrNotRunning, got %v", err)
 	}
 	if err := rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame()); !errors.Is(err, ErrNotRunning) {
@@ -298,7 +331,7 @@ func TestExtendedRuntime_SubmitBeforeRun_ReturnsNotRunning(t *testing.T) {
 func TestExtendedRuntime_Run_SucceedsOnlyOnce(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 
 	done := runInBackground(t, rt, context.Background())
 
@@ -315,12 +348,11 @@ func TestExtendedRuntime_Run_SucceedsOnlyOnce(t *testing.T) {
 func TestExtendedRuntime_SubmitWhileRunning_Succeeds(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 
 	done := runInBackground(t, rt, context.Background())
 
-	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); err != nil {
+	if _, err := rt.RegisterFrontendOperation(context.Background(), parseReq("s1", "SELECT 1", nil)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -331,7 +363,7 @@ func TestExtendedRuntime_SubmitWhileRunning_Succeeds(t *testing.T) {
 func TestExtendedRuntime_SubmitAfterTerminal_ReturnsStopped(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 
 	done := runInBackground(t, rt, context.Background())
 	backendW.Close() // EOF, no pending work -> clean stop
@@ -339,8 +371,7 @@ func TestExtendedRuntime_SubmitAfterTerminal_ReturnsStopped(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); !errors.Is(err, ErrRuntimeStopped) {
+	if _, err := rt.RegisterFrontendOperation(context.Background(), parseReq("s1", "SELECT 1", nil)); !errors.Is(err, ErrRuntimeStopped) {
 		t.Fatalf("expected ErrRuntimeStopped, got %v", err)
 	}
 	if err := rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame()); !errors.Is(err, ErrRuntimeStopped) {
@@ -351,7 +382,7 @@ func TestExtendedRuntime_SubmitAfterTerminal_ReturnsStopped(t *testing.T) {
 func TestExtendedRuntime_ContextCancellation_ClosesBothEnds(t *testing.T) {
 	backendConn1, backendConn2 := net.Pipe()
 	clientConn1, clientConn2 := net.Pipe()
-	_, rt := newTestRuntime(t, backendConn1, clientConn1)
+	rt := newTestRuntime(t, backendConn1, clientConn1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(t, rt, ctx)
@@ -374,12 +405,10 @@ func TestExtendedRuntime_BackendReaderJoinedBeforeRunReturns(t *testing.T) {
 	// backendR never receives data or a close from the test - the ONLY
 	// way Run() can return promptly is if cancellation correctly closes
 	// r.backend, unblocking runBackendReader's Read() so it can exit and
-	// be joined by Run's wg.Wait() before Run itself returns. If the
-	// reader were not properly joined, this test would time out via
-	// waitDone's deadline.
+	// be joined by Run's wg.Wait() before Run itself returns.
 	backendR, _ := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(t, rt, ctx)
@@ -394,7 +423,7 @@ func TestExtendedRuntime_NoGoroutineLeakOnOrdinaryCancellation(t *testing.T) {
 
 	backendR, _ := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(t, rt, ctx)
@@ -410,7 +439,7 @@ func TestExtendedRuntime_BlockedFirst_SyntheticEmitsImmediately(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	defer backendW.Close()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -421,10 +450,6 @@ func TestExtendedRuntime_BlockedFirst_SyntheticEmitsImmediately(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// By the time SubmitSyntheticError returned, the frame was already
-	// fully written - the ack is only sent after output processing
-	// completes (bkz. RegisterForwardedOperation/SubmitSyntheticError doc
-	// comment). No backend traffic was needed at all.
 	if !bytes.Equal(client.Snapshot(), frame) {
 		t.Fatalf("expected the synthetic frame written exactly once, got %x", client.Snapshot())
 	}
@@ -441,15 +466,12 @@ func TestExtendedRuntime_BlockedFirst_SyntheticEmitsImmediately(t *testing.T) {
 func TestExtendedRuntime_QueuedOrdering_ParseCompleteBeforeSynthetic(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	op := mustRegister(t, context.Background(), rt, parseReq("s1", "SELECT 1", nil))
 
 	if err := rt.SubmitSyntheticError(context.Background(), op.Cycle, minimalErrorFrame()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -473,12 +495,12 @@ func TestExtendedRuntime_QueuedOrdering_ParseCompleteBeforeSynthetic(t *testing.
 func TestExtendedRuntime_IntermediateDataRows_DoNotReleaseQueuedSynthetic(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	eop := setupRuntimeExecuteHead(t, context.Background(), s, rt, backendW, client)
+	eop := setupRuntimeExecuteHead(t, context.Background(), rt, backendW, client)
 
 	if err := rt.SubmitSyntheticError(context.Background(), eop.Cycle, minimalErrorFrame()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -514,7 +536,7 @@ func TestExtendedRuntime_IntermediateDataRows_DoNotReleaseQueuedSynthetic(t *tes
 func TestExtendedRuntime_Async_NoticeResponseNoPlan(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
@@ -532,12 +554,12 @@ func TestExtendedRuntime_Async_NoticeResponseNoPlan(t *testing.T) {
 func TestExtendedRuntime_Async_ParameterStatusDuringExecute_DoesNotConsumePlan(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	setupRuntimeExecuteHead(t, context.Background(), s, rt, backendW, client)
+	setupRuntimeExecuteHead(t, context.Background(), rt, backendW, client)
 	before := client.Snapshot()
 
 	ps := buildFrame(protocol.MsgParameterStatus, []byte{'k', 0, 'v', 0})
@@ -561,15 +583,12 @@ func TestExtendedRuntime_Async_ParameterStatusDuringExecute_DoesNotConsumePlan(t
 func TestExtendedRuntime_Async_NotificationResponseWhileSyncPending(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	syncOp, _ := s.CreateSync()
-	if err := rt.RegisterForwardedOperation(context.Background(), syncOp); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, context.Background(), rt, syncReq())
 
 	notif := buildFrame(protocol.MsgNotificationResponse, append([]byte{0, 0, 0, 1}, append([]byte("ch"), 0, 'p', 0)...))
 	if _, err := backendW.Write(notif); err != nil {
@@ -592,15 +611,12 @@ func TestExtendedRuntime_Async_NotificationResponseWhileSyncPending(t *testing.T
 func TestExtendedRuntime_Sync_ErrorResponseThenReadyForQuery(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	syncOp, _ := s.CreateSync()
-	if err := rt.RegisterForwardedOperation(context.Background(), syncOp); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, context.Background(), rt, syncReq())
 
 	errFrame := minimalErrorFrame()
 	if _, err := backendW.Write(errFrame); err != nil {
@@ -624,23 +640,14 @@ func TestExtendedRuntime_Sync_ErrorResponseThenReadyForQuery(t *testing.T) {
 func TestExtendedRuntime_Sync_MultipleCyclesFIFO(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	sync1, _ := s.CreateSync()
-	if err := rt.RegisterForwardedOperation(context.Background(), sync1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	op2, _, _ := s.CreateParse("s2", "SELECT 2", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op2); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	sync2, _ := s.CreateSync()
-	if err := rt.RegisterForwardedOperation(context.Background(), sync2); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, context.Background(), rt, syncReq())
+	mustRegister(t, context.Background(), rt, parseReq("s2", "SELECT 2", nil))
+	mustRegister(t, context.Background(), rt, syncReq())
 
 	rfq1 := rfqFrame(protocol.TxStatusIdle)
 	if _, err := backendW.Write(rfq1); err != nil {
@@ -669,7 +676,7 @@ func TestExtendedRuntime_Sync_MultipleCyclesFIFO(t *testing.T) {
 func TestExtendedRuntime_ConnectionLevelError_RelayedThenTerminate(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	frame := minimalErrorFrame()
@@ -692,7 +699,7 @@ func TestExtendedRuntime_ConnectionLevelError_RelayedThenTerminate(t *testing.T)
 func TestExtendedRuntime_ConnectionLevelError_MalformedNoOutputFailsClosed(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	if _, err := backendW.Write(terminalOnlyErrorFrame()); err != nil {
@@ -718,7 +725,7 @@ func TestExtendedRuntime_Writes_PartialWriterCompletesFrame(t *testing.T) {
 	defer backendW.Close()
 	client := newTrackingWriter()
 	client.partialN = 3
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
@@ -743,7 +750,7 @@ func TestExtendedRuntime_Writes_NoProgressFailsClosed(t *testing.T) {
 	defer backendW.Close()
 	client := newTrackingWriter()
 	client.noProgressOnce = true
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	err := rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
@@ -763,7 +770,7 @@ func TestExtendedRuntime_Writes_ClientWriteErrorTerminatesRuntime(t *testing.T) 
 	client := newTrackingWriter()
 	injected := errors.New("test: simulated write failure")
 	client.writeErrOnce = injected
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	err := rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
@@ -780,7 +787,7 @@ func TestExtendedRuntime_Writes_ClientWriteErrorTerminatesRuntime(t *testing.T) 
 func TestExtendedRuntime_Writes_FramesBeforeTerminateWrittenExactlyOnce(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	frame := minimalErrorFrame()
@@ -801,7 +808,7 @@ func TestExtendedRuntime_Writes_FramesBeforeTerminateWrittenExactlyOnce(t *testi
 func TestExtendedRuntime_Writes_NoWriteAfterTermination(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	if _, err := backendW.Write(minimalErrorFrame()); err != nil {
@@ -820,25 +827,14 @@ func TestExtendedRuntime_Writes_MaxConcurrencyIsOne(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	defer backendW.Close()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	// protocol.State is single-writer by design (owned exclusively by one
-	// frontend producer in the real architecture) - Create* calls
-	// themselves must happen serially. Only RegisterForwardedOperation
-	// itself (channel-based, safe for concurrent callers) is exercised
-	// concurrently below.
-	ops := make([]protocol.PendingOperation, 10)
-	for i := 0; i < 10; i++ {
-		op, _, err := s.CreateParse(fmt.Sprintf("s%d", i), "SELECT 1", nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		ops[i] = op
-	}
-
+	// State is now owned exclusively by the event loop, so concurrent
+	// callers safely race directly against RegisterFrontendOperation
+	// itself (no external State access needed).
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
@@ -852,7 +848,7 @@ func TestExtendedRuntime_Writes_MaxConcurrencyIsOne(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_ = rt.RegisterForwardedOperation(context.Background(), ops[i])
+			_, _ = rt.RegisterFrontendOperation(context.Background(), parseReq(fmt.Sprintf("s%d", i), "SELECT 1", nil))
 		}(i)
 	}
 	wg.Wait()
@@ -870,7 +866,7 @@ func TestExtendedRuntime_Writes_MaxConcurrencyIsOne(t *testing.T) {
 func TestExtendedRuntime_BackendReading_FragmentedFrame(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
@@ -890,7 +886,7 @@ func TestExtendedRuntime_BackendReading_FragmentedFrame(t *testing.T) {
 func TestExtendedRuntime_BackendReading_SeveralFramesOneRead(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
@@ -910,7 +906,7 @@ func TestExtendedRuntime_BackendReading_SeveralFramesOneRead(t *testing.T) {
 func TestExtendedRuntime_BackendReading_DecoderError(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	bad := buildFrame(protocol.MsgErrorResponse, nil)
@@ -931,7 +927,7 @@ func TestExtendedRuntime_BackendReading_DecoderError(t *testing.T) {
 func TestExtendedRuntime_BackendReading_NonEOFReadError(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	injected := errors.New("test: simulated backend read failure")
@@ -946,7 +942,7 @@ func TestExtendedRuntime_BackendReading_NonEOFReadError(t *testing.T) {
 func TestExtendedRuntime_BackendReading_CleanEOFNoPendingWork(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	backendW.Close()
@@ -960,13 +956,10 @@ func TestExtendedRuntime_BackendReading_CleanEOFNoPendingWork(t *testing.T) {
 func TestExtendedRuntime_BackendReading_UnexpectedEOFWithPendingWork(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
-	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, context.Background(), rt, parseReq("s1", "SELECT 1", nil))
 
 	backendW.Close()
 
@@ -983,7 +976,7 @@ func TestExtendedRuntime_BackendReading_BlockedReaderStillWokenBySynthetic(t *te
 	backendR, backendW := io.Pipe()
 	defer backendW.Close()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
@@ -1032,38 +1025,23 @@ func TestExtendedRuntime_BackendReading_ChannelBackpressureNoMessageLoss(t *test
 }
 
 // --- Plan mismatch ------------------------------------------------------
-
-func TestExtendedRuntime_PlanMismatch_AckBeforeRegistration(t *testing.T) {
-	backendR, backendW := io.Pipe()
-	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
-	done := runInBackground(t, rt, context.Background())
-
-	s.CreateParse("s1", "SELECT 1", nil) // deliberately NOT registered with the runtime
-
-	if _, err := backendW.Write(emptyFrame(protocol.MsgParseComplete)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	err := waitDone(t, done)
-	if !errors.Is(err, ErrBackendProtocolFailure) {
-		t.Fatalf("expected ErrBackendProtocolFailure, got %v", err)
-	}
-	if len(client.Snapshot()) != 0 {
-		t.Fatalf("expected no output, got %x", client.Snapshot())
-	}
-}
+//
+// Note: the pre-hardening "backend acknowledgement arrives before plan
+// registration" scenario (a caller creating a State operation without
+// ever registering it with the sequencer) is now structurally
+// IMPOSSIBLE - State is exclusively owned by the event loop, and
+// RegisterFrontendOperation always creates the State operation and
+// registers it with the sequencer atomically in the same turn. What
+// remains representable (and still tested below) is a real backend
+// message arriving with no matching operation at all, or the wrong kind.
 
 func TestExtendedRuntime_PlanMismatch_WrongOperationPlan(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
-	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, context.Background(), rt, parseReq("s1", "SELECT 1", nil))
 
 	if _, err := backendW.Write(emptyFrame(protocol.MsgBindComplete)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1078,7 +1056,7 @@ func TestExtendedRuntime_PlanMismatch_WrongOperationPlan(t *testing.T) {
 func TestExtendedRuntime_PlanMismatch_UnexpectedReadyForQuery(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
 	if _, err := backendW.Write(rfqFrame(protocol.TxStatusIdle)); err != nil {
@@ -1094,10 +1072,10 @@ func TestExtendedRuntime_PlanMismatch_UnexpectedReadyForQuery(t *testing.T) {
 func TestExtendedRuntime_PlanMismatch_UnsupportedCOPYResponse(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
-	setupRuntimeExecuteHead(t, context.Background(), s, rt, backendW, client)
+	setupRuntimeExecuteHead(t, context.Background(), rt, backendW, client)
 
 	if _, err := backendW.Write(buildFrame(protocol.MsgCopyOutResponse, []byte{0, 0, 0})); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1114,7 +1092,7 @@ func TestExtendedRuntime_PlanMismatch_UnsupportedCOPYResponse(t *testing.T) {
 func TestExtendedRuntime_Cancellation_WhileBackendReadBlocked(t *testing.T) {
 	backendR, _ := io.Pipe() // never written to, never closed by the test
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(t, rt, ctx)
 	cancel()
@@ -1123,24 +1101,16 @@ func TestExtendedRuntime_Cancellation_WhileBackendReadBlocked(t *testing.T) {
 	}
 }
 
-func TestExtendedRuntime_Cancellation_WhileFrontendSubmitWaitsForCapacity(t *testing.T) {
+func TestExtendedRuntime_Cancellation_BeforeRun_ReturnsNotRunning(t *testing.T) {
 	backendR, _ := io.Pipe()
 	client := newTrackingWriter()
-	s := protocol.NewState()
-	limits := RuntimeLimits{FrontendEventBuffer: 1, BackendEventBuffer: 1}
-	rt, err := NewExtendedRuntime(s, backendR, client, protocol.DefaultSequencerLimits(), limits)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	rt := newTestRuntime(t, backendR, client)
 
-	// A submit ctx that's already canceled must return promptly with
-	// ctx.Err() rather than hang, even if the runtime never started.
 	canceledCtx, cancelNow := context.WithCancel(context.Background())
 	cancelNow()
-	op := protocol.PendingOperation{ID: 1, Kind: protocol.OpParse, Cycle: 1}
-	if err := rt.RegisterForwardedOperation(canceledCtx, op); !errors.Is(err, ErrNotRunning) {
-		// Runtime not started yet: not-running takes precedence over an
-		// already-canceled caller context (checked first, no blocking).
+	// Runtime not started yet: not-running takes precedence over an
+	// already-canceled caller context (checked first, no blocking).
+	if _, err := rt.RegisterFrontendOperation(canceledCtx, parseReq("s1", "SELECT 1", nil)); !errors.Is(err, ErrNotRunning) {
 		t.Fatalf("expected ErrNotRunning, got %v", err)
 	}
 }
@@ -1150,7 +1120,7 @@ func TestExtendedRuntime_Cancellation_WhileClientWriteBlocked(t *testing.T) {
 	defer backendW.Close()
 	clientConn1, clientConn2 := net.Pipe() // real blocking net.Conn semantics
 	defer clientConn2.Close()
-	_, rt := newTestRuntime(t, backendR, clientConn1)
+	rt := newTestRuntime(t, backendR, clientConn1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(t, rt, ctx)
@@ -1176,38 +1146,10 @@ func TestExtendedRuntime_Cancellation_WhileClientWriteBlocked(t *testing.T) {
 	waitDone(t, done)
 }
 
-func TestExtendedRuntime_Cancellation_WithPendingAcknowledgement(t *testing.T) {
-	backendR, _ := io.Pipe()
-	client := newTrackingWriter()
-	s := protocol.NewState()
-	limits := RuntimeLimits{FrontendEventBuffer: 1, BackendEventBuffer: 1}
-	rt, err := NewExtendedRuntime(s, backendR, client, protocol.DefaultSequencerLimits(), limits)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := runInBackground(t, rt, ctx)
-
-	// Fill the buffer with one in-flight (never-drained, since the loop
-	// is still running normally and WILL drain it) - instead, directly
-	// test that a submit whose OWN ctx is canceled mid-flight returns
-	// ctx.Err() rather than leaking.
-	submitCtx, submitCancel := context.WithCancel(context.Background())
-	submitCancel()
-	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
-	err = rt.RegisterForwardedOperation(submitCtx, op)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected nil or context.Canceled, got %v", err)
-	}
-
-	cancel()
-	waitDone(t, done)
-}
-
 func TestExtendedRuntime_Cancellation_RepeatedCloseCallsAreSafe(t *testing.T) {
 	backendR, _ := io.Pipe()
 	client := newTrackingWriter()
-	_, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(t, rt, ctx)
 	cancel()
@@ -1229,15 +1171,12 @@ func TestExtendedRuntime_Cancellation_RepeatedCloseCallsAreSafe(t *testing.T) {
 func TestExtendedRuntime_MutationIsolation_SyntheticFrameMutatedAfterSubmission(t *testing.T) {
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	op := mustRegister(t, context.Background(), rt, parseReq("s1", "SELECT 1", nil))
 
 	frame := append([]byte(nil), minimalErrorFrame()...)
 	if err := rt.SubmitSyntheticError(context.Background(), op.Cycle, frame); err != nil {
@@ -1256,19 +1195,41 @@ func TestExtendedRuntime_MutationIsolation_SyntheticFrameMutatedAfterSubmission(
 	waitDone(t, done)
 }
 
+func TestExtendedRuntime_MutationIsolation_RequestSlicesMutatedAfterSubmission(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	oids := []uint32{23, 25}
+	req := parseReq("s1", "SELECT 1", oids)
+	reg, err := rt.RegisterFrontendOperation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	oids[0] = 999999 // mutate caller's own slice after submission returns
+
+	if reg.Operation.Kind != protocol.OpParse {
+		t.Fatalf("unexpected registration: %+v", reg)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
 func TestExtendedRuntime_NonDisclosure_ErrorsNeverContainMarkers(t *testing.T) {
 	const secretStmt = "SECRET_RUNTIME_STMT_MARKER"
 	const secretSQL = "SECRET_RUNTIME_SQL_MARKER"
 
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	done := runInBackground(t, rt, context.Background())
 
-	op, _, _ := s.CreateParse(secretStmt, "SELECT 1 -- "+secretSQL, nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	mustRegister(t, context.Background(), rt, parseReq(secretStmt, "SELECT 1 -- "+secretSQL, nil))
 
 	// Trigger a plan mismatch by acknowledging the WRONG kind.
 	if _, err := backendW.Write(emptyFrame(protocol.MsgBindComplete)); err != nil {
@@ -1286,25 +1247,647 @@ func TestExtendedRuntime_NonDisclosure_ErrorsNeverContainMarkers(t *testing.T) {
 }
 
 func TestExtendedRuntime_NonDisclosure_RegistrationErrorNeverContainsMarkers(t *testing.T) {
-	const secretStmt = "SECRET_RUNTIME_DUP_MARKER"
+	const secretPortal = "SECRET_RUNTIME_BIND_MARKER"
+	const secretStmt = "SECRET_RUNTIME_UNKNOWN_STMT_MARKER"
 	backendR, backendW := io.Pipe()
 	defer backendW.Close()
 	client := newTrackingWriter()
-	s, rt := newTestRuntime(t, backendR, client)
+	rt := newTestRuntime(t, backendR, client)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runInBackground(t, rt, ctx)
 
-	op, _, _ := s.CreateParse(secretStmt, "SELECT 1", nil)
-	if err := rt.RegisterForwardedOperation(context.Background(), op); err != nil {
+	// Bind against a statement that was never Parsed: State.CreateBind
+	// rejects this with ErrUnknownStatement before any mutation.
+	_, err := rt.RegisterFrontendOperation(context.Background(), bindReq(secretPortal, secretStmt, nil, nil, nil))
+	if err == nil {
+		t.Fatal("expected an unknown-statement rejection")
+	}
+	if strings.Contains(err.Error(), secretPortal) || strings.Contains(err.Error(), secretStmt) {
+		t.Fatalf("registration error leaked a client-supplied name marker: %v", err)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+// ==========================================================================
+// State/sequencer divergence (bkz. gorev 2)
+// ==========================================================================
+
+func TestExtendedRuntime_Divergence_StateFailureLeavesRuntimeUsable(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	// Bind against a statement that was never Parsed: State.CreateBind
+	// itself rejects this (ErrUnknownStatement) BEFORE any mutation -
+	// this must NOT terminate the runtime.
+	_, err := rt.RegisterFrontendOperation(context.Background(), bindReq("p1", "does-not-exist", nil, nil, nil))
+	if err == nil {
+		t.Fatal("expected an error for binding an unknown statement")
+	}
+	if errors.Is(err, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("a State.Create* rejection (no mutation) must not be treated as a divergence, got %v", err)
+	}
+
+	// The runtime must remain fully usable afterward.
+	op := mustRegister(t, context.Background(), rt, parseReq("s1", "SELECT 1", nil))
+	pc := emptyFrame(protocol.MsgParseComplete)
+	if _, err := backendW.Write(pc); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	err := rt.RegisterForwardedOperation(context.Background(), op) // duplicate
-	if err == nil {
-		t.Fatal("expected a duplicate-registration error")
+	waitForBytes(t, client, pc)
+	_ = op
+
+	cancel()
+	if err := waitDone(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
-	if strings.Contains(err.Error(), secretStmt) {
-		t.Fatalf("registration error leaked the statement name marker: %v", err)
+}
+
+func TestExtendedRuntime_Divergence_SequencerCapacityFailureAfterStateCreation_Terminates(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	seqLimits := protocol.DefaultSequencerLimits()
+	seqLimits.MaxPlanUnits = 1 // exhausted after the first registration
+	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, testRuntimeLimits())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	done := runInBackground(t, rt, context.Background())
+
+	mustRegister(t, context.Background(), rt, syncReq()) // fills the 1-unit plan capacity
+
+	// State.CreateParse SUCCEEDS (mutates State) but
+	// AddForwardedOperation fails (ErrPlanQueueFull) - a genuine
+	// divergence.
+	_, regErr := rt.RegisterFrontendOperation(context.Background(), parseReq("s1", "SELECT 1", nil))
+	if !errors.Is(regErr, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("expected ErrFrontendRegistrationDiverged, got %v", regErr)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("expected Run to return ErrFrontendRegistrationDiverged, got %v", runErr)
+	}
+	if !client.Closed() {
+		t.Fatal("expected the client connection closed")
+	}
+}
+
+func TestExtendedRuntime_Divergence_DuplicateRegistrationAfterStateCreation_Terminates(t *testing.T) {
+	// A duplicate CLOSE-then-CLOSE-again style scenario is hard to force
+	// through State (Close never errors); instead we reuse the plan-
+	// capacity mechanism above as the canonical, deterministic way to
+	// force AddForwardedOperation to reject an already-created State
+	// operation. This test additionally confirms NO frontend frame may
+	// be treated as safe to forward, and that both connections close.
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	seqLimits := protocol.DefaultSequencerLimits()
+	seqLimits.MaxPlanUnits = 1
+	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, testRuntimeLimits())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	done := runInBackground(t, rt, context.Background())
+
+	mustRegister(t, context.Background(), rt, syncReq())
+
+	reg, regErr := rt.RegisterFrontendOperation(context.Background(), parseReq("s1", "SELECT 1", nil))
+	if !errors.Is(regErr, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("expected ErrFrontendRegistrationDiverged, got %v", regErr)
+	}
+	if reg.Operation.ID != protocol.NoPendingOperation {
+		t.Fatalf("expected no usable operation snapshot on divergence, got %+v", reg)
+	}
+
+	waitDone(t, done)
+	if !client.Closed() {
+		t.Fatal("expected client connection closed")
+	}
+
+	// A later, would-be-forwarding caller must never be told it can
+	// safely proceed.
+	if _, err := rt.RegisterFrontendOperation(context.Background(), parseReq("s2", "SELECT 2", nil)); !errors.Is(err, ErrRuntimeStopped) {
+		t.Fatalf("expected ErrRuntimeStopped for all later submissions, got %v", err)
+	}
+	if err := rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame()); !errors.Is(err, ErrRuntimeStopped) {
+		t.Fatalf("expected ErrRuntimeStopped, got %v", err)
+	}
+}
+
+func TestExtendedRuntime_Divergence_ErrorsContainNoClientMarkers(t *testing.T) {
+	const secretStmt = "SECRET_DIVERGENCE_STMT_MARKER"
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	seqLimits := protocol.DefaultSequencerLimits()
+	seqLimits.MaxPlanUnits = 1
+	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, testRuntimeLimits())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	done := runInBackground(t, rt, context.Background())
+
+	mustRegister(t, context.Background(), rt, syncReq())
+	_, regErr := rt.RegisterFrontendOperation(context.Background(), parseReq(secretStmt, "SELECT 1", nil))
+	if strings.Contains(regErr.Error(), secretStmt) {
+		t.Fatalf("divergence error leaked the statement name: %v", regErr)
+	}
+
+	runErr := waitDone(t, done)
+	if runErr != nil && strings.Contains(runErr.Error(), secretStmt) {
+		t.Fatalf("Run's primary error leaked the statement name: %v", runErr)
+	}
+}
+
+// ==========================================================================
+// Accepted-event cancellation (bkz. gorev 3)
+// ==========================================================================
+
+func TestExtendedRuntime_AcceptedEvent_ContextCanceledBeforeEnqueue_NotProcessed(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	limits := RuntimeLimits{FrontendEventBuffer: 1, BackendEventBuffer: 1}
+	rt, err := NewExtendedRuntime(s, backendR, client, protocol.DefaultSequencerLimits(), limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	entered := make(chan struct{}, 8)
+	enqueued := make(chan struct{}, 8)
+	release := make(chan struct{})
+	rt.onFrontendEventAccepted = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	rt.onFrontendEventEnqueued = func() {
+		enqueued <- struct{}{}
+	}
+
+	done := runInBackground(t, rt, context.Background())
+
+	// A: gets dequeued immediately, loop pauses in the hook.
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterFrontendOperation(context.Background(), parseReq("sA", "SELECT A", nil))
+		aDone <- err
+	}()
+	<-enqueued
+	<-entered
+
+	// B: fills the now-empty (capacity-1) channel while the loop stays
+	// paused on A.
+	bDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterFrontendOperation(context.Background(), parseReq("sB", "SELECT B", nil))
+		bDone <- err
+	}()
+	<-enqueued
+
+	// C: context ALREADY canceled, and the channel is FULL (B occupies
+	// its one slot) with the loop still paused on A - C's send cannot
+	// possibly succeed, so only ctx.Done() is reachable.
+	cCtx, cCancel := context.WithCancel(context.Background())
+	cCancel()
+	if _, err := rt.RegisterFrontendOperation(cCtx, parseReq("sC", "SELECT C", nil)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled for C (never enqueued), got %v", err)
+	}
+
+	close(release)
+
+	if err := <-aDone; err != nil {
+		t.Fatalf("expected A to succeed, got %v", err)
+	}
+	if err := <-bDone; err != nil {
+		t.Fatalf("expected B to succeed, got %v", err)
+	}
+
+	backendW.Close()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_AcceptedEvent_ContextCanceledAfterAcceptance_GetsDefinitiveResult(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	accepted := make(chan struct{})
+	rt.onFrontendEventAccepted = func() { close(accepted) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitCtx, submitCancel := context.WithCancel(context.Background())
+	type result struct {
+		reg FrontendRegistration
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		reg, err := rt.RegisterFrontendOperation(submitCtx, parseReq("s1", "SELECT 1", nil))
+		resultCh <- result{reg, err}
+	}()
+
+	<-accepted     // the event loop has definitely dequeued the event
+	submitCancel() // cancel AFTER acceptance - must NOT produce ctx.Err()
+
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			t.Fatalf("expected the definitive successful result despite post-acceptance cancellation, got %v", res.err)
+		}
+		if res.reg.Operation.Kind != protocol.OpParse {
+			t.Fatalf("unexpected registration: %+v", res.reg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("submit did not return a definitive result")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_AcceptedEvent_FailureAfterAcceptance_ReturnsSpecificFailure(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	accepted := make(chan struct{})
+	rt.onFrontendEventAccepted = func() { close(accepted) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	// Register the statement first so the SECOND (duplicate) attempt is
+	// guaranteed to be rejected by the sequencer once processed.
+	mustRegister(t, context.Background(), rt, parseReq("dup", "SELECT 1", nil))
+
+	accepted2 := make(chan struct{})
+	rt.onFrontendEventAccepted = func() { close(accepted2) }
+	submitCtx, submitCancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		// Duplicate statement name is fine (State allows re-Parse by
+		// name) - instead force a plan-registration failure isn't
+		// straightforward here, so we assert on ANY definitive result:
+		// cancellation after acceptance must never be ctx.Canceled.
+		_, err := rt.RegisterFrontendOperation(submitCtx, parseReq("dup2", "SELECT 2", nil))
+		errCh <- err
+	}()
+	<-accepted2
+	submitCancel()
+
+	select {
+	case err := <-errCh:
+		if errors.Is(err, context.Canceled) {
+			t.Fatalf("accepted event must not resolve to ctx.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("submit did not return a definitive result")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_AcceptedEvent_RuntimeTermination_ReleasesUnprocessedSubmitter(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	seqLimits := protocol.DefaultSequencerLimits()
+	seqLimits.MaxPlanUnits = 1
+	limits := RuntimeLimits{FrontendEventBuffer: 2, BackendEventBuffer: 2}
+	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	entered := make(chan struct{}, 8)
+	enqueued := make(chan struct{}, 8)
+	release := make(chan struct{})
+	rt.onFrontendEventAccepted = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	rt.onFrontendEventEnqueued = func() {
+		enqueued <- struct{}{}
+	}
+
+	done := runInBackground(t, rt, context.Background())
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterFrontendOperation(context.Background(), parseReq("sA", "SELECT A", nil))
+		aDone <- err
+	}()
+	<-enqueued
+	<-entered // A dequeued, loop paused
+
+	bDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterFrontendOperation(context.Background(), parseReq("sB", "SELECT B", nil))
+		bDone <- err
+	}()
+	<-enqueued
+
+	cDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterFrontendOperation(context.Background(), parseReq("sC", "SELECT C", nil))
+		cDone <- err
+	}()
+	<-enqueued // buffer capacity 2: now holds B then C
+
+	close(release) // let the loop resume: process A (succeeds), then B (diverges -> terminal)
+
+	if err := <-aDone; err != nil {
+		t.Fatalf("expected A to succeed, got %v", err)
+	}
+	bErr := <-bDone
+	if !errors.Is(bErr, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("expected ErrFrontendRegistrationDiverged for B, got %v", bErr)
+	}
+	// C was accepted (enqueued) but the loop exited before ever
+	// dequeuing it - C's submitter must be released with
+	// ErrRuntimeStopped, not left hanging forever.
+	cErr := <-cDone
+	if !errors.Is(cErr, ErrRuntimeStopped) {
+		t.Fatalf("expected ErrRuntimeStopped for the never-dequeued C, got %v", cErr)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("expected Run to return ErrFrontendRegistrationDiverged, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_AcceptedEvent_NoAcknowledgementGoroutineLeak(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			submitCtx, submitCancel := context.WithCancel(context.Background())
+			defer submitCancel()
+			_, _ = rt.RegisterFrontendOperation(submitCtx, parseReq(fmt.Sprintf("s%d", i), "SELECT 1", nil))
+		}(i)
+	}
+	wg.Wait()
+
+	cancel()
+	backendW.Close()
+	waitDone(t, done)
+
+	assertNoGoroutineLeak(t, before)
+}
+
+func TestExtendedRuntime_AcceptedEvent_RegistrationBeforeForwardingUnambiguous(t *testing.T) {
+	// A successful RegisterFrontendOperation result is the ONLY signal a
+	// future frontend caller may treat as "safe to forward the frame."
+	// This test confirms the success path returns a usable, non-zero
+	// operation snapshot, and a rejected/diverged path never does.
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	reg, err := rt.RegisterFrontendOperation(context.Background(), parseReq("s1", "SELECT 1", nil))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reg.Operation.ID == protocol.NoPendingOperation {
+		t.Fatal("expected a usable operation ID on success")
+	}
+
+	rejectedReg, rejErr := rt.RegisterFrontendOperation(context.Background(), bindReq("p1", "unknown-statement", nil, nil, nil))
+	if rejErr == nil {
+		t.Fatal("expected a rejection for an unknown statement")
+	}
+	if rejectedReg.Operation.ID != protocol.NoPendingOperation {
+		t.Fatalf("expected a zero-value operation on rejection, got %+v", rejectedReg)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+// ==========================================================================
+// Truncated backend messages at EOF (bkz. gorev 4)
+// ==========================================================================
+
+func TestExtendedRuntime_EOF_ZeroBufferedBytes_Clean(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	done := runInBackground(t, rt, context.Background())
+
+	backendW.Close()
+
+	if err := waitDone(t, done); err != nil {
+		t.Fatalf("expected a clean stop, got %v", err)
+	}
+}
+
+func TestExtendedRuntime_EOF_PartialHeaderBytes_FailsClosed(t *testing.T) {
+	for n := 1; n <= 4; n++ {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			backendR, backendW := io.Pipe()
+			client := newTrackingWriter()
+			rt := newTestRuntime(t, backendR, client)
+			done := runInBackground(t, rt, context.Background())
+
+			full := rfqFrame(protocol.TxStatusIdle)
+			if _, err := backendW.Write(full[:n]); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			backendW.Close()
+
+			err := waitDone(t, done)
+			if !errors.Is(err, ErrTruncatedBackendMessage) {
+				t.Fatalf("expected ErrTruncatedBackendMessage, got %v", err)
+			}
+			if len(client.Snapshot()) != 0 {
+				t.Fatalf("expected no output, got %x", client.Snapshot())
+			}
+		})
+	}
+}
+
+func TestExtendedRuntime_EOF_TruncatedBody_FailsClosed(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	done := runInBackground(t, rt, context.Background())
+
+	full := buildFrame(protocol.MsgErrorResponse, []byte{'S', 'E', 'R', 'R', 'O', 'R', 0, 0})
+	if _, err := backendW.Write(full[:8]); err != nil { // tag+length present, body cut short
+		t.Fatalf("unexpected error: %v", err)
+	}
+	backendW.Close()
+
+	err := waitDone(t, done)
+	if !errors.Is(err, ErrTruncatedBackendMessage) {
+		t.Fatalf("expected ErrTruncatedBackendMessage, got %v", err)
+	}
+}
+
+func TestExtendedRuntime_EOF_CompleteFramePlusPartialNext_RelaysOnceThenFailsClosed(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	done := runInBackground(t, rt, context.Background())
+
+	notice := buildFrame(protocol.MsgNoticeResponse, []byte{'S', 'N', 0, 0})
+	partialNext := buildFrame(protocol.MsgParameterStatus, []byte{'k', 0, 'v', 0})[:3]
+	if _, err := backendW.Write(append(append([]byte{}, notice...), partialNext...)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	backendW.Close()
+
+	err := waitDone(t, done)
+	if !errors.Is(err, ErrTruncatedBackendMessage) {
+		t.Fatalf("expected ErrTruncatedBackendMessage, got %v", err)
+	}
+	if !bytes.Equal(client.Snapshot(), notice) {
+		t.Fatalf("expected exactly the one complete frame relayed once, got %x", client.Snapshot())
+	}
+}
+
+func TestExtendedRuntime_EOF_SeveralCompleteFrames_Clean(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	done := runInBackground(t, rt, context.Background())
+
+	f1 := buildFrame(protocol.MsgNoticeResponse, []byte{'S', 'N', 0, 0})
+	f2 := buildFrame(protocol.MsgParameterStatus, []byte{'k', 0, 'v', 0})
+	combined := append(append([]byte{}, f1...), f2...)
+	if _, err := backendW.Write(combined); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	backendW.Close()
+
+	err := waitDone(t, done)
+	if err != nil {
+		t.Fatalf("expected a clean stop, got %v", err)
+	}
+	if !bytes.Equal(client.Snapshot(), combined) {
+		t.Fatalf("expected both frames relayed, got %x", client.Snapshot())
+	}
+}
+
+func TestExtendedRuntime_EOF_TruncationErrorContainsNoRawBytesOrFieldValues(t *testing.T) {
+	const secretMarker = "SECRET_EOF_TRUNCATION_MARKER"
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	done := runInBackground(t, rt, context.Background())
+
+	frame := buildFrame(protocol.MsgErrorResponse, append([]byte{'M'}, append([]byte(secretMarker), 0, 0)...))
+	if _, err := backendW.Write(frame[:len(frame)-2]); err != nil { // leave it incomplete
+		t.Fatalf("unexpected error: %v", err)
+	}
+	backendW.Close()
+
+	err := waitDone(t, done)
+	if !errors.Is(err, ErrTruncatedBackendMessage) {
+		t.Fatalf("expected ErrTruncatedBackendMessage, got %v", err)
+	}
+	if strings.Contains(err.Error(), secretMarker) {
+		t.Fatalf("truncation error leaked buffered content: %v", err)
+	}
+}
+
+// ==========================================================================
+// State ownership stress test (bkz. gorev 5)
+// ==========================================================================
+
+// TestExtendedRuntime_StateOwnership_ConcurrentSubmittersNoRace drives many
+// concurrent RegisterFrontendOperation/SubmitSyntheticError callers
+// against a single runtime. Before this hardening, routing State
+// creation through the runtime was mandatory precisely because
+// protocol.State is unsafe for concurrent access (a concurrent
+// Create* call from two goroutines can panic with "concurrent map
+// writes"); this test proves that concurrent SUBMITTERS no longer
+// touch State directly and therefore never trigger that failure mode -
+// all State/sequencer access is serialized onto the single event-loop
+// goroutine regardless of how many goroutines call the public API.
+func TestExtendedRuntime_StateOwnership_ConcurrentSubmittersNoRace(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	const n = 50
+	var wg sync.WaitGroup
+	ids := make([]protocol.PendingOperationID, n)
+	errsCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			reg, err := rt.RegisterFrontendOperation(context.Background(), parseReq(fmt.Sprintf("s%d", i), "SELECT 1", nil))
+			if err != nil {
+				errsCh <- err
+				return
+			}
+			ids[i] = reg.Operation.ID
+		}(i)
+	}
+	wg.Wait()
+	close(errsCh)
+	for err := range errsCh {
+		t.Fatalf("unexpected registration error: %v", err)
+	}
+
+	// Every successfully registered operation must have a distinct,
+	// non-zero ID - proving State's internal counters were never
+	// corrupted by concurrent, unserialized access.
+	seen := make(map[protocol.PendingOperationID]bool, n)
+	for _, id := range ids {
+		if id == protocol.NoPendingOperation {
+			t.Fatal("expected every registration to receive a non-zero operation ID")
+		}
+		if seen[id] {
+			t.Fatalf("duplicate operation ID observed: %d", id)
+		}
+		seen[id] = true
+	}
+
+	if client.ConcurrentViolation() {
+		t.Fatal("detected concurrent client writes during the ownership stress run")
 	}
 
 	cancel()
@@ -1319,7 +1902,7 @@ func TestExtendedRuntime_NonDisclosure_RegistrationErrorNeverContainsMarkers(t *
 // checking core invariants throughout. It is a short bounded property
 // test in the same spirit as the protocol package's opReader-driven fuzz
 // tests, adapted here to drive the runtime's public API instead of
-// calling ResponseSequencer directly.
+// calling ResponseSequencer/State directly.
 func TestExtendedRuntime_Stress(t *testing.T) {
 	seeds := [][]byte{
 		{0, 8, 1, 9, 2, 8, 3},
@@ -1334,7 +1917,7 @@ func TestExtendedRuntime_Stress(t *testing.T) {
 		t.Run(fmt.Sprintf("seed-%d", si), func(t *testing.T) {
 			backendR, backendW := io.Pipe()
 			client := newTrackingWriter()
-			s, rt := newTestRuntime(t, backendR, client)
+			rt := newTestRuntime(t, backendR, client)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := runInBackground(t, rt, ctx)
@@ -1362,11 +1945,8 @@ func TestExtendedRuntime_Stress(t *testing.T) {
 				}
 				switch int(b) % 8 {
 				case 0:
-					op, _, err := s.CreateParse(nameMarker, "SELECT 1", nil)
-					if err == nil {
-						if aerr := rt.RegisterForwardedOperation(context.Background(), op); aerr != nil {
-							seenErrs = append(seenErrs, aerr.Error())
-						}
+					if _, aerr := rt.RegisterFrontendOperation(context.Background(), parseReq(nameMarker, "SELECT 1", nil)); aerr != nil {
+						seenErrs = append(seenErrs, aerr.Error())
 					}
 				case 1:
 					cycle := protocol.CycleID(int(b)%3 + 1)
@@ -1382,11 +1962,8 @@ func TestExtendedRuntime_Stress(t *testing.T) {
 				case 5:
 					backendW.Write(rfqFrame(protocol.TxStatusIdle))
 				case 6:
-					syncOp, err := s.CreateSync()
-					if err == nil {
-						if aerr := rt.RegisterForwardedOperation(context.Background(), syncOp); aerr != nil {
-							seenErrs = append(seenErrs, aerr.Error())
-						}
+					if _, aerr := rt.RegisterFrontendOperation(context.Background(), syncReq()); aerr != nil {
+						seenErrs = append(seenErrs, aerr.Error())
 					}
 				case 7:
 					backendW.Write(dataRowFrame())

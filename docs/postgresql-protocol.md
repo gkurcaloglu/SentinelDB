@@ -330,31 +330,80 @@ needs can be built and tested in isolation.
 
 `internal/gateway/extended_runtime.go` adds a standalone,
 connection-local `gateway.ExtendedRuntime` that combines frontend
-plan-registration events (`RegisterForwardedOperation`,
-`SubmitSyntheticError`) and decoded backend-frame events into a single
-ordered stream of client writes, using the `protocol.ResponseSequencer`
-described above internally. It lives in a new `internal/gateway` package
-— deliberately *not* inside `internal/protocol`, which every Extended
-Query component so far has kept free of I/O and goroutines by design —
-following the same dependency direction already used by
-`internal/firewall` and `internal/masking` (both depend on
-`internal/protocol`, never the reverse).
+operation requests, locally generated synthetic `ErrorResponse` events,
+and decoded backend-frame events into a single ordered stream of client
+writes, using the `protocol.ResponseSequencer` described above
+internally. It lives in a new `internal/gateway` package — deliberately
+*not* inside `internal/protocol`, which every Extended Query component so
+far has kept free of I/O and goroutines by design — following the same
+dependency direction already used by `internal/firewall` and
+`internal/masking` (both depend on `internal/protocol`, never the
+reverse).
 
 Unlike the earlier Extended Query components, `ExtendedRuntime` *does*
 use goroutines, channels, and real `net.Conn`-shaped I/O
-(`io.ReadCloser`/`io.WriteCloser`): one backend-reader goroutine decodes
-bytes from the upstream connection into `protocol.Message` values and
-feeds them, and its own read/decode failures, through a bounded channel;
-one event-loop goroutine — the **only** component that ever writes to the
-client — drains that channel and a second, separate bounded channel of
-frontend events, calling into the `ResponseSequencer` synchronously (it
-is never called concurrently) and writing every resulting `OutputAction`
-in order. The backend reader applies real backpressure: a full backend
-event channel blocks further reads from the real upstream socket rather
-than dropping frames. The runtime owns shutdown of both connections
-itself — closing them is what unblocks an in-progress blocked
-`Read`/`Write` call, since context cancellation alone cannot interrupt an
-arbitrary `io.Reader`/`io.Writer`.
+(`io.ReadCloser`/`io.WriteCloser`).
+
+**`ExtendedRuntime` exclusively owns `protocol.State` while running.**
+`protocol.State` is designed for serial access by a single goroutine.
+`NewExtendedRuntime` accepts a freshly constructed `*protocol.State`
+purely for dependency injection — from the moment `Run` starts, the
+event-loop goroutine is `State`'s sole owner and sole mutator, and no
+public method ever exposes the underlying `*State`. Frontend producers
+never call `State.Create*`/`Apply*`/lookup methods themselves; instead
+they submit a `FrontendOperationRequest` (statement/portal names, query
+text, parameter OIDs/format codes/null flags/result formats — **never**
+Bind parameter *values*) via `RegisterFrontendOperation`, which copies
+every slice field before it crosses the channel boundary. The event loop
+calls the matching `State.Create*` method and registers the result with
+`ResponseSequencer` in the *same* turn, returning an immutable
+`FrontendRegistration` snapshot only once both steps — plus processing of
+any output actions they immediately produced — have fully succeeded. A
+future frontend caller may forward the original frontend frame upstream
+only after that success.
+
+**State/sequencer divergence fails the connection closed.** Creating a
+`State` operation and registering it with the sequencer are two separate
+steps; if `State.Create*` itself fails (e.g. an unknown statement name),
+that is guaranteed mutation-free and is returned as an ordinary rejection
+— the runtime stays healthy. But if `State.Create*` *succeeds* and the
+following `ResponseSequencer.AddForwardedOperation` call fails (e.g. plan
+capacity exhausted), `State` has already mutated while the sequencer's
+plan does not reflect it — an unrecoverable divergence. The runtime never
+attempts a speculative rollback; it returns `ErrFrontendRegistrationDiverged`,
+permanently terminates, and closes both connections. No caller is ever
+told it can safely retry or forward a frame after this.
+
+**Accepted frontend submissions always resolve definitively.** Caller
+context cancellation can only abort a `RegisterFrontendOperation` /
+`SubmitSyntheticError` call *before* the request is enqueued into the
+runtime-owned channel. Once enqueued, ownership transfers to the runtime
+and the caller is guaranteed one of exactly two outcomes: the event
+loop's own acknowledgement, or runtime termination — never an ambiguous
+`ctx.Err()` for an event that may already be in flight or already
+processed.
+
+**Truncated backend messages at end-of-input fail closed, not clean.**
+`protocol.Decoder.Finalize()` reports whether any buffered-but-incomplete
+bytes remain (a partial header, a frame with a truncated body, or a
+complete frame followed by a partial next one) without exposing their
+content. The backend reader calls it whenever the upstream read returns
+EOF: a truncated remainder is treated as a backend protocol failure
+(never both a decode failure and a clean stop for the same read-ending),
+even when the sequencer has no other pending work — a real PostgreSQL
+frame cannot be recovered from mid-message.
+
+One backend-reader goroutine decodes bytes from the upstream connection
+into `protocol.Message` values and feeds them, and its own read/decode/
+truncation failures, through a bounded channel; one event-loop goroutine
+— the **only** component that ever touches `State`, calls
+`ResponseSequencer`, or writes to the client — drains that channel and a
+second, separate bounded channel of frontend events. The backend reader
+applies real backpressure: a full backend event channel blocks further
+reads from the real upstream socket rather than dropping frames. The
+runtime owns shutdown of both connections itself — closing them is what
+unblocks an in-progress blocked `Read`/`Write` call, since context
+cancellation alone cannot interrupt an arbitrary `io.Reader`/`io.Writer`.
 
 **This is still not part of the live gateway.** `ExtendedRuntime` is not
 constructed or called anywhere in `cmd/gateway`, `firewall.Gate`, or

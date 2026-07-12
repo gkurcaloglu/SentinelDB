@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"encoding/binary"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -198,4 +200,125 @@ func FuzzDecoderWrite(f *testing.F) {
 		run(NewClientDecoder(func(Message) {}, func(error) {}))
 		run(NewServerDecoder(func(Message) {}, func(error) {}))
 	})
+}
+
+// --- Finalize (truncated-message-at-EOF detection) ------------------------
+
+func TestDecoder_Finalize_ZeroBufferedBytes_Clean(t *testing.T) {
+	dec := NewServerDecoder(func(Message) {}, func(error) {
+		t.Fatal("unexpected decode error")
+	})
+	if err := dec.Finalize(); err != nil {
+		t.Fatalf("expected nil (clean), got %v", err)
+	}
+}
+
+func TestDecoder_Finalize_AfterCompleteMessage_Clean(t *testing.T) {
+	dec := NewServerDecoder(func(Message) {}, func(error) {
+		t.Fatal("unexpected decode error")
+	})
+	dec.Write(buildTestFrame(MsgReadyForQuery, []byte{'I'}))
+	if err := dec.Finalize(); err != nil {
+		t.Fatalf("expected nil (clean) after a complete message, got %v", err)
+	}
+}
+
+func TestDecoder_Finalize_AfterSeveralCompleteMessages_Clean(t *testing.T) {
+	dec := NewServerDecoder(func(Message) {}, func(error) {
+		t.Fatal("unexpected decode error")
+	})
+	dec.Write(buildTestFrame(MsgReadyForQuery, []byte{'I'}))
+	dec.Write(buildTestFrame(MsgNoticeResponse, []byte{'S', 'N', 0, 0}))
+	dec.Write(buildTestFrame(MsgParseComplete, nil))
+	if err := dec.Finalize(); err != nil {
+		t.Fatalf("expected nil (clean) after several complete messages, got %v", err)
+	}
+}
+
+func TestDecoder_Finalize_PartialHeaderBytes_Truncated(t *testing.T) {
+	for n := 1; n <= 4; n++ {
+		full := buildTestFrame(MsgReadyForQuery, []byte{'I'})
+		dec := NewServerDecoder(func(Message) {}, func(error) {
+			t.Fatal("unexpected decode error (Finalize, not Write, should report truncation)")
+		})
+		dec.Write(full[:n])
+		if err := dec.Finalize(); !errors.Is(err, ErrTruncatedMessage) {
+			t.Fatalf("n=%d: expected ErrTruncatedMessage, got %v", n, err)
+		}
+	}
+}
+
+func TestDecoder_Finalize_TruncatedBody_Truncated(t *testing.T) {
+	full := buildTestFrame(MsgErrorResponse, []byte{'S', 'E', 'R', 'R', 'O', 'R', 0, 0})
+	dec := NewServerDecoder(func(Message) {}, func(error) {
+		t.Fatal("unexpected decode error")
+	})
+	// tag(1) + length(4) present, but body truncated short of the
+	// declared length.
+	dec.Write(full[:8])
+	if err := dec.Finalize(); !errors.Is(err, ErrTruncatedMessage) {
+		t.Fatalf("expected ErrTruncatedMessage, got %v", err)
+	}
+}
+
+func TestDecoder_Finalize_CompleteFramePlusPartialNext_Truncated(t *testing.T) {
+	var got []Message
+	dec := NewServerDecoder(func(m Message) { got = append(got, m) }, func(error) {
+		t.Fatal("unexpected decode error")
+	})
+	complete := buildTestFrame(MsgReadyForQuery, []byte{'I'})
+	partialNext := buildTestFrame(MsgNoticeResponse, []byte{'S', 'N', 0, 0})[:3]
+	dec.Write(append(append([]byte{}, complete...), partialNext...))
+
+	if len(got) != 1 {
+		t.Fatalf("expected exactly the one complete frame relayed, got %d: %+v", len(got), got)
+	}
+	if err := dec.Finalize(); !errors.Is(err, ErrTruncatedMessage) {
+		t.Fatalf("expected ErrTruncatedMessage for the dangling partial next frame, got %v", err)
+	}
+}
+
+func TestDecoder_Finalize_AfterFailure_Clean(t *testing.T) {
+	dec := NewServerDecoder(func(Message) {}, func(error) {})
+	dec.Write([]byte{byte(MsgErrorResponse), 0xFF, 0xFF, 0xFF, 0xFF}) // invalid length -> fail()
+	if dec.getPhase() != phasePassthrough {
+		t.Fatal("test precondition failed: expected passthrough after invalid length")
+	}
+	// The decoder already ran its OWN fail-closed path (bkz. fail,
+	// buf cleared); Finalize must not re-report this as truncation.
+	if err := dec.Finalize(); err != nil {
+		t.Fatalf("expected nil after an already-failed decoder, got %v", err)
+	}
+}
+
+func TestDecoder_Finalize_Idempotent(t *testing.T) {
+	dec := NewServerDecoder(func(Message) {}, func(error) {})
+	dec.Write(buildTestFrame(MsgReadyForQuery, []byte{'I'})[:2])
+	err1 := dec.Finalize()
+	err2 := dec.Finalize()
+	if !errors.Is(err1, ErrTruncatedMessage) || !errors.Is(err2, ErrTruncatedMessage) {
+		t.Fatalf("expected repeated Finalize calls to return the same result, got %v then %v", err1, err2)
+	}
+}
+
+func TestDecoder_Finalize_NeverExposesBufferedContent(t *testing.T) {
+	const secretMarker = "SECRET_DECODER_FINALIZE_MARKER"
+	dec := NewServerDecoder(func(Message) {}, func(error) {})
+	frame := buildTestFrame(MsgErrorResponse, append([]byte{'M'}, append([]byte(secretMarker), 0, 0)...))
+	dec.Write(frame[:len(frame)-2]) // leave it incomplete
+	err := dec.Finalize()
+	if !errors.Is(err, ErrTruncatedMessage) {
+		t.Fatalf("expected ErrTruncatedMessage, got %v", err)
+	}
+	if strings.Contains(err.Error(), secretMarker) {
+		t.Fatalf("Finalize error leaked buffered content: %v", err)
+	}
+}
+
+func buildTestFrame(t MessageType, body []byte) []byte {
+	length := make([]byte, 4)
+	binary.BigEndian.PutUint32(length, uint32(len(body)+4))
+	raw := append([]byte{byte(t)}, length...)
+	raw = append(raw, body...)
+	return raw
 }

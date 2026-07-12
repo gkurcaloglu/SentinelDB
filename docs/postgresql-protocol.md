@@ -222,6 +222,110 @@ is still rejected fail-closed at runtime, exactly as described above —
 this component exists purely so the correlation logic a later stage needs
 can be built and tested in isolation.
 
+### Response sequencer (no runtime wiring)
+
+`internal/protocol/extended_sequence.go` adds a standalone
+`protocol.ResponseSequencer` that combines three inputs into a single,
+correctly-ordered stream of client-output actions: response-plan events
+registered by frontend processing (`AddForwardedOperation`), decoded
+backend messages (`HandleBackendMessage`, which uses a `BackendCorrelator`
+internally), and locally generated synthetic `ErrorResponse` frames
+(`AddSyntheticError`, for a future policy-rejection path that never
+reaches the real server). Like `protocol.State` and
+`protocol.BackendCorrelator`, it is a pure, connection-local component: no
+socket I/O, no goroutines, no logging. Every `OutputAction` it returns
+carries only safe metadata (an action kind, message type, cycle/operation
+identifiers, and an independent copy of the exact bytes to relay) — never
+a client-supplied statement/portal name.
+
+**Registration-before-forwarding is a caller contract, not something the
+sequencer enforces by watching the network.** A caller must call the
+matching `State.Create*` method, then `AddForwardedOperation` with the
+returned snapshot, and only afterward actually write the original
+frontend bytes upstream. `Sync` is registered the same way as any other
+operation (`Flush` and `Terminate` have no backend acknowledgement and
+never get a plan unit at all). Any backend message that arrives without a
+matching, correctly-ordered plan registration is rejected fail-closed
+(`ErrPlanMismatch`, `ErrNoPendingOperation`) without touching `State`.
+
+**A queued synthetic error only ever emits once it reaches the plan
+head.** If the plan is empty, `AddSyntheticError` emits its frame
+immediately ("blocked-first"). If a forwarded operation is still ahead of
+it, the synthetic waits — the sequencer drains every synthetic unit newly
+exposed at the head immediately after any real backend message completes
+or fails the operation in front of it, so a client always sees completed
+real work before a synthetic rejection that was queued behind it.
+
+**A real backend `ErrorResponse` takes precedence over an already-queued
+synthetic for the same cycle.** Once the real server reports a real
+failure, every operation it abandoned in that cycle (per
+`BackendCorrelator`/`State`'s existing same-cycle abandonment) is removed
+from the plan without producing output, and any synthetic error still
+queued for that same cycle is suppressed — it is never emitted, since the
+real failure already accounts for that cycle's error to the client. An
+abandoned operation whose plan registration hasn't arrived yet is
+tombstoned so a later, contract-violating `AddForwardedOperation` call for
+it is rejected rather than silently treated as live; a duplicate
+`AddSyntheticError` for an already-blocked cycle (whether blocked by our
+own earlier synthetic or by a real failure) is silently suppressed, one
+documented rule for both cases.
+
+**`Sync -> ErrorResponse -> ReadyForQuery` passes straight through.**
+Matching `BackendCorrelator`'s own handling of this valid PostgreSQL
+sequence, the sequencer relays the `ErrorResponse` frame without popping
+the `Sync` plan unit or touching any cycle bookkeeping; the following
+`ReadyForQuery` completes that same `Sync` normally.
+
+**Asynchronous backend messages never touch the plan.**
+`NoticeResponse`/`ParameterStatus`/`NotificationResponse` are relayed
+(after `BackendCorrelator`'s own structural validation) regardless of
+what the current plan head is, and never affect its readiness.
+
+**An `ErrorResponse` with no pending `State` operation at all is treated
+as a connection-level backend failure.** The sequencer relays the frame
+and then reports that the connection must be terminated
+(`ActionTerminateConnection`) — no plan/`State` interaction is attempted,
+and the sequencer permanently stops accepting further calls
+(`ErrSequencerTerminal`) afterward.
+
+**Bounded by construction.** `SequencerLimits` caps the plan queue depth,
+a single synthetic frame's size, the number of abandoned-operation
+tombstones retained, and the number of concurrently tracked cycles — all
+must be positive. Limit failures reject the call without any partial
+mutation. All per-cycle bookkeeping (block state, tombstones) is released
+the moment that cycle's matching `ReadyForQuery` is processed, regardless
+of how many other cycles remain outstanding.
+
+**Abandoned-operation tombstone capacity is a correctness limit, not a
+best-effort cache.** When a real backend `ErrorResponse` abandons later
+same-cycle operations, every abandoned operation that has no
+already-registered plan unit to remove directly *requires* a tombstone
+(otherwise a later, contract-violating `AddForwardedOperation` call for
+that same operation ID could be wrongly accepted as live). The sequencer
+computes the complete set of newly required tombstones *before* mutating
+anything and only ever applies the transition atomically: if the full set
+fits within `SequencerLimits.MaxAbandonedTombstones`, every tombstone is
+recorded, the abandoned plan units are removed, and same-cycle synthetic
+units are suppressed, all at once; if it does not fit, **zero** mutation
+is applied for that failure — live tombstones are never silently evicted
+and a partial tombstone set is never recorded. Instead, the real
+`ErrorResponse` is relayed exactly once, `ActionTerminateConnection` is
+returned immediately after it, and the sequencer transitions permanently
+to its terminal state (`ErrSequencerTerminal` for every subsequent
+`AddForwardedOperation`/`AddSyntheticError`/`HandleBackendMessage` call).
+This is a resource-exhaustion fail-closed connection termination, exactly
+like the "no pending operation at all" connection-level `ErrorResponse`
+case above — retaining incomplete abandonment-tracking state and
+continuing as if the sequencer were still fully correct is never an
+option.
+
+**None of this is wired into runtime networking or client output.**
+`ResponseSequencer` is not constructed or called anywhere in
+`cmd/gateway`, `firewall.Gate`, or `masking.Transformer`. Extended Query
+is still rejected fail-closed at runtime, exactly as described above —
+this component exists purely so the response-ordering logic a later stage
+needs can be built and tested in isolation.
+
 ## SSLRequest / GSSENCRequest rejection
 
 SentinelDB always answers `SSLRequest` and `GSSENCRequest` with a single

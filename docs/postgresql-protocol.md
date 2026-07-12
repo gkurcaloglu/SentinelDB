@@ -183,6 +183,38 @@ target that has since been legitimately destroyed by some other event,
 such as `ReadyForQuery('I')` transaction-boundary portal invalidation —
 falling back to "empty" is always safe, a dangling pointer never is).
 
+**`Sync -> ErrorResponse -> ReadyForQuery` is a valid sequence, not a
+failure.** PostgreSQL can emit an `ErrorResponse` while processing `Sync`
+itself; per the protocol documentation this does **not** begin
+discard-until-`Sync` (the message being processed is already `Sync`), and
+PostgreSQL still emits exactly one `ReadyForQuery` for that `Sync`. The
+correlator recognizes a structurally valid `ErrorResponse` received while
+`Sync` is the pending head as valid: it neither pops nor completes the
+`Sync`, abandons nothing, and mutates no statement/portal/cycle/transaction
+state — it returns an intermediate result identifying the still-pending
+`Sync`, and the following `ReadyForQuery` completes that same `Sync`
+normally. A second `ErrorResponse` for the same still-pending `Sync` is
+rejected as impossible backend ordering, without mutation.
+
+**`CorrelationResult` never carries client-supplied names.**
+`FailedOperation` and `AbandonedOperations` use a dedicated
+`CorrelatedOperation` snapshot type (operation ID, cycle, kind, and target
+generation ID only) rather than `State`'s own `PendingOperation`, which
+carries the statement/portal name the client supplied. Every value
+returned this way is an independent copy — mutating a returned
+`CorrelatedOperation` or its containing slice can never affect `State` or
+a later correlation result.
+
+**Asynchronous backend messages (`NoticeResponse`/`ParameterStatus`/
+`NotificationResponse`) are structurally validated, never retained.** The
+correlator checks each message's wire framing (field framing for
+`NoticeResponse`, exactly two NUL-terminated strings for
+`ParameterStatus`, a process ID followed by two NUL-terminated strings for
+`NotificationResponse`) and rejects malformed bodies without touching any
+pending operation or `Describe` substate — but the field/string/PID
+*values* themselves are never read into a Go string, returned, or stored;
+only their framing (NUL-terminator positions) is inspected.
+
 **None of this is wired into runtime networking or client output.**
 `BackendCorrelator` is not constructed or called anywhere in
 `cmd/gateway`, `firewall.Gate`, or `masking.Transformer`. Extended Query

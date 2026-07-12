@@ -40,7 +40,20 @@ func commandCompleteMsg(tag string) Message {
 	return backendMsg(MsgCommandComplete, append([]byte(tag), 0))
 }
 
-func minimalErrorResponse() Message { return backendMsg(MsgErrorResponse, []byte{0}) }
+// minimalErrorResponse returns the minimal VALID ErrorResponse under the
+// tightened field-framing rule (bkz. validateFieldFraming): at least one
+// non-terminal field is required - a terminal-only body is rejected.
+func minimalErrorResponse() Message {
+	body := []byte{'S'}
+	body = append(body, []byte("ERROR")...)
+	body = append(body, 0)
+	body = append(body, 0) // terminator
+	return backendMsg(MsgErrorResponse, body)
+}
+
+// terminalOnlyErrorResponse returns a body consisting solely of the
+// terminal zero field-code byte - invalid under the tightened rule.
+func terminalOnlyErrorResponse() Message { return backendMsg(MsgErrorResponse, []byte{0}) }
 
 func fieldedErrorResponse(text string) Message {
 	body := []byte{'S'}
@@ -762,7 +775,7 @@ func TestCorrelator_NoticeResponse_NoPendingOperation(t *testing.T) {
 func TestCorrelator_NoticeResponse_DuringExecute(t *testing.T) {
 	s, c := setupExecuteHead(t)
 	before := snapshotState(s)
-	res, err := c.Handle(backendMsg(MsgNoticeResponse, []byte{0}))
+	res, err := c.Handle(backendMsg(MsgNoticeResponse, []byte{'S', 'N', 'O', 'T', 'I', 'C', 'E', 0, 0}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1222,11 +1235,19 @@ func TestCorrelator_Atomicity_WrongAcknowledgementLeavesStateUnchanged(t *testin
 
 func TestCorrelator_Atomicity_ErrorResponseAbandonmentValidationFailureLeavesStateUnchanged(t *testing.T) {
 	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT bad", nil)
 	s.CreateSync()
+	// First ErrorResponse targets the Parse head normally (valid, mutates).
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Second ErrorResponse now targets the Sync head - this is the
+	// "validation failure" case this test actually exercises: a
+	// malformed body against the Sync head must leave State unchanged.
 	before := snapshotState(s)
-	_, err := c.Handle(minimalErrorResponse())
-	if !errors.Is(err, ErrErrorResponseForSync) {
-		t.Fatalf("expected ErrErrorResponseForSync, got %v", err)
+	_, err := c.Handle(backendMsg(MsgErrorResponse, []byte{1})) // malformed: no terminator
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
 	}
 	assertStateUnchanged(t, before, snapshotState(s))
 }
@@ -1290,6 +1311,482 @@ func TestCorrelator_MalformedMessage_ErrorNeverContainsSecretMarker(t *testing.T
 	}
 }
 
+// --- Sync -> ErrorResponse -> ReadyForQuery ---------------------------
+//
+// PostgreSQL can emit Sync -> ErrorResponse -> ReadyForQuery when an error
+// occurs while processing Sync itself (bkz.
+// https://www.postgresql.org/docs/current/protocol-flow.html, "Extended
+// Query"). This does not begin discard-until-Sync (the message being
+// processed is already Sync) and PostgreSQL still emits exactly one
+// ReadyForQuery for that Sync.
+
+func TestCorrelator_SyncErrorResponse_ThenReadyForQuery_I(t *testing.T) {
+	s, c := newCorrelator(t)
+	syncOp, _ := s.CreateSync()
+
+	res, err := c.Handle(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsErrorResponse || !res.Intermediate || res.OperationCompleted {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if res.OperationKind != OpSync || res.OperationID != syncOp.ID {
+		t.Fatalf("expected result to identify the pending Sync, got %+v", res)
+	}
+
+	rfqRes, err := c.Handle(rfqMsg(TxStatusIdle))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !rfqRes.CycleCompleted || rfqRes.OperationID != syncOp.ID {
+		t.Fatalf("expected ReadyForQuery to complete the same Sync, got %+v", rfqRes)
+	}
+}
+
+func TestCorrelator_SyncErrorResponse_ThenReadyForQuery_T(t *testing.T) {
+	s, c := newCorrelator(t)
+	syncOp, _ := s.CreateSync()
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rfqRes, err := c.Handle(rfqMsg(TxStatusInTransaction))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !rfqRes.CycleCompleted || rfqRes.OperationID != syncOp.ID {
+		t.Fatalf("expected ReadyForQuery to complete the same Sync, got %+v", rfqRes)
+	}
+}
+
+func TestCorrelator_SyncErrorResponse_ThenReadyForQuery_E(t *testing.T) {
+	s, c := newCorrelator(t)
+	syncOp, _ := s.CreateSync()
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rfqRes, err := c.Handle(rfqMsg(TxStatusFailedTransaction))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !rfqRes.CycleCompleted || rfqRes.OperationID != syncOp.ID {
+		t.Fatalf("expected ReadyForQuery to complete the same Sync, got %+v", rfqRes)
+	}
+}
+
+func TestCorrelator_SyncErrorResponse_DoesNotConsumeSync(t *testing.T) {
+	s, c := newCorrelator(t)
+	syncOp, _ := s.CreateSync()
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	head, ok := s.HeadPendingOperation()
+	if !ok || head.ID != syncOp.ID {
+		t.Fatalf("expected Sync to remain the pending head, got %+v (ok=%v)", head, ok)
+	}
+}
+
+func TestCorrelator_SyncErrorResponse_DoesNotAbandonNextCycle(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateSync()
+	laterOp, laterGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.Statement(laterGen.ID); !ok {
+		t.Fatal("expected the next cycle's statement generation to remain")
+	}
+	found := false
+	for _, op := range s.PendingOperations() {
+		if op.ID == laterOp.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected the next cycle's operation to remain queued")
+	}
+}
+
+func TestCorrelator_SyncErrorResponse_DoesNotAlterPortalsStatementsOrTxStatus(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	s.CreateBind("p1", "s1", nil, nil, nil)
+	c.Handle(emptyBackendMsg(MsgBindComplete))
+	s.CreateSync()
+
+	before := snapshotState(s)
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	after := snapshotState(s)
+	if before.statements != after.statements || before.portals != after.portals || before.txStatus != after.txStatus {
+		t.Fatalf("expected statements/portals/txStatus unchanged: before=%+v after=%+v", before, after)
+	}
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected s1 to remain committed")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected p1 to remain committed")
+	}
+}
+
+func TestCorrelator_DuplicateSyncErrorResponse_RejectedWithoutMutation(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateSync()
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	before := snapshotState(s)
+	_, err := c.Handle(minimalErrorResponse())
+	if !errors.Is(err, ErrImpossibleBackendOrdering) {
+		t.Fatalf("expected ErrImpossibleBackendOrdering, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_MalformedSyncErrorResponse_RejectedWithoutMutation(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateSync()
+	before := snapshotState(s)
+	_, err := c.Handle(backendMsg(MsgErrorResponse, []byte{1})) // no terminator
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_AsyncMessagesBetweenSyncErrorResponseAndReadyForQuery_Accepted(t *testing.T) {
+	s, c := newCorrelator(t)
+	syncOp, _ := s.CreateSync()
+	if _, err := c.Handle(minimalErrorResponse()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	res, err := c.Handle(backendMsg(MsgNoticeResponse, []byte{'S', 'N', 'O', 'T', 'I', 'C', 'E', 0, 0}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Async {
+		t.Fatal("expected Async result")
+	}
+
+	rfqRes, err := c.Handle(rfqMsg(TxStatusIdle))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !rfqRes.CycleCompleted || rfqRes.OperationID != syncOp.ID {
+		t.Fatalf("expected ReadyForQuery to still complete the same Sync, got %+v", rfqRes)
+	}
+}
+
+// --- Sanitized correlation-result API (no client names) --------------
+
+func TestCorrelator_FailedOperation_ContainsNoNameField(t *testing.T) {
+	s, c := newCorrelator(t)
+	const secretName = "SECRET_STATEMENT_NAME_MARKER"
+	op, _, _ := s.CreateParse(secretName, "SELECT 1", nil)
+
+	res, err := c.Handle(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.FailedOperation.ID != op.ID {
+		t.Fatalf("expected FailedOperation.ID %d, got %d", op.ID, res.FailedOperation.ID)
+	}
+	dump := fmt.Sprintf("%+v", res.FailedOperation)
+	if strings.Contains(dump, secretName) {
+		t.Fatalf("FailedOperation leaked the statement name: %s", dump)
+	}
+}
+
+func TestCorrelator_AbandonedOperations_ContainNoNames(t *testing.T) {
+	s, c := newCorrelator(t)
+	const secretName = "SECRET_ABANDONED_NAME_MARKER"
+	failOp, _, _ := s.CreateParse("s0", "SELECT bad", nil)
+	laterOp, _, _ := s.CreateParse(secretName, "SELECT 1", nil)
+
+	res, err := c.Handle(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.FailedOperation.ID != failOp.ID {
+		t.Fatalf("unexpected FailedOperation: %+v", res.FailedOperation)
+	}
+	if len(res.AbandonedOperations) != 1 || res.AbandonedOperations[0].ID != laterOp.ID {
+		t.Fatalf("unexpected AbandonedOperations: %+v", res.AbandonedOperations)
+	}
+	dump := fmt.Sprintf("%+v", res.AbandonedOperations)
+	if strings.Contains(dump, secretName) {
+		t.Fatalf("AbandonedOperations leaked the statement name: %s", dump)
+	}
+}
+
+func TestCorrelator_ResultAndErrorFormatting_NeverContainNameMarkers(t *testing.T) {
+	s, c := newCorrelator(t)
+	const secretStmt = "SECRET_FMT_STMT_MARKER"
+	const secretPortal = "SECRET_FMT_PORTAL_MARKER"
+	s.CreateParse(secretStmt, "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	s.CreateBind(secretPortal, secretStmt, nil, nil, nil)
+	failOp, _, _ := s.CreateParse("s2", "SELECT bad", nil)
+	_ = failOp
+
+	res, err := c.Handle(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dump := fmt.Sprintf("%+v", res)
+	if strings.Contains(dump, secretStmt) || strings.Contains(dump, secretPortal) {
+		t.Fatalf("CorrelationResult formatting leaked a name marker: %s", dump)
+	}
+}
+
+func TestCorrelator_SanitizedOperation_IDKindCycleGenerationCorrect(t *testing.T) {
+	s, c := newCorrelator(t)
+	failOp, failGen, _ := s.CreateParse("s0", "SELECT bad", nil)
+	laterOp, laterGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+
+	res, err := c.Handle(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.FailedOperation.ID != failOp.ID || res.FailedOperation.Kind != OpParse ||
+		res.FailedOperation.Cycle != failOp.Cycle || res.FailedOperation.TargetGeneration != failGen.ID {
+		t.Fatalf("unexpected FailedOperation: %+v", res.FailedOperation)
+	}
+	if len(res.AbandonedOperations) != 1 {
+		t.Fatalf("expected 1 abandoned operation, got %d", len(res.AbandonedOperations))
+	}
+	ab := res.AbandonedOperations[0]
+	if ab.ID != laterOp.ID || ab.Kind != OpParse || ab.Cycle != laterOp.Cycle || ab.TargetGeneration != laterGen.ID {
+		t.Fatalf("unexpected AbandonedOperations[0]: %+v", ab)
+	}
+}
+
+func TestCorrelator_ModifyingReturnedAbandonedSlice_DoesNotAffectStateOrLaterResults(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s0", "SELECT bad", nil)
+	laterOp, laterGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+
+	res, err := c.Handle(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.AbandonedOperations) != 1 {
+		t.Fatalf("expected 1 abandoned operation, got %d", len(res.AbandonedOperations))
+	}
+	res.AbandonedOperations[0].ID = 9999
+	res.AbandonedOperations[0].TargetGeneration = 9999
+	res.AbandonedOperations = append(res.AbandonedOperations, CorrelatedOperation{ID: 8888})
+
+	// A later, independent correlation for an unrelated operation must be
+	// completely unaffected by mutating the earlier returned slice.
+	s.CreateParse("s2", "SELECT 2", nil)
+	res2, err := c.Handle(emptyBackendMsg(MsgParseComplete))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res2.AbandonedOperations) != 0 {
+		t.Fatalf("expected the later result to have no abandoned operations of its own, got %+v", res2.AbandonedOperations)
+	}
+	if _, ok := s.Statement(laterGen.ID); ok {
+		t.Fatal("expected the originally-abandoned generation to remain removed, unaffected by the mutated snapshot")
+	}
+	_ = laterOp
+}
+
+// --- Asynchronous message structural validation -----------------------
+
+func TestCorrelator_NoticeResponse_ValidAccepted(t *testing.T) {
+	_, c := newCorrelator(t)
+	res, err := c.Handle(backendMsg(MsgNoticeResponse, []byte{'S', 'N', 'O', 'T', 'I', 'C', 'E', 0, 'C', '0', '0', '0', '0', '0', 0, 0}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Async {
+		t.Fatal("expected Async result")
+	}
+}
+
+func TestCorrelator_NoticeResponse_MalformedRejected(t *testing.T) {
+	s, c := newCorrelator(t)
+	before := snapshotState(s)
+	_, err := c.Handle(backendMsg(MsgNoticeResponse, []byte{0})) // terminal-only
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_ParameterStatus_ValidAccepted(t *testing.T) {
+	_, c := newCorrelator(t)
+	res, err := c.Handle(backendMsg(MsgParameterStatus, []byte{'k', 'e', 'y', 0, 'v', 'a', 'l', 0}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Async {
+		t.Fatal("expected Async result")
+	}
+}
+
+func TestCorrelator_ParameterStatus_MalformedRejected(t *testing.T) {
+	s, c := newCorrelator(t)
+	before := snapshotState(s)
+	_, err := c.Handle(backendMsg(MsgParameterStatus, []byte{'k', 'e', 'y', 0})) // missing second string
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_NotificationResponse_ValidAccepted(t *testing.T) {
+	_, c := newCorrelator(t)
+	body := append([]byte{0, 0, 0, 42}, append([]byte("chan"), 0, 'p', 'l', 0)...)
+	res, err := c.Handle(backendMsg(MsgNotificationResponse, body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Async {
+		t.Fatal("expected Async result")
+	}
+}
+
+func TestCorrelator_NotificationResponse_MalformedRejected(t *testing.T) {
+	s, c := newCorrelator(t)
+	before := snapshotState(s)
+	_, err := c.Handle(backendMsg(MsgNotificationResponse, []byte{0, 0, 0})) // too short for even the PID
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_MalformedAsync_DoesNotConsumePendingOperation(t *testing.T) {
+	s, c := newCorrelator(t)
+	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	before := snapshotState(s)
+	if _, err := c.Handle(backendMsg(MsgNoticeResponse, []byte{0})); !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+	head, ok := s.HeadPendingOperation()
+	if !ok || head.ID != op.ID {
+		t.Fatalf("expected the pending Parse to remain the head, got %+v (ok=%v)", head, ok)
+	}
+}
+
+func TestCorrelator_MalformedAsync_DoesNotAlterDescribeSubstate(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	dop, _ := s.CreateDescribeStatement("s1")
+	c.Handle(paramDescMsg(nil))
+
+	if _, err := c.Handle(backendMsg(MsgParameterStatus, []byte{'k', 0})); !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	if !c.describeParamSeen[dop.ID] {
+		t.Fatal("expected Describe substate to remain 'seen', unaffected by an unrelated malformed async message")
+	}
+}
+
+// --- ErrorResponse field framing (tightened) ---------------------------
+
+func TestCorrelator_ErrorResponse_TerminalOnlyRejected(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	before := snapshotState(s)
+	_, err := c.Handle(terminalOnlyErrorResponse())
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_ErrorResponse_OneValidFieldAccepted(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	body := append([]byte{'S'}, append([]byte("ERROR"), 0, 0)...)
+	res, err := c.Handle(backendMsg(MsgErrorResponse, body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsErrorResponse {
+		t.Fatal("expected IsErrorResponse")
+	}
+}
+
+func TestCorrelator_ErrorResponse_MultipleValidFieldsAccepted(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	body := []byte{'S'}
+	body = append(body, []byte("ERROR")...)
+	body = append(body, 0)
+	body = append(body, 'C')
+	body = append(body, []byte("42601")...)
+	body = append(body, 0)
+	body = append(body, 'M')
+	body = append(body, []byte("syntax error")...)
+	body = append(body, 0)
+	body = append(body, 0) // terminator
+	res, err := c.Handle(backendMsg(MsgErrorResponse, body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsErrorResponse {
+		t.Fatal("expected IsErrorResponse")
+	}
+}
+
+func TestCorrelator_ErrorResponse_MissingFieldValueTerminatorRejected(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	before := snapshotState(s)
+	body := append([]byte{'S'}, []byte("ERROR")...) // no NUL after value, no terminator
+	_, err := c.Handle(backendMsg(MsgErrorResponse, body))
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_ErrorResponse_MissingFinalTerminatorRejected(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	before := snapshotState(s)
+	body := append([]byte{'S'}, append([]byte("ERROR"), 0)...) // value terminated, but no final 0x00
+	_, err := c.Handle(backendMsg(MsgErrorResponse, body))
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_ErrorResponse_TrailingBytesRejected(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	before := snapshotState(s)
+	body := append([]byte{'S'}, append([]byte("ERROR"), 0, 0, 0xFF)...) // extra byte after terminator
+	_, err := c.Handle(backendMsg(MsgErrorResponse, body))
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
+func TestCorrelator_ErrorResponse_ValidationFailureLeavesCorrelatorStateUnchanged(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	before := snapshotState(s)
+	_, err := c.Handle(terminalOnlyErrorResponse())
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	assertStateUnchanged(t, before, snapshotState(s))
+}
+
 // --- Fuzz / randomized sequence test ---------------------------------
 //
 // FuzzBackendCorrelatorSequence drives a short, bounded, byte-driven
@@ -1341,13 +1838,28 @@ func FuzzBackendCorrelatorSequence(f *testing.F) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		r := &opReader{data: data}
-		stmtNames := []string{"", "s1", "s2"}
-		portalNames := []string{"", "p1", "p2"}
+		const stmtNameMarker = "SECRET_STMT_NAME_MARKER"
+		const portalNameMarker = "SECRET_PORTAL_NAME_MARKER"
+		// stmtNames/portalNames intentionally include a recognizable
+		// marker-bearing name, so every named Parse/Bind exercised by the
+		// randomized sequence periodically creates objects under a name
+		// that must NEVER leak into any CorrelationResult or error text
+		// (bkz. gereksinim 2, "Remove client names from CorrelationResult").
+		stmtNames := []string{"", "s1", stmtNameMarker}
+		portalNames := []string{"", "p1", portalNameMarker}
 		const secretMarker = "SECRET_FUZZ_MARKER"
 
+		checkNoMarkers := func(s string) {
+			if strings.Contains(s, secretMarker) || strings.Contains(s, stmtNameMarker) || strings.Contains(s, portalNameMarker) {
+				t.Fatalf("value leaked a secret/name marker: %s", s)
+			}
+		}
+		checkResultNoMarkers := func(res CorrelationResult) {
+			checkNoMarkers(fmt.Sprintf("%+v", res))
+		}
 		checkErrNoSecret := func(err error) {
-			if err != nil && strings.Contains(err.Error(), secretMarker) {
-				t.Fatalf("error text leaked secret marker: %v", err)
+			if err != nil {
+				checkNoMarkers(err.Error())
 			}
 		}
 
@@ -1356,7 +1868,7 @@ func FuzzBackendCorrelatorSequence(f *testing.F) {
 			if !ok {
 				break
 			}
-			switch int(opb) % 15 {
+			switch int(opb) % 16 {
 			case 0: // frontend: CreateParse
 				i, ok := r.pick(len(stmtNames))
 				if !ok {
@@ -1409,6 +1921,7 @@ func FuzzBackendCorrelatorSequence(f *testing.F) {
 				}
 				res, err := c.Handle(correctTerminalFor(head.Kind))
 				checkErrNoSecret(err)
+				checkResultNoMarkers(res)
 				if err == nil {
 					if res.Async {
 						t.Fatalf("a terminal response must not be Async")
@@ -1425,44 +1938,107 @@ func FuzzBackendCorrelatorSequence(f *testing.F) {
 				head, hadHead := s.HeadPendingOperation()
 				res, err := c.Handle(fieldedErrorResponse(secretMarker))
 				checkErrNoSecret(err)
+				checkResultNoMarkers(res)
 				if err == nil {
 					if !hadHead {
 						t.Fatalf("ErrorResponse succeeded with no pending head")
 					}
 					if head.Kind == OpSync {
-						t.Fatalf("ErrorResponse must never succeed against a Sync head")
-					}
-					if res.FailedOperation.Cycle != head.Cycle {
-						t.Fatalf("failed operation cycle mismatch: %+v vs head %+v", res.FailedOperation, head)
-					}
-					for _, ab := range res.AbandonedOperations {
-						if ab.Cycle != head.Cycle {
-							t.Fatalf("abandoned operation from a different cycle: %+v (failed cycle %d)", ab, head.Cycle)
+						// Sync -> ErrorResponse: valid (PostgreSQL can emit
+						// this while processing Sync itself), but it must
+						// NEVER consume/complete the Sync - only the
+						// following ReadyForQuery does.
+						if !res.IsErrorResponse || !res.Intermediate || res.OperationCompleted {
+							t.Fatalf("expected a Sync ErrorResponse to be IsErrorResponse+Intermediate, not OperationCompleted: %+v", res)
 						}
-						if ab.Kind == OpSync {
-							t.Fatalf("Sync must never be abandoned: %+v", ab)
+						if res.OperationKind != OpSync || res.OperationID != head.ID || res.CycleID != head.Cycle {
+							t.Fatalf("expected Sync ErrorResponse result to identify the still-pending Sync: %+v vs head %+v", res, head)
 						}
-					}
-					newHead, hasNew := s.HeadPendingOperation()
-					if hasNew && newHead.ID == head.ID {
-						t.Fatalf("a real ErrorResponse must consume the failing head operation")
+						newHead, hasNew := s.HeadPendingOperation()
+						if !hasNew || newHead.ID != head.ID {
+							t.Fatalf("a Sync ErrorResponse must never consume the Sync itself: head=%+v hasNew=%v newHead=%+v", head, hasNew, newHead)
+						}
+						// The following ReadyForQuery must complete
+						// exactly this same Sync.
+						rfqRes, rfqErr := c.Handle(rfqMsg(TxStatusIdle))
+						checkErrNoSecret(rfqErr)
+						if rfqErr == nil {
+							if !rfqRes.CycleCompleted || rfqRes.OperationID != head.ID {
+								t.Fatalf("expected ReadyForQuery after a Sync ErrorResponse to complete exactly that Sync, got %+v (head=%+v)", rfqRes, head)
+							}
+						}
+					} else {
+						if res.FailedOperation.Cycle != head.Cycle {
+							t.Fatalf("failed operation cycle mismatch: %+v vs head %+v", res.FailedOperation, head)
+						}
+						for _, ab := range res.AbandonedOperations {
+							if ab.Cycle != head.Cycle {
+								t.Fatalf("abandoned operation from a different cycle: %+v (failed cycle %d)", ab, head.Cycle)
+							}
+							if ab.Kind == OpSync {
+								t.Fatalf("Sync must never be abandoned: %+v", ab)
+							}
+						}
+						newHead, hasNew := s.HeadPendingOperation()
+						if hasNew && newHead.ID == head.ID {
+							t.Fatalf("a real ErrorResponse must consume the failing head operation")
+						}
 					}
 				}
-			case 10: // backend: asynchronous message
+			case 10: // backend: asynchronous message (valid and malformed variants)
 				b, ok := r.next()
 				if !ok {
 					continue
 				}
 				types := []MessageType{MsgNoticeResponse, MsgParameterStatus, MsgNotificationResponse}
 				mt := types[int(b)%len(types)]
-				before := snapshotState(s)
-				res, err := c.Handle(backendMsg(mt, []byte(secretMarker+"\x00")))
-				checkErrNoSecret(err)
-				if err != nil {
-					t.Fatalf("an asynchronous message must never error: %v", err)
+				wantValidChoice, ok := r.pick(2)
+				if !ok {
+					continue
 				}
-				if !res.Async {
-					t.Fatalf("expected an Async result for %v", mt)
+				wantValid := wantValidChoice == 0
+				var body []byte
+				switch mt {
+				case MsgNoticeResponse:
+					if wantValid {
+						body = append([]byte{'S'}, append([]byte(secretMarker), 0, 0)...)
+					} else {
+						body = []byte{0} // terminal-only: now invalid
+					}
+				case MsgParameterStatus:
+					if wantValid {
+						body = append(append([]byte(secretMarker), 0), append([]byte("v"), 0)...)
+					} else {
+						body = append([]byte(secretMarker), 0) // missing second string
+					}
+				case MsgNotificationResponse:
+					if wantValid {
+						body = append([]byte{0, 0, 0, 1}, append([]byte(secretMarker), 0, 'p', 0)...)
+					} else {
+						body = []byte{0, 0, 0} // too short even for the PID
+					}
+				}
+				before := snapshotState(s)
+				res, err := c.Handle(backendMsg(mt, body))
+				checkErrNoSecret(err)
+				checkResultNoMarkers(res)
+				if wantValid {
+					if err != nil {
+						t.Fatalf("a well-formed asynchronous message must never error: %v", err)
+					}
+					if !res.Async {
+						t.Fatalf("expected an Async result for %v", mt)
+					}
+				} else if err == nil || !errors.Is(err, ErrMalformedBackendMessage) {
+					t.Fatalf("expected ErrMalformedBackendMessage for malformed %v, got %v", mt, err)
+				}
+				assertStateUnchanged(t, before, snapshotState(s))
+			case 15: // backend: terminal-only ErrorResponse (invalid under tightened framing)
+				before := snapshotState(s)
+				_, err := c.Handle(terminalOnlyErrorResponse())
+				checkErrNoSecret(err)
+				if !errors.Is(err, ErrMalformedBackendMessage) {
+					t.Fatalf("expected ErrMalformedBackendMessage for a terminal-only ErrorResponse, got %v", err)
 				}
 				assertStateUnchanged(t, before, snapshotState(s))
 			case 11: // backend: ReadyForQuery with a random (possibly invalid) status

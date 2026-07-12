@@ -44,9 +44,17 @@ var (
 	ErrDuplicateDescribeIntermediate = errors.New("extendedcorrelation: yinelenen ParameterDescription")
 	ErrMissingParameterDescription   = errors.New("extendedcorrelation: RowDescription/NoData'dan once ParameterDescription eksik")
 	ErrUnsupportedCopyResponse       = errors.New("extendedcorrelation: COPY protokolu desteklenmiyor")
-	ErrErrorResponseForSync          = errors.New("extendedcorrelation: Sync icin ErrorResponse alinamaz")
 	ErrImpossibleBackendOrdering     = errors.New("extendedcorrelation: imkansiz backend mesaj sirasi")
 )
+
+// NOT: ErrErrorResponseForSync kasitli olarak KALDIRILDI. PostgreSQL,
+// Sync'in KENDISI islenirken bir hata olustugunda su sirayla mesaj
+// gonderebilir: Sync -> ErrorResponse -> ReadyForQuery. Bu, discard-until-
+// Sync davranisini BASLATMAZ (islenen mesaj zaten Sync'in kendisidir) ve
+// PostgreSQL yine de o Sync icin TAM OLARAK bir ReadyForQuery gonderir.
+// Bu yuzden Sync bekleyen kuyruk basiyken gelen yapisal olarak gecerli bir
+// ErrorResponse artik GECERLI (fail-closed olmayan) bir durumdur - bkz.
+// handleErrorResponse.
 
 // CorrelationResult, tek bir backend Message'in korelasyon sonucudur.
 // YALNIZCA sinirli, guvenli metadata tasir - ham cerceve baytlari, SQL
@@ -85,16 +93,52 @@ type CorrelationResult struct {
 	// CompletedCycleID, yalnizca CycleCompleted true oldugunda anlamlidir.
 	CompletedCycleID CycleID
 
-	// FailedOperation, yalnizca IsErrorResponse true oldugunda doldurulur:
-	// gercekten basarisiz olan (ErrorResponse'u alan) islemin bagimsiz bir
-	// goruntusudur.
-	FailedOperation PendingOperation
+	// FailedOperation, yalnizca IsErrorResponse true VE OperationKind Sync
+	// DEGILKEN doldurulur (Sync'in kendi hatasi - bkz. asagidaki
+	// "Sync -> ErrorResponse" notu - hicbir islemi "basarisiz" saymaz,
+	// yalnizca bir ara adimdir): gercekten basarisiz olan islemin
+	// bagimsiz, GUVENLI (isim icermeyen) bir goruntusudur.
+	FailedOperation CorrelatedOperation
 	// AbandonedOperations, yalnizca IsErrorResponse true VE ayni cycle'da
 	// daha sonraki islemler varsa doldurulur: PostgreSQL'in bu noktadan
 	// sonra o cycle'in Sync'ine kadar sessizce yok saydigi - ve bu yuzden
-	// HICBIR ZAMAN bir onay almayacak olan - islemlerin bagimsiz
-	// goruntuleridir.
-	AbandonedOperations []PendingOperation
+	// HICBIR ZAMAN bir onay almayacak olan - islemlerin bagimsiz, GUVENLI
+	// (isim icermeyen) goruntuleridir.
+	AbandonedOperations []CorrelatedOperation
+}
+
+// CorrelatedOperation, bir PendingOperation'in GUVENLI (istemci-saglanan ad
+// icermeyen) bir goruntusudur. CorrelationResult'in disari sizdirdigi TEK
+// islem-goruntusu turudur - PendingOperation'in kendisi (ör.
+// protocol.State.PendingOperations() araciligiyla) TargetName alanini
+// tasidigindan, dogrudan disari verilmez. State'in kendi PendingOperation
+// modeli DEGISMEDEN kalir; bu yalnizca korelator sinirinda uygulanan bir
+// gecis (sanitization) turudur.
+type CorrelatedOperation struct {
+	ID    PendingOperationID
+	Cycle CycleID
+	Kind  OperationKind
+	// TargetGeneration, bu islemin olusturdugu/referans verdigi
+	// generation'in degismez ID'sidir - ISIM DEGIL, yalnizca sayisal bir
+	// kimlik (bkz. dosya basi "YALNIZCA sinirli, guvenli metadata").
+	TargetGeneration GenerationID
+}
+
+// sanitizeOperation, bir State PendingOperation goruntusunu, TargetName'i
+// (istemci-saglanan statement/portal adi) ATARAK guvenli bir
+// CorrelatedOperation'a donusturur.
+func sanitizeOperation(op PendingOperation) CorrelatedOperation {
+	return CorrelatedOperation{ID: op.ID, Cycle: op.Cycle, Kind: op.Kind, TargetGeneration: op.TargetGeneration}
+}
+
+// sanitizeOperations, sanitizeOperation'i bagimsiz bir dilim uzerinde
+// uygular - donen dilim, girdi dilimiyle hicbir backing array paylasmaz.
+func sanitizeOperations(ops []PendingOperation) []CorrelatedOperation {
+	out := make([]CorrelatedOperation, len(ops))
+	for i, op := range ops {
+		out[i] = sanitizeOperation(op)
+	}
+	return out
 }
 
 // BackendCorrelator, decode edilmis backend protocol.Message degerlerini
@@ -116,6 +160,18 @@ type BackendCorrelator struct {
 	// basarisiz olduğunda ya da terk edildiginde (abandoned) bu haritadan
 	// HEMEN silinir - hicbir islem sinirini asip kalici hale gelmez.
 	describeParamSeen map[PendingOperationID]bool
+
+	// syncErrorSeen, YALNIZCA Sync (OpSync) islemleri icin, o TAM
+	// PendingOperationID'ye ozel "bu Sync icin zaten yapisal olarak
+	// gecerli bir ErrorResponse gorulduSSSmu" alt-durumunu tasir (bkz.
+	// handleErrorResponse - "Sync -> ErrorResponse -> ReadyForQuery"
+	// sirasi PostgreSQL'de gecerlidir, discard-until-Sync baslatmaz, ve
+	// Sync kuyruk basindan HIC cikarilmaz). Bir sonraki ikinci
+	// ErrorResponse "imkansiz backend sirasi" olarak reddedilir - bu
+	// yuzden HANGI Sync icin zaten bir ErrorResponse gorulduğu izlenmelidir.
+	// Karsilik gelen ReadyForQuery o Sync'i basariyla tamamladiginda bu
+	// haritadan HEMEN silinir.
+	syncErrorSeen map[PendingOperationID]bool
 }
 
 // NewBackendCorrelator, verilen *State'i kullanan yeni bir
@@ -127,6 +183,7 @@ func NewBackendCorrelator(state *State) (*BackendCorrelator, error) {
 	return &BackendCorrelator{
 		state:             state,
 		describeParamSeen: make(map[PendingOperationID]bool),
+		syncErrorSeen:     make(map[PendingOperationID]bool),
 	}, nil
 }
 
@@ -195,12 +252,29 @@ func (c *BackendCorrelator) Handle(m Message) (CorrelationResult, error) {
 	}
 }
 
+// handleAsync, eszamansiz (uncorrelated) uc backend mesaj turunu isler:
+// NoticeResponse, ParameterStatus, NotificationResponse. Govde SEKLI
+// (framing) dogrulanir - hicbir mesaj hicbir bekleyen islemi tuketmeden/
+// degistirmeden reddedilebilir - ama govde ICERIGI (bildirim metni,
+// parametre adi/degeri, kanal adi, payload, PID) hicbir zaman okunup
+// disari dondurulmez/saklanmaz; yalnizca NUL sonlandiricilarin/alan
+// kodlarinin KONUMLARI incelenir.
 func (c *BackendCorrelator) handleAsync(m Message) (CorrelationResult, error) {
-	// Kasitli olarak govde HIC incelenmez/dogrulanmaz - bu mesajlarin
-	// govdesi (bildirim metni, parametre adi/degeri, kanal/payload)
-	// sinirsiz sunucu/istemci verisidir ve bu korelator tarafindan asla
-	// gozlemlenmemeli/saklanmamalidir (bkz. gereksinim). Yalnizca turu
-	// raporlanir.
+	body := backendBody(m)
+	var err error
+	switch m.Type {
+	case MsgNoticeResponse:
+		// NoticeResponse, ErrorResponse ile AYNI alan cercevelemesini
+		// kullanir (bkz. https://www.postgresql.org/docs/current/protocol-message-formats.html).
+		err = validateFieldFraming(body)
+	case MsgParameterStatus:
+		err = validateParameterStatusFraming(body)
+	case MsgNotificationResponse:
+		err = validateNotificationResponseFraming(body)
+	}
+	if err != nil {
+		return CorrelationResult{}, err
+	}
 	return CorrelationResult{MessageType: m.Type, Async: true}, nil
 }
 
@@ -373,16 +447,46 @@ func (c *BackendCorrelator) handleExecuteTerminal(m Message, requireTag bool) (C
 // kuyruk basindaki islemi basarisiz isaretler VE ayni cycle'daki daha
 // sonraki islemleri (o cycle'in kendi Sync'i haric) terk edilmis
 // (abandoned) sayar (bkz. State.ApplyErrorResponseAndAbandonCycle).
+// handleErrorResponse, gercek bir backend ErrorResponse'unu isler. Iki
+// farkli durum vardir:
+//
+//   - Kuyruk basi Sync ISE: PostgreSQL'in "Sync -> ErrorResponse ->
+//     ReadyForQuery" sirasini yansitir - Sync'in KENDISI islenirken bir
+//     hata olustugunda gorulur (bkz. https://www.postgresql.org/docs/current/protocol-flow.html,
+//     "Extended Query"). Bu durum discard-until-Sync davranisini BASLATMAZ
+//     (islenen mesaj zaten Sync'in kendisidir) ve PostgreSQL yine de o
+//     Sync icin TAM OLARAK bir ReadyForQuery gonderir. Bu yuzden: Sync ne
+//     kuyruktan cikarilir ne de "tamamlanmis" sayilir - yalnizca bir ARA
+//     adim olarak isaretlenir (Intermediate=true, OperationCompleted=
+//     false) ve karsilik gelen ReadyForQuery, o Sync'i normal sekilde
+//     tamamlar. Ayni Sync icin IKINCI bir ErrorResponse imkansiz bir
+//     backend sirasidir (reddedilir, State degismez).
+//   - Kuyruk basi Sync DEGILSE: State.ApplyErrorResponseAndAbandonCycle
+//     cagrilir - kuyruk basindaki islemi basarisiz isaretler VE ayni
+//     cycle'daki daha sonraki islemleri (o cycle'in kendi Sync'i haric)
+//     terk edilmis (abandoned) sayar.
 func (c *BackendCorrelator) handleErrorResponse(m Message) (CorrelationResult, error) {
-	if err := validateErrorResponseFraming(backendBody(m)); err != nil {
+	if err := validateFieldFraming(backendBody(m)); err != nil {
 		return CorrelationResult{}, err
 	}
 	head, ok := c.state.HeadPendingOperation()
 	if !ok {
 		return CorrelationResult{}, ErrNoPendingOperation
 	}
+
 	if head.Kind == OpSync {
-		return CorrelationResult{}, ErrErrorResponseForSync
+		if c.syncErrorSeen[head.ID] {
+			// Ayni Sync icin ikinci bir ErrorResponse - PostgreSQL'in
+			// protokolunde bir Sync en fazla bir kez basarisiz "ara adim"
+			// bildirimi alabilir (sonrasinda tam olarak bir ReadyForQuery
+			// beklenir). Bu, imkansiz bir backend sirasidir.
+			return CorrelationResult{}, ErrImpossibleBackendOrdering
+		}
+		c.syncErrorSeen[head.ID] = true
+		return CorrelationResult{
+			MessageType: m.Type, IsErrorResponse: true, Intermediate: true,
+			OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+		}, nil
 	}
 
 	failed, abandoned, err := c.state.ApplyErrorResponseAndAbandonCycle(head.ID)
@@ -401,13 +505,15 @@ func (c *BackendCorrelator) handleErrorResponse(m Message) (CorrelationResult, e
 	return CorrelationResult{
 		MessageType: m.Type, IsErrorResponse: true, OperationCompleted: true,
 		OperationID: failed.ID, OperationKind: failed.Kind, CycleID: failed.Cycle,
-		FailedOperation: failed, AbandonedOperations: abandoned,
+		FailedOperation: sanitizeOperation(failed), AbandonedOperations: sanitizeOperations(abandoned),
 	}, nil
 }
 
 // handleReadyForQuery, YALNIZCA Sync icin gecerli bir terminal mesajdir;
 // State.ApplyReadyForQuery FIFO en-eski-bekleyen-cycle eslestirmesini ve
-// islem durumu ('I'/'T'/'E') dogrulamasini kendisi yapar.
+// islem durumu ('I'/'T'/'E') dogrulamasini kendisi yapar. Bu Sync'e ait,
+// korelator-ozel bir Sync-hatasi alt-durumu (bkz. syncErrorSeen) varsa,
+// basarili tamamlanmadan hemen sonra temizlenir.
 func (c *BackendCorrelator) handleReadyForQuery(m Message) (CorrelationResult, error) {
 	body := backendBody(m)
 	if len(body) != 1 {
@@ -421,6 +527,7 @@ func (c *BackendCorrelator) handleReadyForQuery(m Message) (CorrelationResult, e
 	if err != nil {
 		return CorrelationResult{}, err
 	}
+	delete(c.syncErrorSeen, head.ID)
 	return CorrelationResult{
 		MessageType: m.Type, OperationCompleted: true, CycleCompleted: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
@@ -466,37 +573,92 @@ func validateCommandCompleteTag(body []byte) error {
 	return nil
 }
 
-// validateErrorResponseFraming, bir ErrorResponse govdesinin PostgreSQL
-// alan cercevelemesine uydugunu dogrular: sifir olmayan her alan kodu
-// baytini bir NUL-sonlandirmali deger stringi izler, govde tek bir sifir
-// alan-kodu baytiyla (son bayt olarak) sonlanir. HICBIR alan DEGERI
-// (icerigi) okunmaz/donulmez/saklanmaz - yalnizca cerceve sekli dogrulanir.
-func validateErrorResponseFraming(body []byte) error {
+// findCStringEnd, body[offset:] icinde NUL sonlandiricinin MUTLAK (body
+// basindan itibaren) index'ini bulur, bulunamazsa -1 doner. Deger ICERIGI
+// hicbir zaman okunmaz/donulmez - yalnizca konumu.
+func findCStringEnd(body []byte, offset int) int {
+	for i := offset; i < len(body); i++ {
+		if body[i] == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// validateFieldFraming, ErrorResponse VE NoticeResponse'un PAYLASTIGI
+// PostgreSQL alan cercevelemesini dogrular (bkz.
+// https://www.postgresql.org/docs/current/protocol-message-formats.html,
+// ErrorResponse/NoticeResponse): EN AZ BIR sifir-olmayan alan kodu baytini
+// bir NUL-sonlandirmali deger stringi izler, govde tek bir sifir alan-
+// kodu baytiyla (son bayt olarak) sonlanir. Yalnizca-terminator (hicbir
+// alan icermeyen) bir govde REDDEDILIR - gercek PostgreSQL, en azindan
+// 'S'/'V' (severity) ve 'C' (SQLSTATE) alanlarini her zaman gonderir.
+// Kapali bir alan-kodu izin listesi ZORUNLU KILINMAZ (PostgreSQL gelecekte
+// yeni alan turleri ekleyebilir). HICBIR alan DEGERI (icerigi) okunmaz/
+// donulmez/saklanmaz - yalnizca cerceve sekli dogrulanir.
+func validateFieldFraming(body []byte) error {
 	offset := 0
+	sawField := false
 	for {
 		if offset >= len(body) {
 			return ErrMalformedBackendMessage
 		}
 		fieldCode := body[offset]
 		if fieldCode == 0 {
-			if offset != len(body)-1 {
+			if !sawField || offset != len(body)-1 {
 				return ErrMalformedBackendMessage
 			}
 			return nil
 		}
-		offset++
-		idx := -1
-		for i := offset; i < len(body); i++ {
-			if body[i] == 0 {
-				idx = i
-				break
-			}
-		}
+		sawField = true
+		idx := findCStringEnd(body, offset+1)
 		if idx == -1 {
 			return ErrMalformedBackendMessage
 		}
 		offset = idx + 1
 	}
+}
+
+// validateParameterStatusFraming, bir ParameterStatus govdesinin tam
+// olarak iki NUL-sonlandirmali string (parametre adi, parametre degeri)
+// icerdigini ve arkasindan baska hicbir bayt gelmedigini dogrular.
+// Stringlerin ICERIGI hicbir zaman okunmaz/donulmez/saklanmaz.
+func validateParameterStatusFraming(body []byte) error {
+	firstEnd := findCStringEnd(body, 0)
+	if firstEnd == -1 {
+		return ErrMalformedBackendMessage
+	}
+	secondEnd := findCStringEnd(body, firstEnd+1)
+	if secondEnd == -1 {
+		return ErrMalformedBackendMessage
+	}
+	if secondEnd != len(body)-1 {
+		return ErrMalformedBackendMessage
+	}
+	return nil
+}
+
+// validateNotificationResponseFraming, bir NotificationResponse
+// govdesinin Int32(surec kimligi/PID) + NUL-sonlandirmali kanal adi +
+// NUL-sonlandirmali payload iceriginden olustugunu ve arkasindan baska
+// hicbir bayt gelmedigini dogrular. PID DEGERI ve stringlerin ICERIGI
+// hicbir zaman okunmaz/donulmez/saklanmaz.
+func validateNotificationResponseFraming(body []byte) error {
+	if len(body) < 4 {
+		return ErrMalformedBackendMessage
+	}
+	channelEnd := findCStringEnd(body, 4)
+	if channelEnd == -1 {
+		return ErrMalformedBackendMessage
+	}
+	payloadEnd := findCStringEnd(body, channelEnd+1)
+	if payloadEnd == -1 {
+		return ErrMalformedBackendMessage
+	}
+	if payloadEnd != len(body)-1 {
+		return ErrMalformedBackendMessage
+	}
+	return nil
 }
 
 // ParameterDescription, ayristirilmis bir ParameterDescription ('t')

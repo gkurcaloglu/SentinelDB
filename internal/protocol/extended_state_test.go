@@ -156,6 +156,13 @@ func FuzzExtendedStateSequence(f *testing.F) {
 				if err == nil {
 					trackOp(op.ID)
 					trackGen(gen.ID)
+					// Mutation-isolation: corrupting the returned snapshot
+					// locally must never be observable through State.
+					if len(gen.ParamOIDs) > 0 {
+						gen.ParamOIDs[0] = 999999
+					}
+					gen.Query = "corrupted"
+					op.TargetGeneration = 999999
 				}
 			case 1: // CreateBind
 				pi, ok1 := r.pick(len(portalNames))
@@ -167,6 +174,12 @@ func FuzzExtendedStateSequence(f *testing.F) {
 				if err == nil {
 					trackOp(op.ID)
 					trackGen(gen.ID)
+					// Mutation-isolation, same as above, for portal snapshots.
+					if len(gen.ParamFormats) > 0 {
+						gen.ParamFormats[0] = 99
+					}
+					gen.StatementID = 999999
+					op.TargetGeneration = 999999
 				}
 			case 2: // CreateDescribeStatement
 				i, ok := r.pick(len(stmtNames))
@@ -372,6 +385,174 @@ func TestState_OperationIDExhaustion(t *testing.T) {
 	_, _, err := s.CreateParse("", "SELECT 1", nil)
 	if !errors.Is(err, ErrIdentifierExhaustion) {
 		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+}
+
+// --- Identifier-exhaustion atomicity tests -------------------------------
+//
+// These construct near-exhaustion internal counters directly (white-box,
+// same package) and confirm a failed Create* call never leaves partial
+// state behind: no generation in a map, no changed unnamed current
+// pointer, no pending operation, no outstanding Sync cycle. Every
+// Create* method allocates ALL of its fallible identifiers BEFORE
+// mutating any map/pointer/queue, so a later allocation failing after an
+// earlier one succeeded still leaves zero observable side effects (the
+// earlier identifier is simply wasted, never reused, never surfaced).
+
+func TestState_CreateParse_GenerationExhaustion_LeavesNoPartialState(t *testing.T) {
+	s := NewState()
+	s.nextGeneration = math.MaxUint64
+	baseStatements, baseOps := s.StatementCount(), s.PendingOperationCount()
+	prevUnnamed := s.unnamedStatementCurrent
+
+	if _, _, err := s.CreateParse("", "SELECT 1", nil); !errors.Is(err, ErrIdentifierExhaustion) {
+		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+	if s.StatementCount() != baseStatements {
+		t.Fatalf("expected no statement left behind, got count %d", s.StatementCount())
+	}
+	if s.PendingOperationCount() != baseOps {
+		t.Fatalf("expected no pending operation left behind, got count %d", s.PendingOperationCount())
+	}
+	if s.unnamedStatementCurrent != prevUnnamed {
+		t.Fatalf("expected unnamed statement pointer unchanged, got %d want %d", s.unnamedStatementCurrent, prevUnnamed)
+	}
+}
+
+func TestState_CreateParse_OpExhaustion_LeavesNoPartialState(t *testing.T) {
+	s := NewState()
+	s.nextOp = math.MaxUint64
+	baseStatements, baseOps := s.StatementCount(), s.PendingOperationCount()
+	prevUnnamed := s.unnamedStatementCurrent
+	prevGenCounter := s.nextGeneration
+
+	if _, _, err := s.CreateParse("", "SELECT 1", nil); !errors.Is(err, ErrIdentifierExhaustion) {
+		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+	if s.StatementCount() != baseStatements {
+		t.Fatalf("expected no statement left behind (even though a generation ID was already consumed), got count %d", s.StatementCount())
+	}
+	if s.PendingOperationCount() != baseOps {
+		t.Fatalf("expected no pending operation left behind, got count %d", s.PendingOperationCount())
+	}
+	if s.unnamedStatementCurrent != prevUnnamed {
+		t.Fatalf("expected unnamed statement pointer unchanged, got %d want %d", s.unnamedStatementCurrent, prevUnnamed)
+	}
+	if s.nextGeneration != prevGenCounter+1 {
+		t.Fatalf("expected the generation counter to have advanced (wasted, never reused) by exactly 1, got %d want %d", s.nextGeneration, prevGenCounter+1)
+	}
+}
+
+func TestState_CreateBind_GenerationExhaustion_LeavesNoPartialState(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	s.nextGeneration = math.MaxUint64
+	basePortals, baseOps := s.PortalCount(), s.PendingOperationCount()
+	prevUnnamedPortal := s.unnamedPortalCurrent
+
+	if _, _, err := s.CreateBind("", "s1", nil, nil, nil); !errors.Is(err, ErrIdentifierExhaustion) {
+		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+	if s.PortalCount() != basePortals {
+		t.Fatalf("expected no portal left behind, got count %d", s.PortalCount())
+	}
+	if s.PendingOperationCount() != baseOps {
+		t.Fatalf("expected no pending operation left behind, got count %d", s.PendingOperationCount())
+	}
+	if s.unnamedPortalCurrent != prevUnnamedPortal {
+		t.Fatalf("expected unnamed portal pointer unchanged, got %d want %d", s.unnamedPortalCurrent, prevUnnamedPortal)
+	}
+}
+
+func TestState_CreateBind_OpExhaustion_LeavesNoPartialState(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	s.nextOp = math.MaxUint64
+	basePortals, baseOps := s.PortalCount(), s.PendingOperationCount()
+	prevUnnamedPortal := s.unnamedPortalCurrent
+
+	if _, _, err := s.CreateBind("", "s1", nil, nil, nil); !errors.Is(err, ErrIdentifierExhaustion) {
+		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+	if s.PortalCount() != basePortals {
+		t.Fatalf("expected no portal left behind (even though a generation ID was already consumed), got count %d", s.PortalCount())
+	}
+	if s.PendingOperationCount() != baseOps {
+		t.Fatalf("expected no pending operation left behind, got count %d", s.PendingOperationCount())
+	}
+	if s.unnamedPortalCurrent != prevUnnamedPortal {
+		t.Fatalf("expected unnamed portal pointer unchanged, got %d want %d", s.unnamedPortalCurrent, prevUnnamedPortal)
+	}
+}
+
+func TestState_CreateSync_OpExhaustion_LeavesNoPartialState(t *testing.T) {
+	s := NewState()
+	s.nextOp = math.MaxUint64
+	baseOps, baseOutstanding := s.PendingOperationCount(), s.OutstandingCycleCount()
+	prevCycle := s.CurrentCycle()
+
+	if _, err := s.CreateSync(); !errors.Is(err, ErrIdentifierExhaustion) {
+		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+	if s.PendingOperationCount() != baseOps {
+		t.Fatalf("expected no pending operation left behind, got count %d", s.PendingOperationCount())
+	}
+	if s.OutstandingCycleCount() != baseOutstanding {
+		t.Fatalf("expected no outstanding cycle left behind, got count %d", s.OutstandingCycleCount())
+	}
+	if s.CurrentCycle() != prevCycle {
+		t.Fatalf("expected current cycle unchanged, got %d want %d", s.CurrentCycle(), prevCycle)
+	}
+}
+
+func TestState_CreateSync_CycleExhaustion_LeavesNoPartialState(t *testing.T) {
+	s := NewState()
+	s.nextCycle = math.MaxUint64
+	baseOps, baseOutstanding := s.PendingOperationCount(), s.OutstandingCycleCount()
+	prevCycle := s.CurrentCycle()
+	prevOpCounter := s.nextOp
+
+	if _, err := s.CreateSync(); !errors.Is(err, ErrIdentifierExhaustion) {
+		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+	if s.PendingOperationCount() != baseOps {
+		t.Fatalf("expected no pending operation left behind (even though an op ID was already consumed), got count %d", s.PendingOperationCount())
+	}
+	if s.OutstandingCycleCount() != baseOutstanding {
+		t.Fatalf("expected no outstanding cycle left behind, got count %d", s.OutstandingCycleCount())
+	}
+	if s.CurrentCycle() != prevCycle {
+		t.Fatalf("expected current cycle unchanged, got %d want %d", s.CurrentCycle(), prevCycle)
+	}
+	if s.nextOp != prevOpCounter+1 {
+		t.Fatalf("expected the op counter to have advanced (wasted, never reused) by exactly 1, got %d want %d", s.nextOp, prevOpCounter+1)
+	}
+}
+
+// TestState_CreateSimpleOp_OpExhaustion_LeavesNoPartialState, createSimpleOp
+// (Describe/Execute/Close* tarafindan paylasilan) icin temsili bir testtir -
+// tek bir fallible adimi (allocOp) oldugundan ve bu adim herhangi bir
+// mutasyondan once yapildigindan yapisal olarak zaten atomiktir; bu test
+// bunu CreateDescribeStatement uzerinden dogrular (diger tum createSimpleOp
+// cagiranlari - CreateDescribePortal/CreateExecute/CreateCloseStatement/
+// CreateClosePortal - ayni kod yolunu paylasir).
+func TestState_CreateSimpleOp_OpExhaustion_LeavesNoPartialState(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	s.nextOp = math.MaxUint64
+	baseOps := s.PendingOperationCount()
+
+	if _, err := s.CreateDescribeStatement("s1"); !errors.Is(err, ErrIdentifierExhaustion) {
+		t.Fatalf("expected ErrIdentifierExhaustion, got %v", err)
+	}
+	if s.PendingOperationCount() != baseOps {
+		t.Fatalf("expected no pending operation left behind, got count %d", s.PendingOperationCount())
 	}
 }
 
@@ -812,6 +993,194 @@ func TestState_CloseSnapshotCorrectIfNameMappingsChangeLater(t *testing.T) {
 	got, ok := s.CommittedStatement("s1")
 	if !ok || got.ID != sgen2.ID {
 		t.Fatalf("expected new statement generation %d to be live, got %+v (ok=%v)", sgen2.ID, got, ok)
+	}
+}
+
+// --- Close-before-acknowledgement (pending target) tests -----------------
+//
+// PostgreSQL processes frontend messages strictly in order. A well-behaved
+// pipelining client can legally send Close immediately after Parse/Bind
+// without waiting for ParseComplete/BindComplete - if the creation
+// succeeds, the following Close must be able to close that brand-new,
+// still-pending object. CreateCloseStatement/CreateClosePortal must
+// therefore resolve using the same committed-or-pending rule as Describe/
+// Bind/Execute, not committed-only.
+
+func TestState_CreateCloseStatement_NamedPendingBeforeParseComplete(t *testing.T) {
+	s := NewState()
+	sop, sgen, err := s.CreateParse("s1", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Close is pipelined immediately, before ParseComplete.
+	cop, err := s.CreateCloseStatement("s1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cop.TargetGeneration != sgen.ID {
+		t.Fatalf("expected Close to capture the pending generation %d, got %d", sgen.ID, cop.TargetGeneration)
+	}
+	_ = sop
+}
+
+func TestState_CreateCloseStatement_UnnamedPendingBeforeParseComplete(t *testing.T) {
+	s := NewState()
+	sop, sgen, err := s.CreateParse("", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cop, err := s.CreateCloseStatement("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cop.TargetGeneration != sgen.ID {
+		t.Fatalf("expected Close to capture the pending unnamed generation %d, got %d", sgen.ID, cop.TargetGeneration)
+	}
+	_ = sop
+}
+
+func TestState_CreateClosePortal_NamedPendingBeforeBindComplete(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	bop, pgen, err := s.CreateBind("p1", "s1", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cop, err := s.CreateClosePortal("p1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cop.TargetGeneration != pgen.ID {
+		t.Fatalf("expected Close to capture the pending portal generation %d, got %d", pgen.ID, cop.TargetGeneration)
+	}
+	_ = bop
+}
+
+func TestState_CreateClosePortal_UnnamedPendingBeforeBindComplete(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	bop, pgen, err := s.CreateBind("", "", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cop, err := s.CreateClosePortal("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cop.TargetGeneration != pgen.ID {
+		t.Fatalf("expected Close to capture the pending unnamed portal generation %d, got %d", pgen.ID, cop.TargetGeneration)
+	}
+	_ = bop
+}
+
+func TestState_ParseCompleteThenCloseComplete_RemovesCapturedStatement(t *testing.T) {
+	s := NewState()
+	sop, sgen, _ := s.CreateParse("s1", "SELECT 1", nil)
+	cop, err := s.CreateCloseStatement("s1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := s.ApplyParseComplete(sop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := s.ApplyCloseComplete(cop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.Statement(sgen.ID); ok {
+		t.Fatal("expected the captured statement generation to be removed")
+	}
+	if _, ok := s.CommittedStatement("s1"); ok {
+		t.Fatal("expected s1 to no longer resolve")
+	}
+}
+
+func TestState_BindCompleteThenCloseComplete_RemovesCapturedPortal(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	bop, pgen, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	cop, err := s.CreateClosePortal("p1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := s.ApplyBindComplete(bop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := s.ApplyCloseComplete(cop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.Portal(pgen.ID); ok {
+		t.Fatal("expected the captured portal generation to be removed")
+	}
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("expected p1 to no longer resolve")
+	}
+}
+
+func TestState_CreateCloseStatement_NonexistentIsSuccessfulNoOp(t *testing.T) {
+	s := NewState()
+	cop, err := s.CreateCloseStatement("does-not-exist")
+	if err != nil {
+		t.Fatalf("Close of an unknown statement must never error: %v", err)
+	}
+	if cop.TargetGeneration != NoGeneration {
+		t.Fatalf("expected NoGeneration snapshot, got %d", cop.TargetGeneration)
+	}
+	if err := s.ApplyCloseComplete(cop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestState_CreateClosePortal_NonexistentIsSuccessfulNoOp(t *testing.T) {
+	s := NewState()
+	cop, err := s.CreateClosePortal("does-not-exist")
+	if err != nil {
+		t.Fatalf("Close of an unknown portal must never error: %v", err)
+	}
+	if cop.TargetGeneration != NoGeneration {
+		t.Fatalf("expected NoGeneration snapshot, got %d", cop.TargetGeneration)
+	}
+	if err := s.ApplyCloseComplete(cop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestState_PendingStatementClose_StillCascadesToPortals dogrular: bir
+// Close, karsilik gelen Parse henuz onaylanmadan (pending iken) yakalanmis
+// olsa bile - o statement generation'indan olusturulan portal'lara
+// (pipeline edilmis bir Bind ile) cascade hala dogru sekilde uygulanir.
+func TestState_PendingStatementClose_StillCascadesToPortals(t *testing.T) {
+	s := NewState()
+	sop, sgen, _ := s.CreateParse("s1", "SELECT 1", nil)
+	// Close, ParseComplete'den ONCE yakalanir.
+	cop, err := s.CreateCloseStatement("s1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s.ApplyParseComplete(sop.ID)
+
+	bop, pgen, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+
+	if err := s.ApplyCloseComplete(cop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.Statement(sgen.ID); ok {
+		t.Fatal("expected statement to be removed")
+	}
+	if _, ok := s.Portal(pgen.ID); ok {
+		t.Fatal("expected dependent portal to be cascaded away even though Close captured a then-pending statement")
 	}
 }
 
@@ -1539,4 +1908,218 @@ func TestState_CompleteOperation_SucceedsForDescribeAndExecute(t *testing.T) {
 	if err := s.CompleteOperation(eop.ID); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+// --- Mutation-isolation tests ---------------------------------------------
+//
+// Every value State returns is an independent deep copy (bkz. extended_state.go
+// "Degismezlik sozlesmesi" / copyStatementGeneration / copyPortalGeneration /
+// copyPendingOperation). These tests deliberately mutate every field
+// (including slice elements) of returned snapshots and confirm State's own
+// internal data is completely unaffected.
+
+func TestState_MutatingReturnedPendingOperation_DoesNotAffectQueue(t *testing.T) {
+	s := NewState()
+	op, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	originalID, originalCycle, originalKind, originalTarget := op.ID, op.Cycle, op.Kind, op.TargetGeneration
+
+	op.ID = 999999
+	op.Cycle = 999999
+	op.Kind = OpSync
+	op.TargetGeneration = 999999
+	op.TargetName = "corrupted"
+
+	ops := s.PendingOperations()
+	if len(ops) != 1 {
+		t.Fatalf("expected 1 queued operation, got %d", len(ops))
+	}
+	if ops[0].ID != originalID {
+		t.Fatalf("expected queue ID unaffected, got %d want %d", ops[0].ID, originalID)
+	}
+	if ops[0].Cycle != originalCycle {
+		t.Fatalf("expected queue Cycle unaffected, got %d want %d", ops[0].Cycle, originalCycle)
+	}
+	if ops[0].Kind != originalKind {
+		t.Fatalf("expected queue Kind unaffected, got %v want %v", ops[0].Kind, originalKind)
+	}
+	if ops[0].TargetGeneration != originalTarget {
+		t.Fatalf("expected queue TargetGeneration unaffected, got %d want %d", ops[0].TargetGeneration, originalTarget)
+	}
+	if ops[0].TargetName != "s1" {
+		t.Fatalf("expected queue TargetName unaffected, got %q", ops[0].TargetName)
+	}
+}
+
+func TestState_MutatingReturnedStatementGeneration_DoesNotAffectState(t *testing.T) {
+	s := NewState()
+	_, gen, _ := s.CreateParse("s1", "SELECT 1", []uint32{23, 25})
+
+	gen.Query = "DROP TABLE users"
+	gen.Name = "corrupted"
+	gen.State = LifecycleCommitted
+	gen.ParamOIDs[0] = 999999
+
+	got, ok := s.ResolveStatement("s1")
+	if !ok {
+		t.Fatal("expected s1 to still resolve")
+	}
+	if got.Query != "SELECT 1" {
+		t.Fatalf("expected internal Query unaffected, got %q", got.Query)
+	}
+	if got.Name != "s1" {
+		t.Fatalf("expected internal Name unaffected, got %q", got.Name)
+	}
+	if got.State != LifecyclePending {
+		t.Fatalf("expected internal State unaffected, got %v", got.State)
+	}
+	if got.ParamOIDs[0] != 23 {
+		t.Fatalf("expected internal ParamOIDs unaffected, got %v", got.ParamOIDs)
+	}
+}
+
+func TestState_MutatingReturnedParamOIDs_DoesNotAffectState(t *testing.T) {
+	s := NewState()
+	_, gen, _ := s.CreateParse("s1", "SELECT 1", []uint32{23, 25})
+
+	gen.ParamOIDs[0] = 1
+	gen.ParamOIDs[1] = 2
+	gen.ParamOIDs = append(gen.ParamOIDs, 3, 4, 5) // also exercises capacity growth
+
+	got, ok := s.Statement(gen.ID)
+	if !ok {
+		t.Fatal("expected statement to still exist")
+	}
+	if len(got.ParamOIDs) != 2 || got.ParamOIDs[0] != 23 || got.ParamOIDs[1] != 25 {
+		t.Fatalf("expected internal ParamOIDs unaffected by external mutation/append, got %v", got.ParamOIDs)
+	}
+}
+
+func TestState_MutatingReturnedPortalGeneration_DoesNotAffectState(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	_, gen, err := s.CreateBind("p1", "s1", []int16{0, 1}, []bool{false, true}, []int16{0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gen.Name = "corrupted"
+	gen.State = LifecycleCommitted
+	gen.StatementID = 999999
+
+	got, ok := s.ResolvePortal("p1")
+	if !ok {
+		t.Fatal("expected p1 to still resolve")
+	}
+	if got.Name != "p1" {
+		t.Fatalf("expected internal Name unaffected, got %q", got.Name)
+	}
+	if got.State != LifecyclePending {
+		t.Fatalf("expected internal State unaffected, got %v", got.State)
+	}
+	if got.StatementID == 999999 {
+		t.Fatal("expected internal StatementID unaffected")
+	}
+}
+
+func TestState_MutatingReturnedFormatAndNullSlices_DoesNotAffectState(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	_, gen, err := s.CreateBind("p1", "s1", []int16{0, 1}, []bool{false, true}, []int16{1, 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gen.ParamFormats[0] = 99
+	gen.ParamNulls[0] = true
+	gen.ResultFormats[0] = 99
+	gen.ParamFormats = append(gen.ParamFormats, 5, 5, 5)
+
+	got, ok := s.Portal(gen.ID)
+	if !ok {
+		t.Fatal("expected portal to still exist")
+	}
+	if len(got.ParamFormats) != 2 || got.ParamFormats[0] != 0 {
+		t.Fatalf("expected internal ParamFormats unaffected, got %v", got.ParamFormats)
+	}
+	if got.ParamNulls[0] != false {
+		t.Fatalf("expected internal ParamNulls unaffected, got %v", got.ParamNulls)
+	}
+	if got.ResultFormats[0] != 1 {
+		t.Fatalf("expected internal ResultFormats unaffected, got %v", got.ResultFormats)
+	}
+}
+
+func TestState_MutatingResolveOrCommittedSnapshot_DoesNotAffectLaterLookup(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+
+	snap, ok := s.CommittedStatement("s1")
+	if !ok {
+		t.Fatal("expected s1 to resolve")
+	}
+	snap.Query = "corrupted"
+	snap.ParamOIDs = append(snap.ParamOIDs, 42)
+	snap.State = LifecycleFailed
+
+	again, ok := s.CommittedStatement("s1")
+	if !ok {
+		t.Fatal("expected s1 to still resolve")
+	}
+	if again.Query != "SELECT 1" {
+		t.Fatalf("expected later lookup unaffected by earlier snapshot mutation, got %q", again.Query)
+	}
+	if len(again.ParamOIDs) != 0 {
+		t.Fatalf("expected later lookup's ParamOIDs unaffected, got %v", again.ParamOIDs)
+	}
+	if again.State != LifecycleCommitted {
+		t.Fatalf("expected later lookup's State unaffected, got %v", again.State)
+	}
+}
+
+// TestState_InvariantsHoldAfterMutatingEveryReturnedSnapshot dogrular:
+// donen HER snapshot turunu (PendingOperation, StatementGeneration,
+// PortalGeneration - slice alanlari dahil) kasitli olarak bozduktan sonra
+// bile, State'in kendi ic yapisal degismezleri (bkz.
+// checkStructuralInvariants) hala gecerlidir ve gercek ID'lerle yapilan
+// sonraki cagrilar (ApplyParseComplete/ApplyBindComplete) hala doğru
+// calisir - hicbir donus degeri mutasyonu State'e geri sizmaz.
+func TestState_InvariantsHoldAfterMutatingEveryReturnedSnapshot(t *testing.T) {
+	s := NewState()
+
+	pop, sgen, err := s.CreateParse("s1", "SELECT 1", []uint32{1, 2})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	realParseOpID, realStmtGenID := pop.ID, sgen.ID
+
+	pop.ID, pop.Cycle, pop.Kind, pop.TargetGeneration, pop.TargetName = 777, 777, OpSync, 777, "corrupted"
+	sgen.ParamOIDs[0], sgen.Query, sgen.Name, sgen.State = 777, "corrupted", "corrupted", LifecycleCommitted
+
+	if _, err := s.ApplyParseComplete(realParseOpID); err != nil {
+		t.Fatalf("expected ApplyParseComplete to still work with the REAL (unmutated) ID: %v", err)
+	}
+
+	bop, pgen, err := s.CreateBind("p1", "s1", []int16{0}, []bool{false}, []int16{0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	realBindOpID, realPortalGenID := bop.ID, pgen.ID
+
+	bop.TargetGeneration = 777
+	pgen.ParamFormats[0] = 99
+	pgen.StatementID = 777
+
+	if _, err := s.ApplyBindComplete(realBindOpID); err != nil {
+		t.Fatalf("expected ApplyBindComplete to still work with the REAL (unmutated) ID: %v", err)
+	}
+
+	got, ok := s.Portal(realPortalGenID)
+	if !ok || got.StatementID != realStmtGenID {
+		t.Fatalf("expected portal to reference the real statement generation %d, got %+v (ok=%v)", realStmtGenID, got, ok)
+	}
+
+	checkStructuralInvariants(t, s)
 }

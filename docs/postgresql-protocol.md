@@ -124,6 +124,22 @@ decision, unconditionally. Building `protocol.State` does not change
 anything described elsewhere in this document — it remains a groundwork
 data structure for a future stage, not a currently supported feature.
 
+**`Close` may capture a still-pending target.** `CreateCloseStatement`/
+`CreateClosePortal` resolve their target the same committed-or-pending way
+`Describe`/`Bind`/`Execute` do, not committed-only — this correctly
+supports a pipelined `Parse`/`Bind` immediately followed by a `Close` for
+the same name, sent before the real server's `ParseComplete`/`BindComplete`
+has been observed. The captured generation is an immutable snapshot; a
+later name-mapping change never retargets an already-created `Close`.
+
+**Every value `protocol.State` returns is an independent deep copy.**
+`Resolve*`/`Committed*`/`Statement`/`Portal`/`PendingOperations`, and every
+`Create*`/`ApplyParseComplete`/`ApplyBindComplete` return value, is copied
+out of the internally owned map/queue entry — including slice fields
+(`ParamOIDs`, `ParamFormats`, `ParamNulls`, `ResultFormats`). Mutating a
+returned value can never corrupt `State`'s internal data; the only way to
+change `State` is through its own methods.
+
 ## SSLRequest / GSSENCRequest rejection
 
 SentinelDB always answers `SSLRequest` and `GSSENCRequest` with a single

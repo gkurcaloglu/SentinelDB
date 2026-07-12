@@ -19,11 +19,22 @@ import (
 // reddeder (bkz. internal/firewall/gate.go, isExtendedProtocolMessage). Bu
 // dosya yalnizca ileriki asamalarin (bkz. docs/design/0001-extended-query.md,
 // "Implementation decomposition" bolumu, asama 2) uzerine insa edecegi
-// bagimsiz bir yapi tasidir.
+// bagimsiz bir yapi tasidir. Bu asamada hicbir gateway/masking/firewall
+// entegrasyonu yapilmamistir.
 //
 // Concurrency: State, tek bir goroutine tarafindan sirali cagrilmak uzere
 // tasarlanmistir (protocol.Decoder'in kendi buf alani gibi) - dahili hicbir
 // kilitleme yapmaz. Baglanti basina bir State ornegi kullanilmalidir.
+//
+// Degismezlik (immutability) sozlesmesi: TUM public sorgulama/olusturma/
+// onaylama metodlari (ResolveStatement/CommittedStatement/ResolvePortal/
+// CommittedPortal/Statement/Portal/PendingOperations/Create*/
+// ApplyParseComplete/ApplyBindComplete dahil) State icinde saklanan
+// nesnelere degil, TAM (struct + tum slice alanlari) bagimsiz KOPYALARINA
+// deger olarak doner. Donen bir degeri (ör. ParamOIDs[0]'i) degistirmek
+// State'in dahili durumunu ASLA etkilemez - dahili mutasyon yalnizca State
+// metodlari araciligiyla olur. Bkz. copyStatementGeneration/
+// copyPortalGeneration/copyPendingOperation.
 
 // GenerationID, bir prepared statement ya da portal "generation"ini
 // (bkz. docs/design/0001-extended-query.md, "Object generations") tekil
@@ -89,6 +100,10 @@ const (
 // deyim (prepared statement) generation kaydidir. Bind parametre DEGERLERI
 // hicbir zaman burada saklanmaz - yalnizca Parse ile birlikte gelen
 // parametre OID'leri (deger degil, tip bilgisi) kopyalanir.
+//
+// State'ten donen her StatementGeneration DEGERI bagimsiz bir kopyadir
+// (bkz. dosya basi "Degismezlik sozlesmesi") - ParamOIDs dahil hicbir alani
+// degistirmek State'i etkilemez.
 type StatementGeneration struct {
 	ID    GenerationID
 	Name  string // "" ise isimsiz (unnamed) slot
@@ -105,6 +120,10 @@ type StatementGeneration struct {
 // BindMessage) bir Bind mesajindan turetilen, guvenli bir portal generation
 // kaydidir. Bind parametre DEGERLERI hicbir zaman burada saklanmaz -
 // yalnizca format kodlari ve NULL/NULL-olmayan bilgisi kopyalanir.
+//
+// State'ten donen her PortalGeneration DEGERI bagimsiz bir kopyadir (bkz.
+// dosya basi "Degismezlik sozlesmesi") - ParamFormats/ParamNulls/
+// ResultFormats dahil hicbir alani degistirmek State'i etkilemez.
 type PortalGeneration struct {
 	ID   GenerationID
 	Name string // "" ise isimsiz (unnamed) slot
@@ -131,6 +150,11 @@ type PortalGeneration struct {
 // islem kuyrugundaki tek bir girdidir. Ad/hedef alanlari, islem
 // olusturuldugu andaki degismez (immutable) bir goruntudur (snapshot) -
 // isim eslemeleri sonradan degisse bile bu girdi degismez.
+//
+// State'ten donen her PendingOperation DEGERI bagimsiz bir kopyadir (bkz.
+// dosya basi "Degismezlik sozlesmesi"); PendingOperation'in hicbir slice
+// alani olmadigindan (tum alanlar deger tipi) bu kopyalama otomatik olarak
+// tamdir.
 type PendingOperation struct {
 	ID    PendingOperationID
 	Cycle CycleID
@@ -140,10 +164,47 @@ type PendingOperation struct {
 	TargetName string
 	// TargetGeneration, bu islemin olusturdugu (Parse/Bind) ya da
 	// referans verdigi (Describe/Execute/Close) generation'in olusturma
-	// anindaki degismez ID'sidir. Close icin, hedef ad o anda bilinen bir
-	// committed generation'a karsilik gelmiyorsa NoGeneration olabilir
-	// (gercek sunucuda var olmayan bir adi kapatmak hata degildir).
+	// anindaki degismez ID'sidir - committed VEYA HALA PENDING olan bir
+	// generation'a isaret edebilir (ör. bir Close, karsilik gelen Parse/
+	// Bind henuz onaylanmadan pipeline edilmis olabilir; bkz.
+	// CreateCloseStatement/CreateClosePortal). Close icin, hedef ad o anda
+	// bilinen (committed ya da pending) hicbir generation'a karsilik
+	// gelmiyorsa NoGeneration olabilir (gercek sunucuda var olmayan bir
+	// adi kapatmak hata degildir).
 	TargetGeneration GenerationID
+}
+
+// --- Degismezlik (immutability) icin dahili derin-kopya yardimcilari ------
+//
+// Bu yardimcilar YALNIZCA State'in kendi paket-ici (internal) *T
+// isaretcilerinden (haritalarda saklanan, mutasyona ugrayabilen nesneler)
+// bagimsiz, tam DEGER kopyalari uretmek icindir - hicbir slice alani
+// atlanmaz. Public metodlarin TAMAMI donus degerlerini bu yardimcilar
+// araciligiyla uretir; hicbir public metod dahili bir *StatementGeneration/
+// *PortalGeneration/*PendingOperation'i dogrudan (ya da onun slice
+// alanlarindan birini paylasarak) disari sizdirmaz.
+func copyStatementGeneration(g *StatementGeneration) StatementGeneration {
+	c := *g
+	c.ParamOIDs = append([]uint32(nil), g.ParamOIDs...)
+	return c
+}
+
+func copyPortalGeneration(g *PortalGeneration) PortalGeneration {
+	c := *g
+	c.ParamFormats = append([]int16(nil), g.ParamFormats...)
+	c.ParamNulls = append([]bool(nil), g.ParamNulls...)
+	c.ResultFormats = append([]int16(nil), g.ResultFormats...)
+	return c
+}
+
+func copyPendingOperation(op *PendingOperation) PendingOperation {
+	// PendingOperation'in hicbir slice/isaretci alani yoktur (ID/Cycle/Kind
+	// int/uint tipli, TargetName string -Go'da stringler zaten degismezdir-,
+	// TargetGeneration GenerationID) - bu yuzden deger kopyasi (*op) zaten
+	// tamdir. Yine de diger iki yardimciyla simetri ve gelecekte
+	// PendingOperation'a slice alani eklenirse otomatik dogrulugu korumak
+	// icin ayri bir fonksiyon olarak tutulur.
+	return *op
 }
 
 // Sabit, guvenli hata kategorileri (bkz. gereksinim: hicbir hata SQL
@@ -243,7 +304,18 @@ func (s *State) allocOp() (PendingOperationID, error) {
 // sirasinda "gecici olarak gecerli" kabul edilir - bkz. tasarim belgesi,
 // "State should not be committed when the frontend message arrives").
 // Failed generation'lar hicbir zaman cozumlenmez.
-func (s *State) ResolveStatement(name string) (*StatementGeneration, bool) {
+//
+// Donen deger, dahili durumun bagimsiz bir kopyasidir (bkz. dosya basi
+// "Degismezlik sozlesmesi").
+func (s *State) ResolveStatement(name string) (StatementGeneration, bool) {
+	g, ok := s.resolveStatementPtr(name)
+	if !ok {
+		return StatementGeneration{}, false
+	}
+	return copyStatementGeneration(g), true
+}
+
+func (s *State) resolveStatementPtr(name string) (*StatementGeneration, bool) {
 	if name == "" {
 		if s.unnamedStatementCurrent == NoGeneration {
 			return nil, false
@@ -252,7 +324,8 @@ func (s *State) ResolveStatement(name string) (*StatementGeneration, bool) {
 		return g, ok
 	}
 	if id, ok := s.namedStatementCommitted[name]; ok {
-		return s.statements[id], true
+		g, ok := s.statements[id]
+		return g, ok
 	}
 	var best *StatementGeneration
 	for _, g := range s.statements {
@@ -271,27 +344,42 @@ func (s *State) ResolveStatement(name string) (*StatementGeneration, bool) {
 // CommittedStatement, "name" icin YALNIZCA backend tarafindan onaylanmis
 // (committed) generation'i dondurur - asla sadece pending olan bir
 // generation'i dondurmez.
-func (s *State) CommittedStatement(name string) (*StatementGeneration, bool) {
+//
+// Donen deger, dahili durumun bagimsiz bir kopyasidir.
+func (s *State) CommittedStatement(name string) (StatementGeneration, bool) {
 	if name == "" {
 		if s.unnamedStatementCurrent == NoGeneration {
-			return nil, false
+			return StatementGeneration{}, false
 		}
 		g, ok := s.statements[s.unnamedStatementCurrent]
 		if !ok || g.State != LifecycleCommitted {
-			return nil, false
+			return StatementGeneration{}, false
 		}
-		return g, true
+		return copyStatementGeneration(g), true
 	}
 	id, ok := s.namedStatementCommitted[name]
 	if !ok {
-		return nil, false
+		return StatementGeneration{}, false
 	}
 	g, ok := s.statements[id]
-	return g, ok
+	if !ok {
+		return StatementGeneration{}, false
+	}
+	return copyStatementGeneration(g), true
 }
 
 // ResolvePortal, ResolveStatement ile ayni kurallari portal'lar icin uygular.
-func (s *State) ResolvePortal(name string) (*PortalGeneration, bool) {
+//
+// Donen deger, dahili durumun bagimsiz bir kopyasidir.
+func (s *State) ResolvePortal(name string) (PortalGeneration, bool) {
+	g, ok := s.resolvePortalPtr(name)
+	if !ok {
+		return PortalGeneration{}, false
+	}
+	return copyPortalGeneration(g), true
+}
+
+func (s *State) resolvePortalPtr(name string) (*PortalGeneration, bool) {
 	if name == "" {
 		if s.unnamedPortalCurrent == NoGeneration {
 			return nil, false
@@ -300,7 +388,8 @@ func (s *State) ResolvePortal(name string) (*PortalGeneration, bool) {
 		return g, ok
 	}
 	if id, ok := s.namedPortalCommitted[name]; ok {
-		return s.portals[id], true
+		g, ok := s.portals[id]
+		return g, ok
 	}
 	var best *PortalGeneration
 	for _, g := range s.portals {
@@ -318,43 +407,49 @@ func (s *State) ResolvePortal(name string) (*PortalGeneration, bool) {
 
 // CommittedPortal, CommittedStatement ile ayni kurallari portal'lar icin
 // uygular.
-func (s *State) CommittedPortal(name string) (*PortalGeneration, bool) {
+//
+// Donen deger, dahili durumun bagimsiz bir kopyasidir.
+func (s *State) CommittedPortal(name string) (PortalGeneration, bool) {
 	if name == "" {
 		if s.unnamedPortalCurrent == NoGeneration {
-			return nil, false
+			return PortalGeneration{}, false
 		}
 		g, ok := s.portals[s.unnamedPortalCurrent]
 		if !ok || g.State != LifecycleCommitted {
-			return nil, false
+			return PortalGeneration{}, false
 		}
-		return g, true
+		return copyPortalGeneration(g), true
 	}
 	id, ok := s.namedPortalCommitted[name]
 	if !ok {
-		return nil, false
+		return PortalGeneration{}, false
 	}
 	g, ok := s.portals[id]
-	return g, ok
+	if !ok {
+		return PortalGeneration{}, false
+	}
+	return copyPortalGeneration(g), true
 }
 
-// Statement, verilen generation ID'sine sahip statement kaydinin bir
-// KOPYASINI dondurur (dahili haritanin mutasyona ugramasini onlemek icin).
+// Statement, verilen generation ID'sine sahip statement kaydinin bagimsiz
+// bir KOPYASINI dondurur (dahili haritanin mutasyona ugramasini onlemek
+// icin - ParamOIDs dahil).
 func (s *State) Statement(id GenerationID) (StatementGeneration, bool) {
 	g, ok := s.statements[id]
 	if !ok {
 		return StatementGeneration{}, false
 	}
-	return *g, true
+	return copyStatementGeneration(g), true
 }
 
-// Portal, verilen generation ID'sine sahip portal kaydinin bir KOPYASINI
-// dondurur.
+// Portal, verilen generation ID'sine sahip portal kaydinin bagimsiz bir
+// KOPYASINI dondurur (ParamFormats/ParamNulls/ResultFormats dahil).
 func (s *State) Portal(id GenerationID) (PortalGeneration, bool) {
 	g, ok := s.portals[id]
 	if !ok {
 		return PortalGeneration{}, false
 	}
-	return *g, true
+	return copyPortalGeneration(g), true
 }
 
 // --- Parse / Bind olusturma ----------------------------------------------
@@ -372,11 +467,26 @@ func (s *State) Portal(id GenerationID) (PortalGeneration, bool) {
 // FORWARD ANINDA (bu cagri sirasinda, ParseComplete beklenmeden) hemen
 // cozumlenemez hale gelir - gercek sunucunun kendi davranisini yansitir
 // (bkz. docs/design/0001-extended-query.md, "Object generations").
-func (s *State) CreateParse(name, query string, paramOIDs []uint32) (*PendingOperation, *StatementGeneration, error) {
+//
+// Atomiklik: tum tanimlayici (identifier) tahsisleri (generation VE
+// pending-op ID'si) herhangi bir dahili durum (statements haritasi,
+// unnamedStatementCurrent isaretcisi, pendingOps kuyrugu) degistirilmeden
+// ONCE yapilir. Boylece ErrIdentifierExhaustion ile basarisiz olan bir
+// cagri, State'te KISMI/YARIM hicbir yan etki birakmaz - ne bir generation
+// haritada kalir, ne isaretci degisir, ne de kuyruga bir islem eklenir.
+func (s *State) CreateParse(name, query string, paramOIDs []uint32) (PendingOperation, StatementGeneration, error) {
 	genID, err := s.allocGeneration()
 	if err != nil {
-		return nil, nil, err
+		return PendingOperation{}, StatementGeneration{}, err
 	}
+	opID, err := s.allocOp()
+	if err != nil {
+		// genID zaten tuketildi (sayaclar asla geri sarilmaz), ama HENUZ
+		// hicbir haritaya/isaretciye/kuyruga yazilmadi - geri alinacak bir
+		// yan etki yok.
+		return PendingOperation{}, StatementGeneration{}, err
+	}
+
 	gen := &StatementGeneration{
 		ID:           genID,
 		Name:         name,
@@ -390,13 +500,9 @@ func (s *State) CreateParse(name, query string, paramOIDs []uint32) (*PendingOpe
 		s.unnamedStatementCurrent = genID
 	}
 
-	opID, err := s.allocOp()
-	if err != nil {
-		return nil, nil, err
-	}
 	op := &PendingOperation{ID: opID, Cycle: s.currentCycle, Kind: OpParse, TargetName: name, TargetGeneration: genID}
 	s.pendingOps = append(s.pendingOps, op)
-	return op, gen, nil
+	return copyPendingOperation(op), copyStatementGeneration(gen), nil
 }
 
 // CreateBind, ALLOWED bir Bind mesaji icin yeni bir portal generation ve
@@ -406,16 +512,25 @@ func (s *State) CreateParse(name, query string, paramOIDs []uint32) (*PendingOpe
 //
 // paramValues DEGERLERI bu metoda hic verilmez - yalnizca NULL/NULL-olmayan
 // bilgisi (paramNulls) alinir.
-func (s *State) CreateBind(portalName, statementName string, paramFormats []int16, paramNulls []bool, resultFormats []int16) (*PendingOperation, *PortalGeneration, error) {
-	stmt, ok := s.ResolveStatement(statementName)
+//
+// Atomiklik: CreateParse ile ayni ilke - tum tanimlayici tahsisleri
+// (statement cozumlemesi HARIC - o zaten salt-okunur bir sorgudur) herhangi
+// bir dahili durum degistirilmeden once yapilir.
+func (s *State) CreateBind(portalName, statementName string, paramFormats []int16, paramNulls []bool, resultFormats []int16) (PendingOperation, PortalGeneration, error) {
+	stmt, ok := s.resolveStatementPtr(statementName)
 	if !ok {
-		return nil, nil, ErrUnknownStatement
+		return PendingOperation{}, PortalGeneration{}, ErrUnknownStatement
 	}
 
 	genID, err := s.allocGeneration()
 	if err != nil {
-		return nil, nil, err
+		return PendingOperation{}, PortalGeneration{}, err
 	}
+	opID, err := s.allocOp()
+	if err != nil {
+		return PendingOperation{}, PortalGeneration{}, err
+	}
+
 	gen := &PortalGeneration{
 		ID:            genID,
 		Name:          portalName,
@@ -431,13 +546,9 @@ func (s *State) CreateBind(portalName, statementName string, paramFormats []int1
 		s.unnamedPortalCurrent = genID
 	}
 
-	opID, err := s.allocOp()
-	if err != nil {
-		return nil, nil, err
-	}
 	op := &PendingOperation{ID: opID, Cycle: s.currentCycle, Kind: OpBind, TargetName: portalName, TargetGeneration: genID}
 	s.pendingOps = append(s.pendingOps, op)
-	return op, gen, nil
+	return copyPendingOperation(op), copyPortalGeneration(gen), nil
 }
 
 // --- Describe / Execute olusturma -----------------------------------------
@@ -445,65 +556,84 @@ func (s *State) CreateBind(portalName, statementName string, paramFormats []int1
 // CreateDescribeStatement, bilinen (committed ya da gecerli sekilde
 // pending) bir statement icin bir Describe islemi kaydeder. Bilinmiyorsa
 // ErrUnknownStatement doner.
-func (s *State) CreateDescribeStatement(name string) (*PendingOperation, error) {
-	stmt, ok := s.ResolveStatement(name)
+func (s *State) CreateDescribeStatement(name string) (PendingOperation, error) {
+	stmt, ok := s.resolveStatementPtr(name)
 	if !ok {
-		return nil, ErrUnknownStatement
+		return PendingOperation{}, ErrUnknownStatement
 	}
 	return s.createSimpleOp(OpDescribeStatement, name, stmt.ID)
 }
 
 // CreateDescribePortal, bilinen bir portal icin bir Describe islemi
 // kaydeder. Bilinmiyorsa ErrUnknownPortal doner.
-func (s *State) CreateDescribePortal(name string) (*PendingOperation, error) {
-	p, ok := s.ResolvePortal(name)
+func (s *State) CreateDescribePortal(name string) (PendingOperation, error) {
+	p, ok := s.resolvePortalPtr(name)
 	if !ok {
-		return nil, ErrUnknownPortal
+		return PendingOperation{}, ErrUnknownPortal
 	}
 	return s.createSimpleOp(OpDescribePortal, name, p.ID)
 }
 
 // CreateExecute, bilinen bir portal icin bir Execute islemi kaydeder.
 // Bilinmiyorsa ErrUnknownPortal doner.
-func (s *State) CreateExecute(portalName string) (*PendingOperation, error) {
-	p, ok := s.ResolvePortal(portalName)
+func (s *State) CreateExecute(portalName string) (PendingOperation, error) {
+	p, ok := s.resolvePortalPtr(portalName)
 	if !ok {
-		return nil, ErrUnknownPortal
+		return PendingOperation{}, ErrUnknownPortal
 	}
 	return s.createSimpleOp(OpExecute, portalName, p.ID)
 }
 
-func (s *State) createSimpleOp(kind OperationKind, name string, target GenerationID) (*PendingOperation, error) {
+// createSimpleOp, tek bir tanimlayici tahsisi (allocOp) disinda hicbir
+// fallible adim icermez ve bu tahsis herhangi bir durum degisikliginden
+// ONCE yapilir - bu yuzden zaten atomiktir (ya tamamen basarili olur ya da
+// hicbir yan etki birakmadan hata doner).
+func (s *State) createSimpleOp(kind OperationKind, name string, target GenerationID) (PendingOperation, error) {
 	opID, err := s.allocOp()
 	if err != nil {
-		return nil, err
+		return PendingOperation{}, err
 	}
 	op := &PendingOperation{ID: opID, Cycle: s.currentCycle, Kind: kind, TargetName: name, TargetGeneration: target}
 	s.pendingOps = append(s.pendingOps, op)
-	return op, nil
+	return copyPendingOperation(op), nil
 }
 
 // --- Close olusturma -------------------------------------------------------
 
-// CreateCloseStatement, bir Close (statement) islemi kaydeder. Gercek
-// protokolde var olmayan bir adi kapatmak hata DEGILDIR (sunucu tarafinda
-// no-op) - bu yuzden bu metod, "name" bilinen bir committed statement'a
-// cozumlenmese bile HICBIR ZAMAN hata dondurmez; bu durumda dondurulen
-// islemin TargetGeneration'i NoGeneration olur (ApplyCloseComplete bunu
-// no-op olarak isler).
-func (s *State) CreateCloseStatement(name string) (*PendingOperation, error) {
+// CreateCloseStatement, bir Close (statement) islemi kaydeder.
+//
+// Hedef, Describe/Bind ile AYNI committed-veya-pending cozumleme kurallarini
+// (ResolveStatement) kullanarak belirlenir - YALNIZCA committed degil.
+// Bu, gecerli bir pipelined akisi (ör. "Parse statement_x" hemen ardindan,
+// ParseComplete beklenmeden, "Close statement_x") dogru sekilde destekler:
+// PostgreSQL mesajlari sirayla isler, bu yuzden Parse basarili olursa
+// ardindan gelen Close o YENI (henuz pending) generation'i basariyla
+// kapatabilir.
+//
+// Gercek protokolde var olmayan bir adi kapatmak hata DEGILDIR (sunucu
+// tarafinda no-op) - bu yuzden bu metod, "name" ne committed ne de pending
+// bilinen bir generation'a cozumlenmese bile HICBIR ZAMAN hata dondurmez;
+// bu durumda dondurulen islemin TargetGeneration'i NoGeneration olur
+// (ApplyCloseComplete bunu no-op olarak isler).
+//
+// Donen PendingOperation.TargetGeneration, bu cagri anindaki DEGISMEZ bir
+// goruntudur (snapshot): isim eslemeleri (ör. ayni ad baska bir generation'a
+// tasinsa) sonradan degisse bile, ApplyCloseComplete HER ZAMAN bu ayni,
+// yakalanmis generation'i hedefler - ismi asla YENIDEN cozumlemez.
+func (s *State) CreateCloseStatement(name string) (PendingOperation, error) {
 	target := NoGeneration
-	if g, ok := s.CommittedStatement(name); ok {
+	if g, ok := s.resolveStatementPtr(name); ok {
 		target = g.ID
 	}
 	return s.createSimpleOp(OpCloseStatement, name, target)
 }
 
-// CreateClosePortal, CreateCloseStatement ile ayni kurallari portal'lar
-// icin uygular.
-func (s *State) CreateClosePortal(name string) (*PendingOperation, error) {
+// CreateClosePortal, CreateCloseStatement ile ayni kurallari (committed-
+// veya-pending cozumleme, degismez snapshot, var-olmayan-ad icin no-op)
+// portal'lar icin uygular.
+func (s *State) CreateClosePortal(name string) (PendingOperation, error) {
 	target := NoGeneration
-	if g, ok := s.CommittedPortal(name); ok {
+	if g, ok := s.resolvePortalPtr(name); ok {
 		target = g.ID
 	}
 	return s.createSimpleOp(OpClosePortal, name, target)
@@ -515,22 +645,27 @@ func (s *State) CreateClosePortal(name string) (*PendingOperation, error) {
 // kaydetmek" - registering Sync). Bu cagri, mevcut cycle'i KAPATIR: bu
 // noktadan sonra olusturulan her islem YENI bir cycle'a ait olur. Donen
 // PendingOperation.Cycle, KAPANAN (yeni degil) cycle'a aittir.
-func (s *State) CreateSync() (*PendingOperation, error) {
+//
+// Atomiklik: hem pending-op ID'si hem de yeni cycle ID'si, pendingOps/
+// outstandingSyncCycles/currentCycle degistirilmeden ONCE tahsis edilir -
+// ikinci tahsis (allocCycle) basarisiz olursa, ilk basarili tahsisin
+// (allocOp) hicbir gozlemlenebilir yan etkisi olmamistir.
+func (s *State) CreateSync() (PendingOperation, error) {
 	opID, err := s.allocOp()
 	if err != nil {
-		return nil, err
+		return PendingOperation{}, err
 	}
+	newCycle, err := s.allocCycle()
+	if err != nil {
+		return PendingOperation{}, err
+	}
+
 	closingCycle := s.currentCycle
 	op := &PendingOperation{ID: opID, Cycle: closingCycle, Kind: OpSync}
 	s.pendingOps = append(s.pendingOps, op)
 	s.outstandingSyncCycles = append(s.outstandingSyncCycles, closingCycle)
-
-	newCycle, err := s.allocCycle()
-	if err != nil {
-		return nil, err
-	}
 	s.currentCycle = newCycle
-	return op, nil
+	return copyPendingOperation(op), nil
 }
 
 // CurrentCycle, su an yeni islemlerin damgalanacagi (henuz Sync ile
@@ -570,45 +705,52 @@ func (s *State) popHead(id PendingOperationID, wantKinds ...OperationKind) (*Pen
 // ApplyParseComplete, "id" bekleyen Parse islemine gercek sunucudan
 // ParseComplete geldigini bildirir: generation "committed" olur ve
 // (isimliyse) adin committed haritasina yazilir.
-func (s *State) ApplyParseComplete(id PendingOperationID) (*StatementGeneration, error) {
+//
+// Donen deger, dahili durumun bagimsiz bir kopyasidir.
+func (s *State) ApplyParseComplete(id PendingOperationID) (StatementGeneration, error) {
 	op, err := s.popHead(id, OpParse)
 	if err != nil {
-		return nil, err
+		return StatementGeneration{}, err
 	}
 	gen, ok := s.statements[op.TargetGeneration]
 	if !ok {
-		return nil, ErrUnknownGeneration
+		return StatementGeneration{}, ErrUnknownGeneration
 	}
 	gen.State = LifecycleCommitted
 	if gen.Name != "" {
 		s.namedStatementCommitted[gen.Name] = gen.ID
 	}
 	s.cleanup()
-	return gen, nil
+	return copyStatementGeneration(gen), nil
 }
 
 // ApplyBindComplete, ApplyParseComplete ile ayni kurallari Bind/portal
 // icin uygular.
-func (s *State) ApplyBindComplete(id PendingOperationID) (*PortalGeneration, error) {
+//
+// Donen deger, dahili durumun bagimsiz bir kopyasidir.
+func (s *State) ApplyBindComplete(id PendingOperationID) (PortalGeneration, error) {
 	op, err := s.popHead(id, OpBind)
 	if err != nil {
-		return nil, err
+		return PortalGeneration{}, err
 	}
 	gen, ok := s.portals[op.TargetGeneration]
 	if !ok {
-		return nil, ErrUnknownGeneration
+		return PortalGeneration{}, ErrUnknownGeneration
 	}
 	gen.State = LifecycleCommitted
 	if gen.Name != "" {
 		s.namedPortalCommitted[gen.Name] = gen.ID
 	}
 	s.cleanup()
-	return gen, nil
+	return copyPortalGeneration(gen), nil
 }
 
 // ApplyCloseComplete, "id" bekleyen Close islemine gercek sunucudan
 // CloseComplete geldigini bildirir. Hedef generation, Close olusturuldugu
-// andaki DEGISMEZ goruntudur (isim eslemeleri sonradan degismis olsa bile).
+// andaki DEGISMEZ goruntudur (isim eslemeleri sonradan degismis olsa bile,
+// ya da hedef generation Close olusturuldugunda hala pending idiyse ve o
+// sirada zaten commit/fail olmus olsa bile) - isim BURADA YENIDEN
+// COZUMLENMEZ, yalnizca yakalanmis TargetGeneration kullanilir.
 //
 //   - Statement kapatma basarili olursa: statement kaldirilir VE o TAM
 //     generation'dan olusturulmus her portal da kaldirilir (cascade).
@@ -917,12 +1059,14 @@ func (s *State) PortalCount() int           { return len(s.portals) }
 func (s *State) PendingOperationCount() int { return len(s.pendingOps) }
 func (s *State) OutstandingCycleCount() int { return len(s.outstandingSyncCycles) }
 
-// PendingOperations, kuyruktaki islemlerin sirali bir KOPYASINI dondurur
-// (yalnizca testler/gozlem icin - dahili kuyrugu degistirmez).
+// PendingOperations, kuyruktaki islemlerin sirali, bagimsiz bir
+// KOPYASINI dondurur (yalnizca testler/gozlem icin - dahili kuyrugu
+// degistirmez; donen dilimi ya da elemanlarini degistirmek State'i
+// etkilemez).
 func (s *State) PendingOperations() []PendingOperation {
 	out := make([]PendingOperation, len(s.pendingOps))
 	for i, op := range s.pendingOps {
-		out[i] = *op
+		out[i] = copyPendingOperation(op)
 	}
 	return out
 }

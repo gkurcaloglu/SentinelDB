@@ -324,6 +324,16 @@ func (s *ResponseSequencer) drain() []OutputAction {
 	return actions
 }
 
+// HasPendingWork, plan kuyrugunda (iletilmis ya da sentetik) cozumlenmeyi
+// bekleyen en az bir birim olup olmadigini bildirir. Hicbir birimin
+// icerigini disariya yansitmaz - yalnizca bir cagiranin (ör. gelecekteki
+// bir calisma zamani bilesenin), backend baglantisinin erken kapanmasinin
+// sirali/temiz bir durdurma mi yoksa cozumlenmemis bir sekans ortasinda
+// beklenmedik bir kopma mi oldugunu ayirt edebilmesi icin.
+func (s *ResponseSequencer) HasPendingWork() bool {
+	return len(s.plan) > 0
+}
+
 func isAsyncBackendType(t MessageType) bool {
 	return t == MsgNoticeResponse || t == MsgParameterStatus || t == MsgNotificationResponse
 }

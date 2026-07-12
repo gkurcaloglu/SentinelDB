@@ -326,6 +326,45 @@ is still rejected fail-closed at runtime, exactly as described above —
 this component exists purely so the response-ordering logic a later stage
 needs can be built and tested in isolation.
 
+### Standalone event-driven runtime loop (no runtime wiring)
+
+`internal/gateway/extended_runtime.go` adds a standalone,
+connection-local `gateway.ExtendedRuntime` that combines frontend
+plan-registration events (`RegisterForwardedOperation`,
+`SubmitSyntheticError`) and decoded backend-frame events into a single
+ordered stream of client writes, using the `protocol.ResponseSequencer`
+described above internally. It lives in a new `internal/gateway` package
+— deliberately *not* inside `internal/protocol`, which every Extended
+Query component so far has kept free of I/O and goroutines by design —
+following the same dependency direction already used by
+`internal/firewall` and `internal/masking` (both depend on
+`internal/protocol`, never the reverse).
+
+Unlike the earlier Extended Query components, `ExtendedRuntime` *does*
+use goroutines, channels, and real `net.Conn`-shaped I/O
+(`io.ReadCloser`/`io.WriteCloser`): one backend-reader goroutine decodes
+bytes from the upstream connection into `protocol.Message` values and
+feeds them, and its own read/decode failures, through a bounded channel;
+one event-loop goroutine — the **only** component that ever writes to the
+client — drains that channel and a second, separate bounded channel of
+frontend events, calling into the `ResponseSequencer` synchronously (it
+is never called concurrently) and writing every resulting `OutputAction`
+in order. The backend reader applies real backpressure: a full backend
+event channel blocks further reads from the real upstream socket rather
+than dropping frames. The runtime owns shutdown of both connections
+itself — closing them is what unblocks an in-progress blocked
+`Read`/`Write` call, since context cancellation alone cannot interrupt an
+arbitrary `io.Reader`/`io.Writer`.
+
+**This is still not part of the live gateway.** `ExtendedRuntime` is not
+constructed or called anywhere in `cmd/gateway`, `firewall.Gate`, or
+`masking.Transformer` — it has no call site outside its own tests.
+Extended Query is still rejected fail-closed at runtime, exactly as
+described above; this component exists purely so the event-driven
+execution shell a later integration stage needs (wiring `firewall.Gate`
+as the frontend producer, connecting the real upstream socket) can be
+built and tested in isolation first.
+
 ## SSLRequest / GSSENCRequest rejection
 
 SentinelDB always answers `SSLRequest` and `GSSENCRequest` with a single

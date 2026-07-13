@@ -36,9 +36,16 @@ func NewPolicy(rt *Runtime, blockedPhrases []string, onError func(error)) *Polic
 	return &Policy{rt: rt, blockedPhrases: blockedPhrases, onError: onError}
 }
 
-// Evaluate, firewall.Policy arayüzünü karşılar.
+// Evaluate, firewall.Policy arayüzünü karşılar. MsgQuery (Simple Query)
+// VE MsgParse (Extended Query Parse) denetlenir - SQL şablonunu taşıyan
+// TEK frontend mesaj türleri bunlardır (bkz.
+// internal/firewall/extended_frontend.go, "Parse-time policy evaluation").
+// Wasm ABI'sine yalnızca m.Query (düz metin) geçilir - m.Type/m.Raw hiçbir
+// zaman sınırı geçmez (bkz. internal/wasmproto.Envelope), bu yüzden bu
+// denetim SIRF host tarafında yapılır ve eklenti tarafında herhangi bir
+// değişiklik gerektirmez.
 func (p *Policy) Evaluate(m protocol.Message) (firewall.Verdict, string) {
-	if m.Type != protocol.MsgQuery {
+	if m.Type != protocol.MsgQuery && m.Type != protocol.MsgParse {
 		return firewall.Allow, ""
 	}
 

@@ -62,6 +62,82 @@ func fieldedErrorFrame(text string) []byte {
 
 func terminalOnlyErrorFrame() []byte { return buildFrame(protocol.MsgErrorResponse, []byte{0}) }
 
+// --- Test helpers: FRONTEND wire frame builders (bkz. gorev 3/4) -----------
+//
+// These build real, wire-accurate frontend frames (tag+length+body) for
+// RegisterAndForwardFrontendOperation/ForwardFlush/ForwardTerminate tests -
+// distinct from the FrontendOperationRequest builders below, which carry
+// only the safe out-of-band metadata the runtime needs for State/sequencer
+// registration.
+
+func cstr(s string) []byte { return append([]byte(s), 0) }
+
+func int16b(v int16) []byte {
+	b := make([]byte, 2)
+	binary.BigEndian.PutUint16(b, uint16(v))
+	return b
+}
+
+func int32b(v int32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, uint32(v))
+	return b
+}
+
+func feParseFrame(stmt, query string, oids []uint32) []byte {
+	body := append(cstr(stmt), cstr(query)...)
+	body = append(body, int16b(int16(len(oids)))...)
+	for _, o := range oids {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, o)
+		body = append(body, b...)
+	}
+	return buildFrame(protocol.MsgParse, body)
+}
+
+func feBindFrame(portal, stmt string, paramFormats []int16, params []protocol.BindParam, resultFormats []int16) []byte {
+	body := append(cstr(portal), cstr(stmt)...)
+	body = append(body, int16b(int16(len(paramFormats)))...)
+	for _, f := range paramFormats {
+		body = append(body, int16b(f)...)
+	}
+	body = append(body, int16b(int16(len(params)))...)
+	for _, p := range params {
+		if p.Null {
+			body = append(body, int32b(-1)...)
+			continue
+		}
+		body = append(body, int32b(int32(len(p.Value)))...)
+		body = append(body, p.Value...)
+	}
+	body = append(body, int16b(int16(len(resultFormats)))...)
+	for _, f := range resultFormats {
+		body = append(body, int16b(f)...)
+	}
+	return buildFrame(protocol.MsgBind, body)
+}
+
+func feDescribeFrame(target protocol.TargetType, name string) []byte {
+	body := append([]byte{byte(target)}, cstr(name)...)
+	return buildFrame(protocol.MsgDescribe, body)
+}
+
+func feExecuteFrame(portal string, maxRows int32) []byte {
+	body := append(cstr(portal), int32b(maxRows)...)
+	return buildFrame(protocol.MsgExecute, body)
+}
+
+func feCloseFrame(target protocol.TargetType, name string) []byte {
+	body := append([]byte{byte(target)}, cstr(name)...)
+	return buildFrame(protocol.MsgClose, body)
+}
+
+func feSyncFrame() []byte { return buildFrame(protocol.MsgSync, nil) }
+
+func feFlushFrame() []byte { return buildFrame(protocol.MsgFlush, nil) }
+
+func feTerminateFrame() []byte { return buildFrame(protocol.MsgTerminate, nil) }
+
 // --- Test helpers: frontend operation request builders --------------------
 //
 // State is now exclusively owned by the event loop (bkz. "Make the event
@@ -231,18 +307,121 @@ func (w *blockingWriteCloser) WriteCount() int { return int(w.writeCount.Load())
 // --- Test helpers: runtime setup -----------------------------------------
 
 func testRuntimeLimits() RuntimeLimits {
-	return RuntimeLimits{FrontendEventBuffer: 8, BackendEventBuffer: 8}
+	return RuntimeLimits{FrontendEventBuffer: 8, BackendEventBuffer: 8, MaxFrontendFrameBytes: 64 * 1024}
+}
+
+// readOnlyBackendTransport adapts a read/close-only backend test double
+// (e.g. the read side of an io.Pipe(), as used pervasively by tests written
+// before ExtendedRuntime owned the full backend transport - bkz. gorev 3)
+// into a BackendTransport. Its Write always fails: those older tests only
+// exercise RegisterFrontendOperation/SubmitSyntheticError, which never
+// write to the backend, so Write is never legitimately invoked on this
+// type - a real invocation indicates a test bug, not normal operation.
+type readOnlyBackendTransport struct {
+	io.ReadCloser
+}
+
+func (r readOnlyBackendTransport) Write(p []byte) (int, error) {
+	return 0, errors.New("test: backend transport is read-only in this test double")
+}
+
+// toBackendTransport adapts b into a BackendTransport: if b already
+// satisfies the interface (ör. net.Conn, or a purpose-built duplex test
+// double), it is used directly; otherwise it is wrapped as read-only.
+func toBackendTransport(b io.ReadCloser) BackendTransport {
+	if bt, ok := b.(BackendTransport); ok {
+		return bt
+	}
+	return readOnlyBackendTransport{ReadCloser: b}
 }
 
 func newTestRuntime(t *testing.T, backend io.ReadCloser, client io.WriteCloser) *ExtendedRuntime {
 	t.Helper()
 	s := protocol.NewState()
-	rt, err := NewExtendedRuntime(s, backend, client, protocol.DefaultSequencerLimits(), testRuntimeLimits())
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backend), client, protocol.DefaultSequencerLimits(), testRuntimeLimits())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return rt
 }
+
+// --- Test helpers: duplex backend transport (bkz. gorev 3) -----------------
+
+// duplexBackend is a BackendTransport test double for upstream-forwarding
+// tests: Write is captured (with the SAME injectable partial/no-progress/
+// error/concurrency-detection behavior as trackingWriter, via embedding),
+// while Read is served from an independently supplied io.Reader (typically
+// the read side of an io.Pipe(), simulating real backend response bytes).
+type duplexBackend struct {
+	*trackingWriter
+	r io.Reader
+}
+
+func newDuplexBackend(r io.Reader) *duplexBackend {
+	return &duplexBackend{trackingWriter: newTrackingWriter(), r: r}
+}
+
+func (d *duplexBackend) Read(p []byte) (int, error) { return d.r.Read(p) }
+
+// Close closes BOTH the write-capturing side (via the embedded
+// trackingWriter) AND the underlying read source, if closable - without
+// this, a backend-reader goroutine blocked in Read() would never observe
+// the shutdown watcher's Close() call and Run() would hang forever waiting
+// for it to join (bkz. gorev 3, "the backend reader goroutine may continue
+// reading concurrently").
+func (d *duplexBackend) Close() error {
+	_ = d.trackingWriter.Close()
+	if rc, ok := d.r.(io.Closer); ok {
+		return rc.Close()
+	}
+	return nil
+}
+
+// blockingBackendTransport is a BackendTransport test double whose Write
+// signals through enteredWrite the moment it begins, then blocks UNTIL
+// Close is called - the backend-side analogue of blockingWriteCloser, used
+// to deterministically prove the event loop has genuinely entered a
+// blocked upstream Write (bkz. gorev 15/16, "a blocked backend write
+// backpressures the event loop").
+type blockingBackendTransport struct {
+	r            io.Reader
+	enteredWrite chan struct{}
+	closed       chan struct{}
+	closeOnce    sync.Once
+	closeCalled  atomic.Bool
+	writeCount   atomic.Int32
+}
+
+func newBlockingBackendTransport(r io.Reader) *blockingBackendTransport {
+	return &blockingBackendTransport{r: r, enteredWrite: make(chan struct{}, 8), closed: make(chan struct{})}
+}
+
+func (w *blockingBackendTransport) Read(p []byte) (int, error) { return w.r.Read(p) }
+
+func (w *blockingBackendTransport) Write(p []byte) (int, error) {
+	w.writeCount.Add(1)
+	select {
+	case w.enteredWrite <- struct{}{}:
+	default:
+	}
+	<-w.closed
+	return 0, errors.New("test: backend write interrupted by connection close")
+}
+
+func (w *blockingBackendTransport) Close() error {
+	w.closeCalled.Store(true)
+	w.closeOnce.Do(func() { close(w.closed) })
+	// Also close the underlying read source (bkz. duplexBackend.Close's
+	// doc comment for why this is essential, not optional) - otherwise a
+	// backend-reader goroutine concurrently blocked in Read() never joins.
+	if rc, ok := w.r.(io.Closer); ok {
+		_ = rc.Close()
+	}
+	return nil
+}
+
+func (w *blockingBackendTransport) Closed() bool    { return w.closeCalled.Load() }
+func (w *blockingBackendTransport) WriteCount() int { return int(w.writeCount.Load()) }
 
 func waitStarted(t *testing.T, r *ExtendedRuntime) {
 	t.Helper()
@@ -329,7 +508,7 @@ func setupRuntimeExecuteHead(t *testing.T, ctx context.Context, rt *ExtendedRunt
 func TestNewExtendedRuntime_Validation(t *testing.T) {
 	validLimits := testRuntimeLimits()
 	s := protocol.NewState()
-	backend := io.NopCloser(strings.NewReader(""))
+	backend := toBackendTransport(io.NopCloser(strings.NewReader("")))
 	client := newTrackingWriter()
 
 	if _, err := NewExtendedRuntime(nil, backend, client, protocol.DefaultSequencerLimits(), validLimits); !errors.Is(err, ErrNilState) {
@@ -343,9 +522,11 @@ func TestNewExtendedRuntime_Validation(t *testing.T) {
 	}
 
 	badLimits := []RuntimeLimits{
-		{FrontendEventBuffer: 0, BackendEventBuffer: 1},
-		{FrontendEventBuffer: 1, BackendEventBuffer: 0},
-		{FrontendEventBuffer: -1, BackendEventBuffer: 1},
+		{FrontendEventBuffer: 0, BackendEventBuffer: 1, MaxFrontendFrameBytes: 1024},
+		{FrontendEventBuffer: 1, BackendEventBuffer: 0, MaxFrontendFrameBytes: 1024},
+		{FrontendEventBuffer: -1, BackendEventBuffer: 1, MaxFrontendFrameBytes: 1024},
+		{FrontendEventBuffer: 1, BackendEventBuffer: 1, MaxFrontendFrameBytes: 0},
+		{FrontendEventBuffer: 1, BackendEventBuffer: 1, MaxFrontendFrameBytes: -1},
 	}
 	for i, l := range badLimits {
 		if _, err := NewExtendedRuntime(s, backend, client, protocol.DefaultSequencerLimits(), l); !errors.Is(err, ErrInvalidRuntimeLimits) {
@@ -1038,8 +1219,8 @@ func TestExtendedRuntime_BackendReading_ChannelBackpressureNoMessageLoss(t *test
 	backendR, backendW := io.Pipe()
 	client := newTrackingWriter()
 	s := protocol.NewState()
-	limits := RuntimeLimits{FrontendEventBuffer: 1, BackendEventBuffer: 1} // deliberately tiny
-	rt, err := NewExtendedRuntime(s, backendR, client, protocol.DefaultSequencerLimits(), limits)
+	limits := RuntimeLimits{FrontendEventBuffer: 1, BackendEventBuffer: 1, MaxFrontendFrameBytes: 64 * 1024} // deliberately tiny
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backendR), client, protocol.DefaultSequencerLimits(), limits)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1358,7 +1539,7 @@ func TestExtendedRuntime_Divergence_SequencerCapacityFailureAfterStateCreation_T
 	s := protocol.NewState()
 	seqLimits := protocol.DefaultSequencerLimits()
 	seqLimits.MaxPlanUnits = 1 // exhausted after the first registration
-	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, testRuntimeLimits())
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backendR), client, seqLimits, testRuntimeLimits())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1396,7 +1577,7 @@ func TestExtendedRuntime_Divergence_DuplicateRegistrationAfterStateCreation_Term
 	s := protocol.NewState()
 	seqLimits := protocol.DefaultSequencerLimits()
 	seqLimits.MaxPlanUnits = 1
-	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, testRuntimeLimits())
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backendR), client, seqLimits, testRuntimeLimits())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1435,7 +1616,7 @@ func TestExtendedRuntime_Divergence_ErrorsContainNoClientMarkers(t *testing.T) {
 	s := protocol.NewState()
 	seqLimits := protocol.DefaultSequencerLimits()
 	seqLimits.MaxPlanUnits = 1
-	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, testRuntimeLimits())
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backendR), client, seqLimits, testRuntimeLimits())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1462,8 +1643,8 @@ func TestExtendedRuntime_AcceptedEvent_ContextCanceledBeforeEnqueue_NotProcessed
 	defer backendW.Close()
 	client := newTrackingWriter()
 	s := protocol.NewState()
-	limits := RuntimeLimits{FrontendEventBuffer: 1, BackendEventBuffer: 1}
-	rt, err := NewExtendedRuntime(s, backendR, client, protocol.DefaultSequencerLimits(), limits)
+	limits := RuntimeLimits{FrontendEventBuffer: 1, BackendEventBuffer: 1, MaxFrontendFrameBytes: 64 * 1024}
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backendR), client, protocol.DefaultSequencerLimits(), limits)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1616,8 +1797,8 @@ func TestExtendedRuntime_AcceptedEvent_RuntimeTermination_ReleasesUnprocessedSub
 	s := protocol.NewState()
 	seqLimits := protocol.DefaultSequencerLimits()
 	seqLimits.MaxPlanUnits = 1
-	limits := RuntimeLimits{FrontendEventBuffer: 2, BackendEventBuffer: 2}
-	rt, err := NewExtendedRuntime(s, backendR, client, seqLimits, limits)
+	limits := RuntimeLimits{FrontendEventBuffer: 2, BackendEventBuffer: 2, MaxFrontendFrameBytes: 64 * 1024}
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backendR), client, seqLimits, limits)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3165,5 +3346,1009 @@ func TestExtendedRuntime_ShutdownLinearization_SuccessBeforeCancellation_Repeate
 				t.Fatalf("iteration %d: expected context.Canceled, got %v", i, runErr)
 			}
 		}()
+	}
+}
+
+// ==========================================================================
+// Upstream forwarding: RegisterAndForwardFrontendOperation/ForwardFlush/
+// ForwardTerminate/SubmitSyntheticErrorForCurrentCycle/NotifyFrontendClosed
+// (bkz. gorev 3, 5, 6, 7)
+// ==========================================================================
+
+func mustRegisterForward(t *testing.T, ctx context.Context, rt *ExtendedRuntime, req FrontendOperationRequest, frame []byte) protocol.CorrelatedOperation {
+	t.Helper()
+	reg, err := rt.RegisterAndForwardFrontendOperation(ctx, req, frame)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return reg.Operation
+}
+
+func TestExtendedRuntime_UpstreamForwarding_AllOperationKindsForward(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	var want []byte
+	step := func(req FrontendOperationRequest, frame []byte) {
+		t.Helper()
+		mustRegisterForward(t, context.Background(), rt, req, frame)
+		want = append(want, frame...)
+		if !bytes.Equal(backend.Snapshot(), want) {
+			t.Fatalf("forwarded bytes mismatch: got %x want %x", backend.Snapshot(), want)
+		}
+	}
+
+	step(FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, feParseFrame("s1", "SELECT 1", nil))
+	step(FrontendOperationRequest{Kind: protocol.OpBind, PortalName: "p1", StatementName: "s1"}, feBindFrame("p1", "s1", nil, nil, nil))
+	step(FrontendOperationRequest{Kind: protocol.OpDescribeStatement, StatementName: "s1"}, feDescribeFrame(protocol.TargetStatement, "s1"))
+	step(FrontendOperationRequest{Kind: protocol.OpDescribePortal, PortalName: "p1"}, feDescribeFrame(protocol.TargetPortal, "p1"))
+	step(FrontendOperationRequest{Kind: protocol.OpExecute, PortalName: "p1"}, feExecuteFrame("p1", 0))
+	step(FrontendOperationRequest{Kind: protocol.OpCloseStatement, StatementName: "s1"}, feCloseFrame(protocol.TargetStatement, "s1"))
+	step(FrontendOperationRequest{Kind: protocol.OpClosePortal, PortalName: "p1"}, feCloseFrame(protocol.TargetPortal, "p1"))
+	step(FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+
+	if backend.ConcurrentViolation() {
+		t.Fatal("detected concurrent backend writes")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_UpstreamForwarding_CreateStateFailureWritesNothing(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	_, err := rt.RegisterAndForwardFrontendOperation(context.Background(),
+		FrontendOperationRequest{Kind: protocol.OpBind, PortalName: "p1", StatementName: "does-not-exist"},
+		feBindFrame("p1", "does-not-exist", nil, nil, nil))
+	if !errors.Is(err, protocol.ErrUnknownStatement) {
+		t.Fatalf("expected ErrUnknownStatement, got %v", err)
+	}
+	if backend.WriteCount() != 0 {
+		t.Fatalf("expected no upstream write on a mutation-free rejection, got %d writes", backend.WriteCount())
+	}
+
+	// Runtime must remain fully usable afterward (bkz. gorev 3).
+	mustRegisterForward(t, context.Background(), rt, FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, feParseFrame("s1", "SELECT 1", nil))
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_UpstreamForwarding_DivergenceWritesNothingThenTerminates(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	seqLimits := protocol.DefaultSequencerLimits()
+	seqLimits.MaxPlanUnits = 1
+	rt, err := NewExtendedRuntime(s, backend, client, seqLimits, testRuntimeLimits())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	done := runInBackground(t, rt, context.Background())
+
+	mustRegisterForward(t, context.Background(), rt, FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame()) // fills the 1-unit plan capacity
+
+	_, regErr := rt.RegisterAndForwardFrontendOperation(context.Background(),
+		FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"},
+		feParseFrame("s1", "SELECT 1", nil))
+	if !errors.Is(regErr, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("expected ErrFrontendRegistrationDiverged, got %v", regErr)
+	}
+	// The diverged Parse must NEVER reach the backend - only the earlier
+	// successful Sync should have been forwarded.
+	if !bytes.Equal(backend.Snapshot(), feSyncFrame()) {
+		t.Fatalf("expected only the Sync frame forwarded, got %x", backend.Snapshot())
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendRegistrationDiverged) {
+		t.Fatalf("expected Run to return ErrFrontendRegistrationDiverged, got %v", runErr)
+	}
+	if !client.Closed() {
+		t.Fatal("expected the client connection closed")
+	}
+}
+
+func TestExtendedRuntime_UpstreamForwarding_PartialWriteCompletesFrame(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	backend.partialN = 3
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	frame := feParseFrame("s1", "SELECT 1", nil)
+	mustRegisterForward(t, context.Background(), rt, FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, frame)
+	if !bytes.Equal(backend.Snapshot(), frame) {
+		t.Fatalf("expected the complete frame forwarded despite partial writes, got %x want %x", backend.Snapshot(), frame)
+	}
+	if backend.WriteCount() < 2 {
+		t.Fatalf("expected multiple Write calls due to partial writes, got %d", backend.WriteCount())
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_UpstreamForwarding_NoProgressFailsClosed(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	backend.noProgressOnce = true
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	frame := feParseFrame("s1", "SELECT 1", nil)
+	_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, frame)
+	if !errors.Is(err, ErrBackendWriteFailed) || !errors.Is(err, ErrNoProgress) {
+		t.Fatalf("expected wrapped ErrBackendWriteFailed/ErrNoProgress, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrBackendWriteFailed) {
+		t.Fatalf("expected Run to return ErrBackendWriteFailed, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_UpstreamForwarding_WriteErrorAfterRegistrationTerminates(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	injected := errors.New("test: simulated backend write failure")
+	backend.writeErrOnce = injected
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	frame := feParseFrame("s1", "SELECT 1", nil)
+	_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, frame)
+	if !errors.Is(err, ErrBackendWriteFailed) {
+		t.Fatalf("expected ErrBackendWriteFailed, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrBackendWriteFailed) {
+		t.Fatalf("expected Run to return ErrBackendWriteFailed, got %v", runErr)
+	}
+	// The runtime is now fully stopped - proving State/sequencer
+	// registration already happened (a plan unit is now permanently
+	// stranded) before the write failure terminated it.
+	if _, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame()); !errors.Is(err, ErrRuntimeStopped) {
+		t.Fatalf("expected ErrRuntimeStopped after the backend write failure, got %v", err)
+	}
+}
+
+func TestExtendedRuntime_UpstreamForwarding_InvalidFrameNeverWritten(t *testing.T) {
+	cases := []struct {
+		name  string
+		req   FrontendOperationRequest
+		frame []byte
+	}{
+		{"wrong tag", FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, feBindFrame("p1", "s1", nil, nil, nil)},
+		{"truncated", FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, feParseFrame("s1", "SELECT 1", nil)[:3]},
+		{"trailing bytes", FrontendOperationRequest{Kind: protocol.OpSync}, append(feSyncFrame(), 0xFF)},
+		{"describe target mismatch", FrontendOperationRequest{Kind: protocol.OpDescribeStatement, StatementName: "s1"}, feDescribeFrame(protocol.TargetPortal, "s1")},
+		{"close target mismatch", FrontendOperationRequest{Kind: protocol.OpClosePortal, PortalName: "p1"}, feCloseFrame(protocol.TargetStatement, "p1")},
+		{"malformed body", FrontendOperationRequest{Kind: protocol.OpBind, PortalName: "p1", StatementName: "s1"}, buildFrame(protocol.MsgBind, []byte{0})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backendPipeR, _ := io.Pipe()
+			defer backendPipeR.Close()
+			backend := newDuplexBackend(backendPipeR)
+			client := newTrackingWriter()
+			rt := newTestRuntime(t, backend, client)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := runInBackground(t, rt, ctx)
+
+			_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), tc.req, tc.frame)
+			if !errors.Is(err, ErrInvalidFrontendFrame) {
+				t.Fatalf("expected ErrInvalidFrontendFrame, got %v", err)
+			}
+			if backend.WriteCount() != 0 {
+				t.Fatalf("expected no upstream write, got %d", backend.WriteCount())
+			}
+			mustRegisterForward(t, context.Background(), rt, FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+
+			cancel()
+			waitDone(t, done)
+		})
+	}
+}
+
+func TestExtendedRuntime_UpstreamForwarding_FrameSizeLimitEnforced(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	limits := RuntimeLimits{FrontendEventBuffer: 8, BackendEventBuffer: 8, MaxFrontendFrameBytes: 16}
+	rt, err := NewExtendedRuntime(s, backend, client, protocol.DefaultSequencerLimits(), limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	query := "SELECT 1 FROM a_reasonably_long_table_name"
+	frame := feParseFrame("s1", query, nil)
+	if len(frame) <= 16 {
+		t.Fatalf("test setup error: frame not large enough to exceed the limit (%d bytes)", len(frame))
+	}
+	_, regErr := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: query}, frame)
+	if !errors.Is(regErr, ErrFrontendFrameTooLarge) {
+		t.Fatalf("expected ErrFrontendFrameTooLarge, got %v", regErr)
+	}
+	if backend.WriteCount() != 0 {
+		t.Fatalf("expected no upstream write, got %d", backend.WriteCount())
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_UpstreamForwarding_CallerFrameMutationIsolated(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	frame := feParseFrame("s1", "SELECT 1", nil)
+	original := append([]byte(nil), frame...)
+	mustRegisterForward(t, context.Background(), rt, FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, frame)
+	frame[5] = 0xFF // mutate the caller's own slice after submission returns
+
+	if !bytes.Equal(backend.Snapshot(), original) {
+		t.Fatalf("expected forwarded bytes independent of caller mutation, got %x want %x", backend.Snapshot(), original)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_UpstreamForwarding_NoConcurrentUpstreamWrites(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("s%d", i)
+			_, _ = rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpParse, StatementName: name, Query: "SELECT 1"}, feParseFrame(name, "SELECT 1", nil))
+		}(i)
+	}
+	wg.Wait()
+
+	if backend.ConcurrentViolation() {
+		t.Fatal("detected concurrent backend writes - the event loop must be the sole backend writer")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_UpstreamForwarding_BlockedWriteUnblockedByCancellation(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newBlockingBackendTransport(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+		submitDone <- err
+	}()
+
+	select {
+	case <-backend.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked backend Write")
+	}
+
+	cancel()
+
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("expected the blocked submitter to receive a definitive non-nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("submit did not unblock after cancellation - backend.Write was not interrupted")
+	}
+
+	if !backend.Closed() {
+		t.Fatal("expected backend Close to have been called to unblock the write")
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_UpstreamForwarding_NonDisclosure(t *testing.T) {
+	const secretStmt = "SECRET_UPSTREAM_STMT_MARKER"
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	_, err := rt.RegisterAndForwardFrontendOperation(context.Background(),
+		FrontendOperationRequest{Kind: protocol.OpBind, PortalName: "p1", StatementName: secretStmt},
+		feBindFrame("p1", secretStmt, nil, nil, nil))
+	if err == nil {
+		t.Fatal("expected an unknown-statement rejection")
+	}
+	if strings.Contains(err.Error(), secretStmt) {
+		t.Fatalf("upstream-forwarding rejection leaked the statement name marker: %v", err)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_UpstreamForwarding_BindValuesNeverInRequestOrErrors(t *testing.T) {
+	const secretValue = "SECRET_BIND_VALUE_MARKER"
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	mustRegisterForward(t, context.Background(), rt, FrontendOperationRequest{Kind: protocol.OpParse, StatementName: "s1", Query: "SELECT 1"}, feParseFrame("s1", "SELECT 1", nil))
+
+	params := []protocol.BindParam{{Value: []byte(secretValue)}}
+	frame := feBindFrame("p1", "s1", nil, params, nil)
+	reg, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{
+		Kind: protocol.OpBind, PortalName: "p1", StatementName: "s1", ParamNulls: []bool{false},
+	}, frame)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dumps := []string{fmt.Sprintf("%v", reg), fmt.Sprintf("%+v", reg), fmt.Sprintf("%#v", reg)}
+	for _, d := range dumps {
+		if strings.Contains(d, secretValue) {
+			t.Fatalf("Bind parameter value leaked into FrontendRegistration: %s", d)
+		}
+	}
+	// The value legitimately appears in the RAW forwarded frame (real
+	// relayed protocol content) - only the FrontendRegistration/error
+	// non-disclosure assertions above are meaningful here.
+	if !bytes.Contains(backend.Snapshot(), []byte(secretValue)) {
+		t.Fatal("expected the Bind value still present in the raw forwarded frame")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+// --- Flush ------------------------------------------------------------
+
+func TestExtendedRuntime_Flush_ForwardedWithNoPlanUnit(t *testing.T) {
+	backendPipeR, backendPipeW := io.Pipe()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	frame := feFlushFrame()
+	if err := rt.ForwardFlush(context.Background(), frame); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(backend.Snapshot(), frame) {
+		t.Fatalf("expected the Flush frame forwarded exactly once, got %x", backend.Snapshot())
+	}
+
+	backendPipeW.Close() // clean EOF
+	if err := waitDone(t, done); err != nil {
+		t.Fatalf("expected a clean stop (Flush must create no plan unit), got %v", err)
+	}
+}
+
+func TestExtendedRuntime_Flush_MalformedRejectedRuntimeStaysUsable(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	err := rt.ForwardFlush(context.Background(), buildFrame(protocol.MsgFlush, []byte{1}))
+	if !errors.Is(err, ErrInvalidFrontendFrame) {
+		t.Fatalf("expected ErrInvalidFrontendFrame, got %v", err)
+	}
+	if backend.WriteCount() != 0 {
+		t.Fatalf("expected no upstream write, got %d", backend.WriteCount())
+	}
+	if err := rt.ForwardFlush(context.Background(), feFlushFrame()); err != nil {
+		t.Fatalf("expected the runtime to remain usable, got %v", err)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+// --- Terminate --------------------------------------------------------
+
+func TestExtendedRuntime_Terminate_ForwardedExactlyOnceAndShutsDown(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	frame := feTerminateFrame()
+	if err := rt.ForwardTerminate(context.Background(), frame); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(backend.Snapshot(), frame) {
+		t.Fatalf("expected the Terminate frame forwarded exactly once, got %x", backend.Snapshot())
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendTerminateRequested) {
+		t.Fatalf("expected ErrFrontendTerminateRequested, got %v", runErr)
+	}
+	if !client.Closed() {
+		t.Fatal("expected the client connection closed")
+	}
+	if _, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame()); !errors.Is(err, ErrRuntimeStopped) {
+		t.Fatalf("expected later work rejected with ErrRuntimeStopped, got %v", err)
+	}
+}
+
+func TestExtendedRuntime_Terminate_MalformedRejectedRuntimeStaysUsable(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	err := rt.ForwardTerminate(context.Background(), buildFrame(protocol.MsgTerminate, []byte{1}))
+	if !errors.Is(err, ErrInvalidFrontendFrame) {
+		t.Fatalf("expected ErrInvalidFrontendFrame, got %v", err)
+	}
+	if backend.WriteCount() != 0 {
+		t.Fatalf("expected no upstream write, got %d", backend.WriteCount())
+	}
+
+	if err := rt.ForwardTerminate(context.Background(), feTerminateFrame()); err != nil {
+		t.Fatalf("expected the valid Terminate to still succeed, got %v", err)
+	}
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendTerminateRequested) {
+		t.Fatalf("expected ErrFrontendTerminateRequested, got %v", runErr)
+	}
+}
+
+// --- SubmitSyntheticErrorForCurrentCycle -------------------------------
+
+func TestExtendedRuntime_SyntheticCurrentCycle_ReturnsRuntimeOwnedCycle(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	cycle, err := rt.SubmitSyntheticErrorForCurrentCycle(context.Background(), minimalErrorFrame())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cycle == protocol.NoCycle {
+		t.Fatal("expected a real, non-zero current cycle")
+	}
+	if !bytes.Equal(client.Snapshot(), minimalErrorFrame()) {
+		t.Fatalf("expected the synthetic frame written to the client, got %x", client.Snapshot())
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_SyntheticCurrentCycle_AdvancesAfterSync(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	c1, err := rt.SubmitSyntheticErrorForCurrentCycle(context.Background(), minimalErrorFrame())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	syncOp := mustRegisterForward(t, context.Background(), rt, FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+	if syncOp.Cycle != c1 {
+		t.Fatalf("expected Sync to close the SAME cycle the synthetic error blocked, got %v want %v", syncOp.Cycle, c1)
+	}
+
+	c2, err := rt.SubmitSyntheticErrorForCurrentCycle(context.Background(), fieldedErrorFrame("second"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c2 == c1 {
+		t.Fatal("expected the current cycle to have advanced after Sync")
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+// --- NotifyFrontendClosed -----------------------------------------------
+
+func TestExtendedRuntime_NotifyFrontendClosed_EOF(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil); !errors.Is(err, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed, got %v", err)
+	}
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("expected Run to return ErrFrontendClosed, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_NotifyFrontendClosed_ReadError(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	injected := errors.New("test: simulated frontend read failure")
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedReadError, injected); !errors.Is(err, ErrFrontendReadFailed) {
+		t.Fatalf("expected ErrFrontendReadFailed, got %v", err)
+	}
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendReadFailed) {
+		t.Fatalf("expected Run to return ErrFrontendReadFailed, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_NotifyFrontendClosed_ProtocolError(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	injected := errors.New("test: simulated frontend protocol failure")
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedProtocolError, injected); !errors.Is(err, ErrFrontendProtocolFailure) {
+		t.Fatalf("expected ErrFrontendProtocolFailure, got %v", err)
+	}
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendProtocolFailure) {
+		t.Fatalf("expected Run to return ErrFrontendProtocolFailure, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_NotifyFrontendClosed_StopsWaitingForFrontendEvents(t *testing.T) {
+	// The backend reader blocks forever (no data, no close) - the ONLY
+	// way Run() can return promptly is if NotifyFrontendClosed correctly
+	// terminates the event loop without waiting for any further frontend
+	// or backend event (bkz. gorev 7).
+	backendPipeR, _ := io.Pipe()
+	defer backendPipeR.Close()
+	backend := newDuplexBackend(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+	done := runInBackground(t, rt, context.Background())
+
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil); !errors.Is(err, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed, got %v", err)
+	}
+	waitDone(t, done)
+}
+
+// ==========================================================================
+// Frontend-close shutdown supervisor: independent of a blocked event loop
+// (bkz. gorev 5, sertlestirme incelemesi)
+// ==========================================================================
+
+// TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendWrite proves
+// NotifyFrontendClosed can close the owned transports - and thereby
+// unblock the event loop - even while the event loop is genuinely, still
+// blocked deep inside a backend.Write call processing an EARLIER accepted
+// event. The old (pre-hardening) design routed NotifyFrontendClosed
+// through the same frontendEvents channel the blocked event loop was
+// trying to drain, so it could never be delivered in this scenario.
+func TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendWrite(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newBlockingBackendTransport(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+		submitDone <- err
+	}()
+
+	select {
+	case <-backend.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked backend Write")
+	}
+
+	notifyDone := make(chan error, 1)
+	go func() {
+		notifyDone <- rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil)
+	}()
+
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("expected the blocked submitter to receive a definitive non-nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("submit did not unblock after frontend closure - backend.Write was not interrupted")
+	}
+
+	if !backend.Closed() {
+		t.Fatal("expected backend Close to have been called to unblock the write")
+	}
+	if !client.Closed() {
+		t.Fatal("expected the client connection closed too")
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed to be primary, got %v", runErr)
+	}
+
+	select {
+	case err := <-notifyDone:
+		if !errors.Is(err, ErrFrontendClosed) {
+			t.Fatalf("expected NotifyFrontendClosed to return ErrFrontendClosed, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("NotifyFrontendClosed did not return within the bounded deadline")
+	}
+}
+
+// TestExtendedRuntime_FrontendShutdown_UnblocksBlockedClientWrite is the
+// client-write analogue of the backend-write test above: the event loop
+// is blocked writing a CLIENT-bound frame (ör. a synthetic ErrorResponse)
+// when a frontend read failure is reported.
+func TestExtendedRuntime_FrontendShutdown_UnblocksBlockedClientWrite(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newBlockingWriteCloser()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+
+	select {
+	case <-client.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked client Write")
+	}
+
+	injected := errors.New("test: simulated frontend read failure")
+	notifyDone := make(chan error, 1)
+	go func() {
+		notifyDone <- rt.NotifyFrontendClosed(context.Background(), FrontendClosedReadError, injected)
+	}()
+
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("expected the blocked submitter to receive a definitive non-nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("submit did not unblock after frontend closure - client.Write was not interrupted")
+	}
+
+	if !client.Closed() {
+		t.Fatal("expected client Close to have been called to unblock the write")
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendReadFailed) {
+		t.Fatalf("expected ErrFrontendReadFailed to be primary, got %v", runErr)
+	}
+
+	select {
+	case err := <-notifyDone:
+		if !errors.Is(err, ErrFrontendReadFailed) {
+			t.Fatalf("expected NotifyFrontendClosed to return ErrFrontendReadFailed, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("NotifyFrontendClosed did not return within the bounded deadline")
+	}
+}
+
+// TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendRead proves
+// the backend-reader goroutine (permanently blocked in Read, no data ever
+// sent) is still joined promptly once a frontend protocol failure is
+// reported - no goroutine leak.
+func TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendRead(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	backendR, _ := io.Pipe() // never written to, never closed by the test
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	injected := errors.New("test: simulated frontend protocol failure")
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedProtocolError, injected); !errors.Is(err, ErrFrontendProtocolFailure) {
+		t.Fatalf("expected ErrFrontendProtocolFailure, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendProtocolFailure) {
+		t.Fatalf("expected ErrFrontendProtocolFailure to be primary, got %v", runErr)
+	}
+
+	assertNoGoroutineLeak(t, before)
+}
+
+// TestExtendedRuntime_FrontendShutdown_NoSubmitterRemainsBlocked drives
+// several concurrent accepted submitters while the event loop is blocked
+// in a backend Write, then triggers a frontend close - every submitter
+// must receive a definitive result, none may hang.
+func TestExtendedRuntime_FrontendShutdown_NoSubmitterRemainsBlocked(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newBlockingBackendTransport(backendPipeR)
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	limits := RuntimeLimits{FrontendEventBuffer: 4, BackendEventBuffer: 4, MaxFrontendFrameBytes: 64 * 1024}
+	rt, err := NewExtendedRuntime(s, backend, client, protocol.DefaultSequencerLimits(), limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	const n = 3
+	results := make([]chan error, n)
+	for i := 0; i < n; i++ {
+		results[i] = make(chan error, 1)
+		go func(i int) {
+			name := fmt.Sprintf("s%d", i)
+			_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpParse, StatementName: name, Query: "SELECT 1"}, feParseFrame(name, "SELECT 1", nil))
+			results[i] <- err
+		}(i)
+	}
+
+	select {
+	case <-backend.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked backend Write")
+	}
+
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil); !errors.Is(err, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed, got %v", err)
+	}
+
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-results[i]:
+			if err == nil {
+				t.Fatalf("submitter %d: expected a definitive non-nil error", i)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("submitter %d did not receive a definitive result", i)
+		}
+	}
+
+	waitDone(t, done)
+}
+
+// --- Causality: frontend close versus internal failure versus parent ctx --
+
+// TestExtendedRuntime_FrontendShutdown_InternalFailureBeforeLaterFrontendClose_InternalWins
+// mirrors the existing parent-cancellation causality tests: an internal
+// write failure that linearized FIRST must remain primary even if a
+// frontend close notification arrives afterward.
+func TestExtendedRuntime_FrontendShutdown_InternalFailureBeforeLaterFrontendClose_InternalWins(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	injected := errors.New("test: injected write failure for causality ordering")
+	client.writeErrOnce = injected
+	rt := newTestRuntime(t, backendR, client)
+
+	loopReturned := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onLoopReturned = func() {
+		close(loopReturned)
+		<-resume
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+
+	select {
+	case <-loopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for loop() to return")
+	}
+
+	// The internal cause was ALREADY recorded inside loop() before it
+	// returned - a frontend close arriving only now must not win the
+	// causality race.
+	notifyDone := make(chan error, 1)
+	go func() {
+		notifyDone <- rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil)
+	}()
+	close(resume)
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrClientWriteFailed) {
+		t.Fatalf("expected ErrClientWriteFailed to remain primary, got %v", runErr)
+	}
+	if errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("did not expect ErrFrontendClosed to override the earlier internal cause, got %v", runErr)
+	}
+	if err := <-submitDone; !errors.Is(err, ErrClientWriteFailed) {
+		t.Fatalf("expected the submitter to observe ErrClientWriteFailed, got %v", err)
+	}
+
+	select {
+	case err := <-notifyDone:
+		if !errors.Is(err, ErrClientWriteFailed) {
+			t.Fatalf("expected NotifyFrontendClosed to observe the SAME primary result (ErrClientWriteFailed), got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("NotifyFrontendClosed did not return within the bounded deadline")
+	}
+}
+
+// TestExtendedRuntime_FrontendShutdown_FrontendCloseBeforeLaterWriteFailure_FrontendCloseWins
+// proves the reverse ordering: a frontend close that linearizes FIRST
+// remains primary even though the connection closure it triggers produces
+// a LATER ErrBackendWriteFailed symptom from the event loop's own blocked
+// Write.
+func TestExtendedRuntime_FrontendShutdown_FrontendCloseBeforeLaterWriteFailure_FrontendCloseWins(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newBlockingBackendTransport(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+		submitDone <- err
+	}()
+
+	select {
+	case <-backend.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked backend Write")
+	}
+
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil); !errors.Is(err, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed to remain primary despite the later close-induced write failure, got %v", runErr)
+	}
+	if errors.Is(runErr, ErrBackendWriteFailed) {
+		t.Fatalf("did not expect the write-failure symptom to leak as the primary error, got %v", runErr)
+	}
+	<-submitDone // the blocked submitter must still resolve definitively
+}
+
+// TestExtendedRuntime_FrontendShutdown_ParentCancellationBeforeFrontendClose_ParentWins
+// proves parent-context cancellation that linearizes FIRST retains its
+// existing precedence over a later, now-redundant frontend close request.
+func TestExtendedRuntime_FrontendShutdown_ParentCancellationBeforeFrontendClose_ParentWins(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	watcherDone := make(chan struct{})
+	rt.onWatcherShutdownBegun = func() { close(watcherDone) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	cancel()
+	select {
+	case <-watcherDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the watcher to linearize parent shutdown")
+	}
+
+	// The frontend close request is now redundant - the watcher's
+	// one-shot select already committed to the parent-ctx branch.
+	notifyErr := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil)
+	if !errors.Is(notifyErr, context.Canceled) {
+		t.Fatalf("expected NotifyFrontendClosed to observe the parent's context.Canceled, got %v", notifyErr)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled to remain primary, got %v", runErr)
 	}
 }

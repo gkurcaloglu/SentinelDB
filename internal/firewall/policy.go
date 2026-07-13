@@ -40,12 +40,18 @@ func (f PolicyFunc) Evaluate(m protocol.Message) (Verdict, string) {
 	return f(m)
 }
 
-// DenyKeywords, Simple Query metninde (büyük/küçük harf ve boşluk
-// duyarsız) verilen ifadelerden biri geçen sorguları engelleyen, tamamen
-// native (Wasm olmayan) bir Policy döndürür. Eşleştirme mantığı
-// internal/sqlmatch'te tanımlıdır; firewall Wasm eklentisi de (bkz.
-// internal/wasm, plugins/firewall) aynı paketi kullanır, böylece iki
-// enforcement yolu birbirinden sapmaz.
+// DenyKeywords, Simple Query (MsgQuery) VE Extended Query Parse (MsgParse)
+// metninde (büyük/küçük harf ve boşluk duyarsız) verilen ifadelerden biri
+// geçen sorguları engelleyen, tamamen native (Wasm olmayan) bir Policy
+// döndürür. Eşleştirme mantığı internal/sqlmatch'te tanımlıdır; firewall
+// Wasm eklentisi de (bkz. internal/wasm, plugins/firewall) aynı paketi
+// kullanır, böylece iki enforcement yolu birbirinden sapmaz.
+//
+// Yalnızca MsgQuery/MsgParse denetlenir - SQL şablonunu taşıyan TEK
+// frontend mesaj türleri bunlardır (bkz. internal/firewall/extended_frontend.go,
+// "Parse-time policy evaluation"): Bind/Describe/Execute/Close/Flush/Sync/
+// Terminate hiçbir yeni SQL metni taşımaz, bu yüzden kasıtlı olarak
+// denetlenmez (m.Query o mesaj türlerinde zaten boştur).
 //
 // Bu, gerçek bir SQL ayrıştırıcı değil, saf metin eşleştirmesidir: yorum
 // satırları ya da string literalleri içindeki eşleşmeleri de yakalar
@@ -55,7 +61,7 @@ func (f PolicyFunc) Evaluate(m protocol.Message) (Verdict, string) {
 // dayanan bir Policy yazılmalı.
 func DenyKeywords(phrases ...string) Policy {
 	return PolicyFunc(func(m protocol.Message) (Verdict, string) {
-		if m.Type != protocol.MsgQuery {
+		if m.Type != protocol.MsgQuery && m.Type != protocol.MsgParse {
 			return Allow, ""
 		}
 		if matched := sqlmatch.MatchAny(m.Query, phrases); matched != "" {

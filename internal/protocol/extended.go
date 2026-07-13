@@ -399,3 +399,18 @@ func ParseFrontendSync(payload []byte) error {
 	}
 	return nil
 }
+
+// ParseFrontendTerminate, bir Terminate ('X') mesajının gövdesini doğrular.
+// Terminate'in hiçbir alanı yoktur; gövde boş olmalıdır (bkz.
+// ParseFrontendFlush/ParseFrontendSync ile aynı desen). Decoder.consumeNormal
+// bu doğrulamayı BUGÜN otomatik olarak çağırmaz (Terminate akış-sonlandırma
+// semantiği taşır, steady-state Extended Query mesajları arasında olağan bir
+// "onaylanacak" işlem değildir) - bu fonksiyon, internal/firewall'daki opt-in
+// frontend köprüsünün (bkz. Gate.RunExtended) kendi savunma amaçlı çerçeve
+// doğrulaması için sağlanır.
+func ParseFrontendTerminate(payload []byte) error {
+	if len(payload) != 0 {
+		return newExtendedParseError("Terminate", CategoryNonEmptyPayload)
+	}
+	return nil
+}

@@ -446,14 +446,173 @@ watcher closed the connection to unblock it). If an internal condition
 initiated shutdown first, that error remains primary — causality is never
 determined by inspecting an OS error string.
 
-**This is still not part of the live gateway.** `ExtendedRuntime` is not
-constructed or called anywhere in `cmd/gateway`, `firewall.Gate`, or
-`masking.Transformer` — it has no call site outside its own tests.
-Extended Query is still rejected fail-closed at runtime, exactly as
-described above; this component exists purely so the event-driven
-execution shell a later integration stage needs (wiring `firewall.Gate`
-as the frontend producer, connecting the real upstream socket) can be
-built and tested in isolation first.
+**This is still not part of the LIVE gateway.** `cmd/gateway` never
+constructs or calls `ExtendedRuntime`, and `firewall.Gate.Run` — the live,
+production entry point — still rejects Extended Query fail-closed exactly
+as described above. `ExtendedRuntime` now has exactly one call site: the
+opt-in, test-only `firewall.Gate.RunExtended`/`firewall.ExtendedFrontend`
+bridge described in the next section. That path is itself not wired into
+`cmd/gateway`.
+
+### Opt-in Extended Query frontend bridge (still not part of the live gateway)
+
+`internal/firewall/extended_frontend.go` adds a second, opt-in entry point,
+`Gate.RunExtended(ctx, client, frontend)`, alongside the existing
+`Gate.Run(client)` — and a new `firewall.ExtendedFrontend` type that owns
+Parse-time policy evaluation, local rejection, and client-facing
+discard-until-`Sync` for a single connection. `Gate.Run` itself is
+**completely unchanged** — same signature, same behavior, same
+fail-closed Extended Query rejection; `RunExtended` is a parallel method
+that only runs when a caller explicitly constructs an `ExtendedFrontend`
+and calls it. `cmd/gateway` does not do this.
+
+**Steady-state only.** `RunExtended` reads with
+`protocol.NewSteadyStateFrontendFrameDecoder`, which — unlike
+`protocol.NewClientDecoder` — skips the startup/authentication phase
+entirely and starts directly in normal (tag+length) framing mode.
+Startup/authentication handoff into this path remains unimplemented; a
+caller is responsible for having already completed authentication on
+`client` through the existing (unchanged) flow before ever calling
+`RunExtended`.
+
+**Framing and typed body parsing are now two separate steps (hardening
+revision).** `NewSteadyStateFrontendFrameDecoder` validates ONLY normal
+tag+length frame boundaries — it never calls any of the
+`ParseFrontendParse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`
+typed body parsers, unlike `protocol.NewClientDecoder`/`NewServerDecoder`
+(both unchanged). The emitted `protocol.Message` carries only safe framing
+metadata (`Direction`/`Type`/`Name`/`Length`/an independently copied
+`Raw`) — `Query`/`Parse`/`Bind`/`Describe`/`Execute`/`Close` are never
+populated. `ExtendedFrontend` now calls the matching typed parser itself,
+**after** deciding whether the message should even be inspected. This
+separation exists because a single-pass decoder that always parses the
+body cannot distinguish "recoverably malformed" from "connection-ending
+corrupt": the earlier design's `Decoder.fail` path treated both
+identically (permanent passthrough), so a client-supplied, completely
+framed but semantically invalid `Bind` sent while the bridge was already
+discarding a blocked cycle used to become an unrecoverable decoder error
+instead of the silent drop PostgreSQL's discard-until-`Sync` protocol
+requires.
+
+**Discard is decided before any body is parsed.** For every steady-state
+message, `ExtendedFrontend.handle` inspects `Type` first. `Sync` and
+`Terminate` are always validated and processed regardless of discard
+state. Every other Extended Query type (`Parse`/`Bind`/`Describe`/
+`Execute`/`Close`/`Flush`) is dropped **before** its typed body parser is
+ever invoked if the bridge is currently discarding — this holds even when
+the dropped frame's body is deliberately malformed: it produces no second
+synthetic error, no `State`/`ResponseSequencer` call, no upstream write,
+and critically, no decoder failure. Only once a message is determined to
+need real processing does `ExtendedFrontend` extract its payload
+(`frontendPayload`, tag+length stripped from the already-validated `Raw`)
+and call the matching typed parser. A parser failure at that point (a
+message that reaches real processing but is itself malformed) still
+produces the existing "one synthetic `ErrorResponse` + enter discard"
+outcome — for `Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`. `Sync`
+and `Terminate` are different: both are the protocol's synchronization/
+termination points, so a malformed one is **not** treated as recoverable —
+it fails the standalone runtime closed instead (fixed
+`ErrExtendedFrontendMalformedFrame`), never clears discard, and is never
+forwarded.
+
+**Parse-time policy evaluation, exactly like `Query`.** For every `Parse`
+message, `ExtendedFrontend` builds a `protocol.Message{Type: MsgParse,
+Query: <parsed SQL>}` (no `Raw` bytes) and calls `Policy.Evaluate` exactly
+once — the same call `Gate.handle` already makes for `Query`. Both
+built-in policies (`firewall.DenyKeywords` and the Wasm-backed
+`wasm.Policy`) now match `MsgParse` using the identical SQL-matching rule
+they already apply to `MsgQuery`; `Query` behavior itself is unchanged.
+`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`/`Terminate` carry no new
+SQL template and are never policy-evaluated.
+
+**Registration always precedes the upstream write.** `ExtendedRuntime`
+gained a full duplex `BackendTransport` (read **and** write; previously
+read-only) and a new event-loop-only entry point,
+`RegisterAndForwardFrontendOperation`, that performs, in one event-loop
+turn: frame validation → `State.Create*` → `ResponseSequencer`
+registration → the upstream write of the original frontend frame — success
+is reported only once all four have completed. `ExtendedFrontend` never
+writes to the client, never writes upstream itself, and never touches
+`State`/`ResponseSequencer` directly; `ExtendedRuntime`'s event loop
+remains the sole writer of both the client and backend connections, and
+the sole `State`/`ResponseSequencer` owner, exactly as before. A backend
+write failure *after* successful registration is fail-closed and
+terminal, just like the existing client-write-failure case — never a
+silent retry, never a "safe to forward" signal after the fact.
+
+**Local rejection and discard-until-`Sync` are now live for this path.**
+When a `Parse` is policy-blocked, a message body fails validation, or a
+referenced statement/portal is unknown, `ExtendedFrontend` builds one
+fixed, safe `ErrorResponse` and submits it through the runtime's new
+`SubmitSyntheticErrorForCurrentCycle` — which reads `State.CurrentCycle()`
+itself so the frontend-side caller never has to (and cannot) guess a cycle
+ID. On acceptance, `ExtendedFrontend` immediately begins discarding
+`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush` for that cycle:
+discarded messages are dropped before any parsing/policy/registration
+step, creating **no** `State` operation and **no** `ResponseSequencer` plan
+unit. `Sync` and `Terminate` are always honored, discard or not. A real
+`Sync` closes the blocked cycle and is registered/forwarded exactly like
+any other operation — discard clears the instant that forwarding
+succeeds, not when the real `ReadyForQuery` eventually arrives, so a
+pipelined next cycle is never blocked on it. No synthetic
+`ReadyForQuery` is ever fabricated.
+
+**`Flush`/`Terminate` create no response-plan unit.** Two new runtime
+methods, `ForwardFlush` and `ForwardTerminate`, write only the original
+frame upstream — neither creates a `State` operation nor a
+`ResponseSequencer` plan unit, since neither has a corresponding backend
+acknowledgement. A successful client-initiated `Terminate` transitions
+`ExtendedRuntime` to permanent shutdown and closes both connections; no
+client response is fabricated for it.
+
+**Truncated frontend frames at EOF fail closed (hardening revision).**
+`RunExtended` now calls `Decoder.Finalize` when `client.Read` returns
+`io.EOF`, exactly like the existing backend-reader/`ExtendedRuntime`
+truncation check. If any bytes remain buffered but unresolved, this is
+**not** reported as a clean close — it is a connection cut off mid-frame,
+which PostgreSQL framing cannot safely recover from. `RunExtended` reports
+a fixed frontend protocol failure and the standalone runtime terminates
+fail-closed; no partial bytes are ever forwarded and no synthetic
+`ReadyForQuery` is fabricated. A genuinely empty buffer at EOF (or one
+containing only complete, fully processed frames) remains a clean close.
+
+**Frontend closure now independently initiates transport shutdown
+(hardening revision).** The runtime's `NotifyFrontendClosed` method no
+longer routes through the same bounded event channel the (possibly
+blocked) event loop drains. A dedicated, capacity-one shutdown-request
+channel is watched by the existing shutdown-watcher goroutine alongside
+parent-context cancellation — whichever becomes ready first wins. This
+means a frontend EOF, read failure, or unrecoverable framing failure can
+close the owned backend and client transports, and thereby unblock the
+event loop, **even while the event loop is genuinely blocked deep inside a
+backend or client `Write` call**, which the previous single-channel design
+could not guarantee. `NotifyFrontendClosed` blocks until the runtime has
+fully stopped and returns the *same* definitive result `Run` itself
+produces — `RunExtended` inspects that result rather than discarding it.
+Causality is preserved exactly as it already was for parent-context
+cancellation versus internal failures: whichever cause linearizes first
+(an internal failure, a frontend closure, or parent-context cancellation)
+remains the primary reported error, even if the connection closure it
+triggers produces a later, secondary write-failure symptom from the event
+loop's own blocked `Write`.
+
+**Frontend errors are fixed, safe categories with no appended detail
+(hardening revision).** `RunExtended` now returns bare sentinels —
+`ErrExtendedFrontendDecodeFailed`, `ErrExtendedFrontendReadFailed`,
+`ErrExtendedFrontendUnsupportedMessage`, `ErrExtendedFrontendMalformedFrame`
+— never wrapped with the underlying decoder/parser error's own text (no
+declared lengths, tags, or parser detail). The previous revision's
+`fmt.Errorf("%w: %v", ..., err)` wrapping of decoder/parser errors has
+been removed for this reason.
+
+**Mixed Simple/Extended Query and masking remain unsupported.** If a
+`Query` (Simple Query) message, a COPY frontend message, or any other
+unrecognized steady-state message reaches `RunExtended`, `ExtendedFrontend`
+fails closed and terminates the standalone runtime without forwarding
+it — this path is Extended-Query-only in this stage. Masking
+(`masking.Transformer`) integration and per-portal masking-shape
+collection are not implemented for this path; DataRow responses pass
+through unmasked. Both require a later, explicitly scoped stage.
 
 ## SSLRequest / GSSENCRequest rejection
 

@@ -120,14 +120,45 @@ type ExtendedFrontend struct {
 	// durumudur (bkz. gorev 11): protocol.NoCycle ise discard AKTIF
 	// DEGILDIR; aksi halde runtime tarafindan dondurulen, engellenmis
 	// (blocked) TAM cycle degeridir.
+	//
+	// SAHIPLIK: bu alan MUNHASIRAN Gate.RunExtended'in TEK cagiran
+	// goroutine'i tarafindan okunur/yazilir (dogrudan ya da handle/
+	// rejectLocally/handleSync araciligiyla). BASKA HICBIR goroutine -
+	// TEST GOROUTINE'I DAHIL - bu alani (ya da discarding() metodunu)
+	// RunExtended calisirken DOGRUDAN okumamalidir; bu, senkronizasyonsuz
+	// bir veri yarisidir (bkz. "fix: remove extended frontend test
+	// races" - CI'nin Linux -race isi bunu tam olarak boyle yakaladi).
+	// Testler bunun yerine GOZLEMLENEBILIR davranisi (iletilen/iletilmeyen
+	// cerceveler, sentetik hata sayisi, policy cagri sayaci, ya da
+	// asagidaki onLocalRejectionAccepted gibi ozel amacli, thread-safe
+	// bir kanca) kullanmalidir - bkz. extended_frontend_test.go.
 	discardCycle protocol.CycleID
 
 	// err/terminated, ExtendedFrontend'in kalici olarak sonlandigini
 	// (ve varsa RunExtended'in dondurecegi SABIT hatayi) kaydeder - Gate.
-	// Run'in kendi g.err alaniyla AYNI desen (bkz. gate.go). TEK goroutine
-	// tarafindan erisildigi icin senkronizasyona ihtiyac yoktur.
+	// Run'in kendi g.err alaniyla AYNI desen (bkz. gate.go). discardCycle
+	// ile AYNI sahiplik kurali gecerlidir: yalnizca RunExtended'in
+	// cagiran goroutine'i (isTerminal/terminalError DAHIL, bkz. asagida)
+	// dokunur - test goroutine'i ASLA dogrudan okumamalidir.
 	err        error
 	terminated bool
+
+	// onLocalRejectionAccepted, YALNIZCA PAKET TESTLERI tarafindan
+	// ayarlanan istege bagli bir kancadir (bkz. internal/gateway'deki
+	// AYNI desen, ör. onFrontendEventAccepted/onWatcherShutdownBegun) -
+	// rejectLocally basariyla discardCycle'i ayarladiktan HEMEN SONRA
+	// cagrilir. Uretimde HER ZAMAN nil'dir ve hicbir etkisi yoktur.
+	// Testlerin "discard tam olarak ne zaman basladi" sorusunu
+	// discardCycle'i DOGRUDAN okumadan, zamanlamaya (sleep) basvurmadan
+	// deterministik olarak cevaplamasini saglar - ör. bir cycle'in
+	// backend'den bagimsiz sekilde ANINDA engellendigini kanitlamak icin
+	// (bkz. gorev 12, "blocked-first"). Yalnizca RunExtended baslamadan
+	// ONCE ayarlanmalidir (Go bellek modelinin goroutine-olusturma
+	// happens-before garantisiyle veri yarisini onler); kancanin KENDISI
+	// yalnizca thread-safe ilkeller (ör. bir kanali kapatmak) kullanmali,
+	// ASLA ExtendedFrontend'in mutable alanlarini test goroutine'ine
+	// sizdirmamalidir.
+	onLocalRejectionAccepted func()
 }
 
 // NewExtendedFrontend, verilen runtime uzerinde calisan yeni bir
@@ -204,6 +235,15 @@ func (g *Gate) RunExtended(ctx context.Context, client io.Reader, frontend *Exte
 }
 
 // --- ExtendedFrontend ic durum yonetimi -----------------------------------
+//
+// UYARI: asagidaki uc yardimci (isTerminal/terminalError/discarding)
+// YALNIZCA Gate.RunExtended'in TEK cagiran goroutine'i icinden
+// cagirilmalidir (dogrudan RunExtended'den, ya da handle/rejectLocally/
+// handleSync gibi AYNI goroutine icinde calisan yardimcilardan). Bu
+// paketin kendi testleri DAHIL, hicbir kod bunlari BASKA bir goroutine'den
+// (ör. RunExtended hala calisirken bir test goroutine'inden) cagirmamalidir -
+// senkronize edilmemis bir okuma/yazma veri yarisi olusturur (bkz. "fix:
+// remove extended frontend test races").
 
 func (f *ExtendedFrontend) isTerminal() bool     { return f.terminated }
 func (f *ExtendedFrontend) terminalError() error { return f.err }
@@ -315,6 +355,9 @@ func (f *ExtendedFrontend) rejectLocally(ctx context.Context, sqlState, reason s
 		return
 	}
 	f.discardCycle = cycle
+	if f.onLocalRejectionAccepted != nil {
+		f.onLocalRejectionAccepted()
+	}
 }
 
 // isFatalRegistrationError, RegisterAndForwardFrontendOperation/

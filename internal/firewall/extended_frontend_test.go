@@ -258,6 +258,20 @@ func waitRuntimeStarted(t *testing.T, rt *gateway.ExtendedRuntime) {
 
 func newHarness(t *testing.T, policy Policy, onDecide func(protocol.Message, Verdict, string, time.Duration)) *harness {
 	t.Helper()
+	return newHarnessConfigured(t, policy, onDecide, nil)
+}
+
+// newHarnessConfigured is the newHarness variant that lets a test install
+// deterministic, thread-safe synchronization hooks (bkz.
+// ExtendedFrontend.onLocalRejectionAccepted) on the *ExtendedFrontend
+// BEFORE Gate.RunExtended's goroutine starts - the only point at which
+// setting such a hook is race-free (Go memory model's goroutine-creation
+// happens-before guarantee). configure may be nil. No test may read/write
+// ExtendedFrontend's mutable fields directly once its RunExtended
+// goroutine has started (bkz. gorev 1-3, "fix: remove extended frontend
+// test races") - configure exists precisely so tests never need to.
+func newHarnessConfigured(t *testing.T, policy Policy, onDecide func(protocol.Message, Verdict, string, time.Duration), configure func(*ExtendedFrontend)) *harness {
+	t.Helper()
 	clientRuntimeSide, clientTestSide := net.Pipe()
 	backendRuntimeSide, backendTestSide := net.Pipe()
 
@@ -270,6 +284,9 @@ func newHarness(t *testing.T, policy Policy, onDecide func(protocol.Message, Ver
 	frontend, err := NewExtendedFrontend(rt, policy, onDecide)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if configure != nil {
+		configure(frontend)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -529,23 +546,15 @@ func TestExtendedFrontend_LocalRejection_MalformedParseBody(t *testing.T) {
 	// The framing-only decoder accepts this as one complete frame; only
 	// ExtendedFrontend's own body parser rejects it.
 	h.sendClient(malformedParseFrame("s1"))
-
-	deadline := time.Now().Add(2 * time.Second)
-	for len(h.clientBound.Snapshot()) == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	got := h.clientBound.Snapshot()
-	if len(got) == 0 || protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
+	got := waitForSynthetic(t, h)
+	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
 		t.Fatalf("expected a synthetic ErrorResponse, got %x", got)
 	}
-	if !h.frontend.discarding() {
-		t.Fatal("expected the bridge to enter discard-until-Sync after a malformed body")
-	}
-	// The decoder must NOT have failed closed (bkz. gorev 1) - the
-	// runtime/RunExtended must both remain alive and usable.
-	if h.frontend.isTerminal() {
-		t.Fatal("expected the bridge to remain non-terminal after a recoverable malformed body")
-	}
+	// Prove discard is active AND the bridge/decoder remain alive (did
+	// NOT fail closed) purely through OBSERVABLE behavior - never by
+	// reading ExtendedFrontend's bridge-owned state directly (bkz. "fix:
+	// remove extended frontend test races").
+	assertDiscardingThenClears(t, h, got)
 }
 
 func TestExtendedFrontend_LocalRejection_UnknownStatementBind(t *testing.T) {
@@ -653,18 +662,18 @@ func TestExtendedFrontend_Discard_BlockedFirstThenSyncClears(t *testing.T) {
 		t.Fatalf("expected discarded messages to produce no upstream bytes, got %x", h.upstream.Snapshot())
 	}
 
-	// Sync must still be forwarded and clear discard.
+	// Sync must still be forwarded, and discard must clear afterward -
+	// proven by a next-cycle Parse also being forwarded (bkz. gorev 2:
+	// "wait until the real Sync frame has been completely forwarded
+	// upstream; submit a valid next-cycle operation; prove it is
+	// registered and forwarded" - never by reading discardCycle directly).
 	sync := feSyncFrame()
 	h.sendClient(sync)
 	waitForAccumulated(t, h.upstream, sync)
 
-	deadline = time.Now().Add(2 * time.Second)
-	for h.frontend.discarding() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if h.frontend.discarding() {
-		t.Fatal("expected discard to clear after Sync was forwarded")
-	}
+	parse2 := feParseFrame("s2", "SELECT 2", nil)
+	h.sendClient(parse2)
+	waitForAccumulated(t, h.upstream, append(sync, parse2...))
 }
 
 func TestExtendedFrontend_Discard_TerminateStillForwardedDuringDiscard(t *testing.T) {
@@ -876,7 +885,17 @@ func TestExtendedFrontend_Ordering_BindExecuteDataRowCommandCompletePassThrough(
 }
 
 func TestExtendedFrontend_Ordering_BlockedParseBehindRealOperation_RealThenSynthetic(t *testing.T) {
-	h := newHarness(t, DenyKeywords("DROP TABLE"), nil)
+	// B's synthetic rejection is accepted (and discardCycle set) WHILE
+	// its resulting frame remains queued behind A - not yet client-visible
+	// - so its acceptance cannot be observed via clientBound bytes alone.
+	// A deterministic, thread-safe hook (set BEFORE RunExtended starts,
+	// bkz. newHarnessConfigured) proves acceptance without ever reading
+	// ExtendedFrontend's bridge-owned discardCycle field from this test
+	// goroutine (bkz. "fix: remove extended frontend test races").
+	accepted := make(chan struct{})
+	h := newHarnessConfigured(t, DenyKeywords("DROP TABLE"), nil, func(f *ExtendedFrontend) {
+		f.onLocalRejectionAccepted = func() { close(accepted) }
+	})
 	defer h.close()
 
 	// A: allowed Parse, still pending (no ParseComplete yet).
@@ -889,12 +908,10 @@ func TestExtendedFrontend_Ordering_BlockedParseBehindRealOperation_RealThenSynth
 
 	// B's synthetic rejection must be accepted (bridge enters discard)
 	// WITHOUT requiring A's backend completion first.
-	deadline := time.Now().Add(2 * time.Second)
-	for !h.frontend.discarding() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if !h.frontend.discarding() {
-		t.Fatal("expected the bridge to enter discard for the blocked Parse without waiting on A")
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the blocked Parse's synthetic rejection to be accepted")
 	}
 	// Nothing must be client-visible yet (A hasn't completed).
 	if len(h.clientBound.Snapshot()) != 0 {
@@ -909,7 +926,7 @@ func TestExtendedFrontend_Ordering_BlockedParseBehindRealOperation_RealThenSynth
 	// the combined bytes and assert the ORDER directly.
 	pc := beEmpty(protocol.MsgParseComplete)
 	h.sendBackend(pc)
-	deadline = time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for len(h.clientBound.Snapshot()) <= len(pc) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
@@ -1094,34 +1111,64 @@ func TestExtendedFrontend_Stress(t *testing.T) {
 				return stopped
 			}
 
+			// sendClient/sendBackend below race checkStopped by design: a
+			// write can land in the gap between "not yet stopped" and
+			// RunExtended actually exiting and closing the pipe. That is
+			// an expected, benign outcome of a randomized shutdown race,
+			// not a bug - so a write failure is only fatal if the run
+			// hasn't (by then) actually stopped; otherwise it just ends
+			// this seed's loop early, same as checkStopped() would have.
+			sendClient := func(frame []byte) bool {
+				if _, err := h.clientTest.Write(frame); err != nil {
+					if checkStopped() {
+						return false
+					}
+					t.Fatalf("unexpected error writing a client frame: %v", err)
+				}
+				return true
+			}
+			sendBackend := func(frame []byte) bool {
+				if _, err := h.backendTest.Write(frame); err != nil {
+					if checkStopped() {
+						return false
+					}
+					t.Fatalf("unexpected error writing a backend frame: %v", err)
+				}
+				return true
+			}
+
 			for step := 0; step < 60 && !checkStopped(); step++ {
 				b, ok := next()
 				if !ok {
 					break
 				}
+				ok = true
 				switch int(b) % 11 {
 				case 0:
-					h.sendClient(feParseFrame("s1", "SELECT 1", nil))
+					ok = sendClient(feParseFrame("s1", "SELECT 1", nil))
 				case 1:
-					h.sendClient(feParseFrame(nameMarker, "DROP TABLE users;", nil)) // policy-blocked
+					ok = sendClient(feParseFrame(nameMarker, "DROP TABLE users;", nil)) // policy-blocked
 				case 2:
-					h.sendClient(feBindFrame("p1", "s1", nil, []protocol.BindParam{{Value: []byte(bodyMarker)}}, nil))
+					ok = sendClient(feBindFrame("p1", "s1", nil, []protocol.BindParam{{Value: []byte(bodyMarker)}}, nil))
 				case 3:
-					h.sendClient(feBindFrame("p1", "does-not-exist", nil, []protocol.BindParam{{Null: true}}, nil))
+					ok = sendClient(feBindFrame("p1", "does-not-exist", nil, []protocol.BindParam{{Null: true}}, nil))
 				case 4:
-					h.sendClient(feDescribeFrame(protocol.TargetPortal, "p1"))
+					ok = sendClient(feDescribeFrame(protocol.TargetPortal, "p1"))
 				case 5:
-					h.sendClient(feExecuteFrame("p1", 0))
+					ok = sendClient(feExecuteFrame("p1", 0))
 				case 6:
-					h.sendClient(feCloseFrame(protocol.TargetStatement, "s1"))
+					ok = sendClient(feCloseFrame(protocol.TargetStatement, "s1"))
 				case 7:
-					h.sendClient(feFlushFrame())
+					ok = sendClient(feFlushFrame())
 				case 8:
-					h.sendClient(feSyncFrame())
+					ok = sendClient(feSyncFrame())
 				case 9:
-					h.sendBackend(beEmpty(protocol.MsgParseComplete))
+					ok = sendBackend(beEmpty(protocol.MsgParseComplete))
 				case 10:
-					h.sendBackend(buildFrame(protocol.MsgNoticeResponse, []byte{'S', 'N', 0, 0}))
+					ok = sendBackend(buildFrame(protocol.MsgNoticeResponse, []byte{'S', 'N', 0, 0}))
+				}
+				if !ok {
+					break
 				}
 				time.Sleep(200 * time.Microsecond) // bounded settling, not a correctness dependency
 			}
@@ -1164,6 +1211,153 @@ func waitForSynthetic(t *testing.T, h *harness) []byte {
 	return nil
 }
 
+// assertDiscardingThenClears proves - WITHOUT ever reading
+// ExtendedFrontend's bridge-owned discardCycle field from the test
+// goroutine - that discard is currently active and later clears, purely
+// through observable behavior (bkz. gorev 2):
+//
+//  1. a subsequent, otherwise-VALID Bind is silently dropped: no upstream
+//     forwarding and no additional client-bound bytes beyond the already-
+//     observed synthetic ErrorResponse (proves discard is active - an
+//     inactive bridge would either forward it or reject it with a SECOND
+//     synthetic error);
+//  2. a subsequent Sync IS still forwarded upstream (proves the bridge/
+//     runtime remain alive and usable, and that discard is clearable);
+//  3. a subsequent next-cycle Parse IS forwarded upstream (proves discard
+//     actually CLEARED after the Sync, not merely that Sync itself was
+//     accepted - an inactive-clearing bug would silently drop this too and
+//     time out the wait below).
+func assertDiscardingThenClears(t *testing.T, h *harness, synthetic []byte) {
+	t.Helper()
+
+	h.sendClient(feBindFrame("p1", "s1", nil, nil, nil))
+	time.Sleep(20 * time.Millisecond) // bounded settling for the (absence of) processing
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the discarded Bind never forwarded, got %x", h.upstream.Snapshot())
+	}
+	if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
+		t.Fatalf("expected no additional synthetic error, got %x (was %x)", h.clientBound.Snapshot(), synthetic)
+	}
+
+	sync := feSyncFrame()
+	h.sendClient(sync)
+	waitForAccumulated(t, h.upstream, sync)
+
+	parseNext := feParseFrame("next-cycle", "SELECT 1", nil)
+	h.sendClient(parseNext)
+	waitForAccumulated(t, h.upstream, append(append([]byte{}, sync...), parseNext...))
+}
+
+// TestExtendedFrontend_NoConcurrentBridgeStateReads is a focused regression
+// guard for the race CI's Linux -race job caught (bkz. "fix: remove
+// extended frontend test races"): test goroutines calling
+// frontend.discarding()/isTerminal() concurrently with RunExtended's own
+// goroutine mutating discardCycle/err/terminated inside
+// rejectLocally/handle/handleSync.
+//
+// It drives many back-to-back discard-set -> Sync-clears cycles from the
+// main test goroutine while a second goroutine concurrently polls the
+// harness's mutex-protected connAccumulators in a tight loop - genuine
+// concurrent access to the harness from two test goroutines, running
+// alongside RunExtended's own goroutine and the runtime's goroutine.
+// Neither test goroutine ever reads ExtendedFrontend's bridge-owned fields
+// directly: the only cross-goroutine signal is onLocalRejectionAccepted
+// (a channel close), set BEFORE RunExtended starts so the goroutine-
+// creation happens-before edge covers it (bkz. Go memory model), plus the
+// accumulators' own internal mutex. Run this test under `go test -race`
+// and it is exactly what would have caught the original race.
+func TestExtendedFrontend_NoConcurrentBridgeStateReads(t *testing.T) {
+	const cycles = 25
+
+	accepted := make(chan struct{}, cycles)
+	h := newHarnessConfigured(t, DenyKeywords("DROP TABLE"), nil, func(f *ExtendedFrontend) {
+		f.onLocalRejectionAccepted = func() { accepted <- struct{}{} }
+	})
+	defer h.close()
+
+	stopMonitor := make(chan struct{})
+	monitorDone := make(chan struct{})
+	go func() {
+		defer close(monitorDone)
+		for {
+			select {
+			case <-stopMonitor:
+				return
+			default:
+				_ = h.upstream.Snapshot()
+				_ = h.clientBound.Snapshot()
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	defer func() {
+		close(stopMonitor)
+		<-monitorDone
+	}()
+
+	// waitClientGrows polls the (mutex-protected) clientBound accumulator
+	// until it grows past prevLen, then asserts the new suffix starts with
+	// wantTag. Bounded polling of synchronized state, never a blind sleep.
+	waitClientGrows := func(cycle int, prevLen int, wantTag protocol.MessageType) []byte {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			got := h.clientBound.Snapshot()
+			if len(got) > prevLen {
+				if protocol.MessageType(got[prevLen]) != wantTag {
+					t.Fatalf("cycle %d: expected new suffix tag %q, got %q", cycle, byte(wantTag), got[prevLen])
+				}
+				return got
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("cycle %d: timed out waiting for client-bound tag %q", cycle, byte(wantTag))
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	var wantUpstream []byte
+	clientLen := 0
+	for i := 0; i < cycles; i++ {
+		h.sendClient(feParseFrame(fmt.Sprintf("blocked-%d", i), "DROP TABLE users;", nil))
+
+		select {
+		case <-accepted:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("cycle %d: timed out waiting for the blocked Parse's synthetic rejection to be accepted", i)
+		}
+
+		// Acceptance only means discardCycle was set; the synthetic frame
+		// may still be queued behind earlier real traffic before it
+		// reaches the client, so this cycle is fully drained end-to-end
+		// (real Sync/RFQ, real next-cycle Parse/ParseComplete) below
+		// before starting the next one - otherwise the sequencer's
+		// real-before-synthetic ordering guarantee would correctly, and
+		// forever, withhold a LATER cycle's synthetic error behind an
+		// EARLIER cycle's still-pending real completion.
+		got := waitClientGrows(i, clientLen, protocol.MsgErrorResponse)
+		clientLen = len(got)
+
+		sync := feSyncFrame()
+		wantUpstream = append(wantUpstream, sync...)
+		h.sendClient(sync)
+		waitForAccumulated(t, h.upstream, wantUpstream)
+
+		h.sendBackend(beRFQ('I'))
+		got = waitClientGrows(i, clientLen, protocol.MsgReadyForQuery)
+		clientLen = len(got)
+
+		next := feParseFrame(fmt.Sprintf("next-%d", i), "SELECT 1", nil)
+		wantUpstream = append(wantUpstream, next...)
+		h.sendClient(next)
+		waitForAccumulated(t, h.upstream, wantUpstream)
+
+		h.sendBackend(beEmpty(protocol.MsgParseComplete))
+		got = waitClientGrows(i, clientLen, protocol.MsgParseComplete)
+		clientLen = len(got)
+	}
+}
+
 func TestExtendedFrontend_Framing_ValidParseParsedAndForwarded(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	defer h.close()
@@ -1182,15 +1376,10 @@ func TestExtendedFrontend_Framing_MalformedParseProducesOneSyntheticAndDiscard(t
 	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
 		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
 	}
-	if !h.frontend.discarding() {
-		t.Fatal("expected the bridge to enter discard-until-Sync")
-	}
-	if h.frontend.isTerminal() {
-		t.Fatal("expected the decoder to NOT fail closed for a completely framed malformed body")
-	}
 	if len(h.upstream.Snapshot()) != 0 {
 		t.Fatalf("expected the malformed Parse never forwarded, got %x", h.upstream.Snapshot())
 	}
+	assertDiscardingThenClears(t, h, got)
 }
 
 func TestExtendedFrontend_Framing_MalformedBindProducesOneSyntheticAndDiscard(t *testing.T) {
@@ -1202,12 +1391,10 @@ func TestExtendedFrontend_Framing_MalformedBindProducesOneSyntheticAndDiscard(t 
 	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
 		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
 	}
-	if !h.frontend.discarding() {
-		t.Fatal("expected the bridge to enter discard-until-Sync")
-	}
 	if len(h.upstream.Snapshot()) != 0 {
 		t.Fatalf("expected the malformed Bind never forwarded, got %x", h.upstream.Snapshot())
 	}
+	assertDiscardingThenClears(t, h, got)
 }
 
 func TestExtendedFrontend_Framing_MalformedDescribeProducesOneSyntheticAndDiscard(t *testing.T) {
@@ -1219,12 +1406,10 @@ func TestExtendedFrontend_Framing_MalformedDescribeProducesOneSyntheticAndDiscar
 	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
 		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
 	}
-	if !h.frontend.discarding() {
-		t.Fatal("expected the bridge to enter discard-until-Sync")
-	}
 	if len(h.upstream.Snapshot()) != 0 {
 		t.Fatalf("expected the malformed Describe never forwarded, got %x", h.upstream.Snapshot())
 	}
+	assertDiscardingThenClears(t, h, got)
 }
 
 func TestExtendedFrontend_Framing_MalformedExecuteProducesOneSyntheticAndDiscard(t *testing.T) {
@@ -1236,12 +1421,10 @@ func TestExtendedFrontend_Framing_MalformedExecuteProducesOneSyntheticAndDiscard
 	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
 		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
 	}
-	if !h.frontend.discarding() {
-		t.Fatal("expected the bridge to enter discard-until-Sync")
-	}
 	if len(h.upstream.Snapshot()) != 0 {
 		t.Fatalf("expected the malformed Execute never forwarded, got %x", h.upstream.Snapshot())
 	}
+	assertDiscardingThenClears(t, h, got)
 }
 
 func TestExtendedFrontend_Framing_MalformedCloseProducesOneSyntheticAndDiscard(t *testing.T) {
@@ -1253,12 +1436,10 @@ func TestExtendedFrontend_Framing_MalformedCloseProducesOneSyntheticAndDiscard(t
 	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
 		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
 	}
-	if !h.frontend.discarding() {
-		t.Fatal("expected the bridge to enter discard-until-Sync")
-	}
 	if len(h.upstream.Snapshot()) != 0 {
 		t.Fatalf("expected the malformed Close never forwarded, got %x", h.upstream.Snapshot())
 	}
+	assertDiscardingThenClears(t, h, got)
 }
 
 func TestExtendedFrontend_Framing_MalformedSyncFailsClosedNeverForwarded(t *testing.T) {
@@ -1331,22 +1512,14 @@ func TestExtendedFrontend_DiscardBeforeParsing_BlockedParseThenMalformedBindThen
 	if policyCalls != callsAfterBlock {
 		t.Fatalf("expected policy NOT invoked for the discarded malformed Bind, calls went from %d to %d", callsAfterBlock, policyCalls)
 	}
-	if h.frontend.isTerminal() {
-		t.Fatal("expected the decoder to NOT fail closed for the discarded malformed Bind")
-	}
+	// The decoder/bridge NOT having failed closed is proven behaviorally
+	// below (step 3's Sync forwarding, step 5's next-cycle Parse
+	// forwarding) - never by reading ExtendedFrontend state directly.
 
 	// 3. Valid Sync - must still be registered and forwarded.
 	sync := feSyncFrame()
 	h.sendClient(sync)
 	waitForAccumulated(t, h.upstream, sync)
-
-	deadline := time.Now().Add(2 * time.Second)
-	for h.frontend.discarding() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if h.frontend.discarding() {
-		t.Fatal("expected discard to clear after Sync was forwarded")
-	}
 
 	// 4. Real ReadyForQuery completes the cycle.
 	rfq := beRFQ(protocol.TxStatusIdle)
@@ -1374,21 +1547,17 @@ func TestExtendedFrontend_DiscardBeforeParsing_BlockedParseThenMalformedParseThe
 	if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
 		t.Fatalf("expected NO additional synthetic error, got %x (was %x)", h.clientBound.Snapshot(), synthetic)
 	}
-	if h.frontend.isTerminal() {
-		t.Fatal("expected the decoder to NOT fail closed for the discarded malformed Parse")
-	}
 
+	// The decoder/bridge NOT having failed closed, and discard clearing
+	// afterward, are both proven behaviorally: Sync must forward, and a
+	// next-cycle Parse must ALSO forward (never by reading state directly).
 	sync := feSyncFrame()
 	h.sendClient(sync)
 	waitForAccumulated(t, h.upstream, sync)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for h.frontend.discarding() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if h.frontend.discarding() {
-		t.Fatal("expected discard to clear after Sync was forwarded")
-	}
+	parse2 := feParseFrame("s3", "SELECT 3", nil)
+	h.sendClient(parse2)
+	waitForAccumulated(t, h.upstream, append(sync, parse2...))
 }
 
 func TestExtendedFrontend_DiscardBeforeParsing_BlockedParseThenMalformedFlushThenSync(t *testing.T) {
@@ -1406,21 +1575,17 @@ func TestExtendedFrontend_DiscardBeforeParsing_BlockedParseThenMalformedFlushThe
 	if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
 		t.Fatalf("expected NO additional synthetic error, got %x (was %x)", h.clientBound.Snapshot(), synthetic)
 	}
-	if h.frontend.isTerminal() {
-		t.Fatal("expected the decoder to NOT fail closed for the discarded malformed Flush")
-	}
 
+	// The decoder/bridge NOT having failed closed, and discard clearing
+	// afterward, are both proven behaviorally: Sync must forward, and a
+	// next-cycle Parse must ALSO forward (never by reading state directly).
 	sync := feSyncFrame()
 	h.sendClient(sync)
 	waitForAccumulated(t, h.upstream, sync)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for h.frontend.discarding() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if h.frontend.discarding() {
-		t.Fatal("expected discard to clear after Sync was forwarded")
-	}
+	parse2 := feParseFrame("s3", "SELECT 3", nil)
+	h.sendClient(parse2)
+	waitForAccumulated(t, h.upstream, append(sync, parse2...))
 }
 
 // ==========================================================================
@@ -1658,10 +1823,10 @@ func TestExtendedFrontend_DiscardBeforeParsing_Repeated(t *testing.T) {
 			if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
 				t.Fatalf("iteration %d: expected exactly one synthetic error, got %x", i, h.clientBound.Snapshot())
 			}
-			if h.frontend.isTerminal() {
-				t.Fatalf("iteration %d: expected the decoder to NOT fail closed", i)
-			}
 
+			// The decoder/bridge NOT having failed closed is proven
+			// behaviorally: Sync must still forward (never by reading
+			// state directly).
 			sync := feSyncFrame()
 			h.sendClient(sync)
 			waitForAccumulated(t, h.upstream, sync)

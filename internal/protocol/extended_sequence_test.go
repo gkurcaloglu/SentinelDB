@@ -1416,3 +1416,132 @@ func r0Peek(data []byte) (byte, bool) {
 	}
 	return data[0], true
 }
+
+// --- OutputAction.TargetGeneration -----------------------------------
+
+func TestSequencer_TargetGeneration_ExecuteDataRow_IdentifiesPortal(t *testing.T) {
+	s, seq := setupSequencerExecuteHead(t)
+	portal, ok := s.CommittedPortal("")
+	if !ok {
+		t.Fatal("expected committed unnamed portal")
+	}
+	actions, err := seq.HandleBackendMessage(dataRowMsg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 || actions[0].Kind != ActionEmitBackendFrame {
+		t.Fatalf("expected exactly one ActionEmitBackendFrame, got %+v", actions)
+	}
+	if actions[0].TargetGeneration != portal.ID {
+		t.Fatalf("expected DataRow action TargetGeneration=%d, got %d", portal.ID, actions[0].TargetGeneration)
+	}
+}
+
+func TestSequencer_TargetGeneration_DescribeStatement_RowDescription(t *testing.T) {
+	s, seq := newSequencer(t)
+	pop, stmtGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+	if _, err := seq.AddForwardedOperation(pop); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := seq.HandleBackendMessage(emptyBackendMsg(MsgParseComplete)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	dop, err := s.CreateDescribeStatement("s1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := seq.AddForwardedOperation(dop); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := seq.HandleBackendMessage(paramDescMsg(nil)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	actions, err := seq.HandleBackendMessage(rowDescMsg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 || actions[0].TargetGeneration != stmtGen.ID {
+		t.Fatalf("expected statement-Describe RowDescription action TargetGeneration=%d, got %+v", stmtGen.ID, actions)
+	}
+}
+
+func TestSequencer_TargetGeneration_AsyncMessage_IsNoGeneration(t *testing.T) {
+	_, seq := newSequencer(t)
+	actions, err := seq.HandleBackendMessage(backendMsg(MsgNoticeResponse, []byte{'S', 'N', 0, 0}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 || actions[0].TargetGeneration != NoGeneration {
+		t.Fatalf("expected async action TargetGeneration=NoGeneration, got %+v", actions)
+	}
+}
+
+func TestSequencer_TargetGeneration_SyntheticFrame_IsNoGeneration(t *testing.T) {
+	_, seq := newSequencer(t)
+	actions, err := seq.AddSyntheticError(CycleID(1), minimalErrorResponse().Raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 || actions[0].Kind != ActionEmitSyntheticFrame {
+		t.Fatalf("expected exactly one synthetic action, got %+v", actions)
+	}
+	if actions[0].TargetGeneration != NoGeneration {
+		t.Fatalf("expected synthetic action TargetGeneration=NoGeneration, got %d", actions[0].TargetGeneration)
+	}
+}
+
+func TestSequencer_TargetGeneration_ConnectionLevelErrorResponse_IsNoGeneration(t *testing.T) {
+	_, seq := newSequencer(t)
+	actions, err := seq.HandleBackendMessage(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) == 0 || actions[0].TargetGeneration != NoGeneration {
+		t.Fatalf("expected connection-level ErrorResponse action TargetGeneration=NoGeneration, got %+v", actions)
+	}
+}
+
+func TestSequencer_TargetGeneration_TwoPortals_DoNotCrossContaminate(t *testing.T) {
+	s, seq := newSequencer(t)
+	pop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	seq.AddForwardedOperation(pop)
+	seq.HandleBackendMessage(emptyBackendMsg(MsgParseComplete))
+
+	bop1, portal1, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	seq.AddForwardedOperation(bop1)
+	seq.HandleBackendMessage(emptyBackendMsg(MsgBindComplete))
+
+	bop2, portal2, _ := s.CreateBind("p2", "s1", nil, nil, nil)
+	seq.AddForwardedOperation(bop2)
+	seq.HandleBackendMessage(emptyBackendMsg(MsgBindComplete))
+
+	if portal1.ID == portal2.ID {
+		t.Fatal("expected two distinct portal generations")
+	}
+
+	eop1, _ := s.CreateExecute("p1")
+	seq.AddForwardedOperation(eop1)
+	actions1, err := seq.HandleBackendMessage(dataRowMsg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if actions1[0].TargetGeneration != portal1.ID {
+		t.Fatalf("expected portal1 DataRow TargetGeneration=%d, got %d", portal1.ID, actions1[0].TargetGeneration)
+	}
+	if _, err := seq.HandleBackendMessage(commandCompleteMsg("SELECT 1")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	eop2, _ := s.CreateExecute("p2")
+	seq.AddForwardedOperation(eop2)
+	actions2, err := seq.HandleBackendMessage(dataRowMsg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if actions2[0].TargetGeneration != portal2.ID {
+		t.Fatalf("expected portal2 DataRow TargetGeneration=%d, got %d", portal2.ID, actions2[0].TargetGeneration)
+	}
+	if actions2[0].TargetGeneration == actions1[0].TargetGeneration {
+		t.Fatal("expected the two portals' DataRow TargetGeneration to differ")
+	}
+}

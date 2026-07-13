@@ -2108,3 +2108,225 @@ func FuzzBackendCorrelatorSequence(f *testing.F) {
 		}
 	})
 }
+
+// --- TargetGeneration (bkz. CorrelationResult.TargetGeneration) -----------
+//
+// Bu testler, CorrelationResult.TargetGeneration'in HER islem turu icin
+// dogru, ISIM ICERMEYEN sayisal generation kimligini tasidigini kanitlar -
+// ileriki bir yanit maskeleme katmaninin (bkz. internal/masking) bir
+// DataRow/RowDescription'in hangi portal/statement generation'ina ait
+// oldugunu belirleyebilmesi icin gereklidir.
+
+func TestCorrelator_TargetGeneration_ParseComplete_MatchesStatementGeneration(t *testing.T) {
+	s, c := newCorrelator(t)
+	_, stmtGen, err := s.CreateParse("s1", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	res, err := c.Handle(emptyBackendMsg(MsgParseComplete))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != stmtGen.ID || res.TargetGeneration == NoGeneration {
+		t.Fatalf("expected TargetGeneration=%d, got %d", stmtGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_BindComplete_MatchesPortalGeneration(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	_, portalGen, err := s.CreateBind("p1", "s1", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	res, err := c.Handle(emptyBackendMsg(MsgBindComplete))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != portalGen.ID || res.TargetGeneration == NoGeneration {
+		t.Fatalf("expected TargetGeneration=%d, got %d", portalGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_DescribeStatement_RowDescription(t *testing.T) {
+	s, c := newCorrelator(t)
+	_, stmtGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	if _, err := s.CreateDescribeStatement("s1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c.Handle(paramDescMsg(nil))
+	res, err := c.Handle(rowDescMsg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != stmtGen.ID {
+		t.Fatalf("expected statement TargetGeneration=%d, got %d", stmtGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_DescribeStatement_NoData(t *testing.T) {
+	s, c := newCorrelator(t)
+	_, stmtGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	s.CreateDescribeStatement("s1")
+	c.Handle(paramDescMsg(nil))
+	res, err := c.Handle(emptyBackendMsg(MsgNoData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != stmtGen.ID {
+		t.Fatalf("expected statement TargetGeneration=%d, got %d", stmtGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_DescribePortal_RowDescription(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	_, portalGen, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	c.Handle(emptyBackendMsg(MsgBindComplete))
+	if _, err := s.CreateDescribePortal("p1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	res, err := c.Handle(rowDescMsg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != portalGen.ID {
+		t.Fatalf("expected portal TargetGeneration=%d, got %d", portalGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_DescribePortal_NoData(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	_, portalGen, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	c.Handle(emptyBackendMsg(MsgBindComplete))
+	s.CreateDescribePortal("p1")
+	res, err := c.Handle(emptyBackendMsg(MsgNoData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != portalGen.ID {
+		t.Fatalf("expected portal TargetGeneration=%d, got %d", portalGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_Execute_DataRow_IdentifiesPortal(t *testing.T) {
+	s, c := setupExecuteHead(t)
+	portal, ok := s.CommittedPortal("")
+	if !ok {
+		t.Fatal("expected committed unnamed portal")
+	}
+	res, err := c.Handle(dataRowMsg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Intermediate {
+		t.Fatalf("expected Intermediate=true, got %+v", res)
+	}
+	if res.TargetGeneration != portal.ID {
+		t.Fatalf("expected DataRow TargetGeneration=%d (portal), got %d", portal.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_ExecuteTerminal_CommandComplete(t *testing.T) {
+	s, c := setupExecuteHead(t)
+	portal, _ := s.CommittedPortal("")
+	res, err := c.Handle(commandCompleteMsg("SELECT 1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != portal.ID {
+		t.Fatalf("expected CommandComplete TargetGeneration=%d, got %d", portal.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_ExecuteTerminal_PortalSuspended(t *testing.T) {
+	s, c := setupExecuteHead(t)
+	portal, _ := s.CommittedPortal("")
+	res, err := c.Handle(emptyBackendMsg(MsgPortalSuspended))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != portal.ID {
+		t.Fatalf("expected PortalSuspended TargetGeneration=%d, got %d", portal.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_CloseComplete_Statement(t *testing.T) {
+	s, c := newCorrelator(t)
+	_, stmtGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	if _, err := s.CreateCloseStatement("s1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	res, err := c.Handle(emptyBackendMsg(MsgCloseComplete))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != stmtGen.ID {
+		t.Fatalf("expected statement-close TargetGeneration=%d, got %d", stmtGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_CloseComplete_Portal(t *testing.T) {
+	s, c := newCorrelator(t)
+	s.CreateParse("s1", "SELECT 1", nil)
+	c.Handle(emptyBackendMsg(MsgParseComplete))
+	_, portalGen, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	c.Handle(emptyBackendMsg(MsgBindComplete))
+	if _, err := s.CreateClosePortal("p1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	res, err := c.Handle(emptyBackendMsg(MsgCloseComplete))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != portalGen.ID {
+		t.Fatalf("expected portal-close TargetGeneration=%d, got %d", portalGen.ID, res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_ErrorResponse_MatchesFailedOperationGeneration(t *testing.T) {
+	s, c := newCorrelator(t)
+	_, stmtGen, _ := s.CreateParse("s1", "SELECT 1", nil)
+	res, err := c.Handle(minimalErrorResponse())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != stmtGen.ID {
+		t.Fatalf("expected failed-Parse TargetGeneration=%d, got %d", stmtGen.ID, res.TargetGeneration)
+	}
+	if res.FailedOperation.TargetGeneration != stmtGen.ID {
+		t.Fatalf("expected FailedOperation.TargetGeneration=%d, got %d", stmtGen.ID, res.FailedOperation.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_Async_IsNoGeneration(t *testing.T) {
+	_, c := newCorrelator(t)
+	res, err := c.Handle(backendMsg(MsgNoticeResponse, []byte{'S', 'N', 0, 0}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != NoGeneration {
+		t.Fatalf("expected async message TargetGeneration=NoGeneration, got %d", res.TargetGeneration)
+	}
+}
+
+func TestCorrelator_TargetGeneration_Sync_IsNoGeneration(t *testing.T) {
+	s, c := newCorrelator(t)
+	if _, err := s.CreateSync(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	res, err := c.Handle(rfqMsg(TxStatusIdle))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetGeneration != NoGeneration {
+		t.Fatalf("expected Sync/ReadyForQuery TargetGeneration=NoGeneration, got %d", res.TargetGeneration)
+	}
+}

@@ -100,6 +100,13 @@ type OutputAction struct {
 	OperationID   PendingOperationID
 	OperationKind OperationKind
 	Synthetic     bool
+	// TargetGeneration, ilgili CorrelationResult'tan aynen kopyalanan,
+	// ISIM ICERMEYEN statement/portal generation kimligidir - hangi
+	// generation'a ait oldugunu bir yanit maskeleme katmaninin (bkz.
+	// internal/masking) belirleyebilmesi icindir. Asenkron/baglanti-
+	// seviyesi cerceveler ve TUM sentetik eylemler icin her zaman
+	// NoGeneration'dir.
+	TargetGeneration GenerationID
 	// Bytes, istemciye oldugu gibi iletilecek tam cerceve baytlaridir
 	// (tag + uzunluk + govde). ActionTerminateConnection icin nil'dir.
 	// Her zaman sequencer'in ic durumundan bagimsiz, cagirana ait bir
@@ -426,12 +433,13 @@ func (s *ResponseSequencer) handleConnectionLevelErrorResponse(m Message) ([]Out
 func (s *ResponseSequencer) applyCorrelationResult(m Message, res CorrelationResult) []OutputAction {
 	actions := []OutputAction{
 		{
-			Kind:          ActionEmitBackendFrame,
-			MessageType:   m.Type,
-			CycleID:       res.CycleID,
-			OperationID:   res.OperationID,
-			OperationKind: res.OperationKind,
-			Bytes:         append([]byte(nil), m.Raw...),
+			Kind:             ActionEmitBackendFrame,
+			MessageType:      m.Type,
+			CycleID:          res.CycleID,
+			OperationID:      res.OperationID,
+			OperationKind:    res.OperationKind,
+			TargetGeneration: res.TargetGeneration,
+			Bytes:            append([]byte(nil), m.Raw...),
 		},
 	}
 

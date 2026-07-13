@@ -92,6 +92,12 @@ const (
 
 	reasonMalformedBody    = "SentinelDB policy: gecersiz Extended Query mesaj govdesi, baglanti guvenlik icin reddedildi"
 	reasonUnknownReference = "SentinelDB policy: bilinmeyen ya da gecersiz Extended Query referansi"
+	// reasonMaskingPreflightRejected, opt-in yanit maskelemesi etkinken bir
+	// Execute'un maskeleme on-kontrolunden (preflight) gecemedigi TUM
+	// durumlar icin kullanilir: bilinmeyen sonuc sekli, ikili maskeleme
+	// hedefi, tutarsiz/gecersiz sonuc format meta verisi, ya da sekil
+	// kapasitesi asimi (bkz. gorev 10, gateway.ErrExtendedMaskingPreflightRejected).
+	reasonMaskingPreflightRejected = "SentinelDB policy: yanit maskeleme on-kontrolu basarisiz, Execute reddedildi"
 )
 
 // ExtendedFrontend, decode edilmis steady-state Extended Query frontend
@@ -385,6 +391,18 @@ func (f *ExtendedFrontend) handleRegistrationOutcome(ctx context.Context, err er
 	}
 	if errors.Is(err, gateway.ErrInvalidFrontendFrame) || errors.Is(err, gateway.ErrFrontendFrameTooLarge) {
 		f.rejectLocally(ctx, sqlStateProtocolError, reasonMalformedBody)
+		return
+	}
+	if errors.Is(err, gateway.ErrExtendedMaskingPreflightRejected) {
+		// Opt-in yanit maskelemesi etkinken bir Execute'un maskeleme
+		// on-kontrolunden gecemedigi TUM durumlar (bilinmeyen sonuc sekli,
+		// ikili maskeleme hedefi, tutarsiz format meta verisi, sekil
+		// kapasitesi asimi) - HICBIR State/sequencer mutasyonu
+		// uygulanmadan, kurtarilabilir bir yerel ret + discard (bkz.
+		// gorev 10). Policy hicbir zaman Execute'u degerlendirmez -
+		// maskeleme preflight'i, Policy'den TAMAMEN bagimsiz ayri bir
+		// yerel ret kategorisidir.
+		f.rejectLocally(ctx, sqlStatePolicyBlocked, reasonMaskingPreflightRejected)
 		return
 	}
 	// Geriye kalan tek kategori: State.Create* kendi sozlesmesi geregi

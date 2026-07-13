@@ -605,14 +605,128 @@ declared lengths, tags, or parser detail). The previous revision's
 `fmt.Errorf("%w: %v", ..., err)` wrapping of decoder/parser errors has
 been removed for this reason.
 
-**Mixed Simple/Extended Query and masking remain unsupported.** If a
-`Query` (Simple Query) message, a COPY frontend message, or any other
+**Mixed Simple/Extended Query routing remains unsupported.** If a `Query`
+(Simple Query) message, a COPY frontend message, or any other
 unrecognized steady-state message reaches `RunExtended`, `ExtendedFrontend`
 fails closed and terminates the standalone runtime without forwarding
-it — this path is Extended-Query-only in this stage. Masking
-(`masking.Transformer`) integration and per-portal masking-shape
-collection are not implemented for this path; DataRow responses pass
-through unmasked. Both require a later, explicitly scoped stage.
+it — this path is Extended-Query-only in this stage. Startup/
+authentication handoff and mixed Simple/Extended Query routing require a
+later, explicitly scoped stage. Extended Query response masking (see
+the next section) is now implemented, opt-in, and independent of this
+mixed-routing gap.
+
+### Opt-in Extended Query response masking (still not part of the live gateway)
+
+`gateway.NewExtendedRuntimeWithMasking` adds a second, opt-in constructor
+alongside the existing `NewExtendedRuntime` — same struct, same event
+loop, same single-writer/single-reader ownership guarantees, with masking
+metadata attached only when explicitly requested. `NewExtendedRuntime`
+itself is **completely unchanged** and continues to produce a
+masking-disabled runtime; `cmd/gateway` does not call the masking
+constructor.
+
+**Two layers, not one.** `masking.Transformer` (the live Simple Query
+path) was **not** given Extended Query awareness directly — its
+I/O-owning `Decoder`, single connection-global result shape, and
+sole-writer design do not fit `ExtendedRuntime`'s event-loop/per-
+generation ownership model. Instead, `internal/masking/row_mask.go`
+extracts the existing per-`DataRow` masking behavior into an I/O-free,
+goroutine-free core (`MaskDataRow`/`RowMaskPlan`/`MaskTarget`) that both
+`Transformer` and the new Extended path now share — `Transformer`'s
+public API, wire behavior, and hook-invocation counts are byte-for-byte
+unchanged; only its internals were refactored to call the shared core.
+`internal/masking/extended.go` adds a second, connection-local
+`ExtendedTracker`, owned and called only by `ExtendedRuntime`'s single
+event-loop goroutine, that caches per-generation shape/plan metadata
+instead of one connection-global result shape.
+
+**Shape metadata is keyed by `GenerationID`, never by name.**
+`protocol.CorrelationResult` and `protocol.OutputAction` both gained a
+`TargetGeneration protocol.GenerationID` field, captured from the exact
+pending-operation snapshot at correlation time (`BackendCorrelator`) and
+copied through unchanged by `ResponseSequencer` — asynchronous/
+connection-level/synthetic actions always carry `NoGeneration`. This lets
+`ExtendedRuntime`'s event loop identify which statement or portal
+generation a Describe result or `DataRow` belongs to using only a
+numeric identifier, with the same non-disclosure guarantee every other
+Extended Query type already has (no statement/portal name ever crosses
+this boundary).
+
+**Statement Describe and portal Describe are cached separately, and
+mean different things.** A statement `Describe`'s `RowDescription`
+supplies column names for masking-target matching, but its format codes
+are placeholders and are **discarded**, never treated as a later
+`Execute`'s actual wire format. A portal `Describe`'s `RowDescription`
+format codes **are** the actual result formats for that portal, and are
+validated for consistency against the portal's own `Bind` result-format-
+codes (`masking.ExpandResultFormats`) before anything is cached — an
+inconsistency fails closed. `NoData` (statement- or portal-level) caches
+a **known-NoData** shape, distinct from *unknown* (no Describe observed
+at all): both make `DataRow` masking obligations well-defined, but only
+unknown shape can locally reject an `Execute`. `RowDescription`/`NoData`
+themselves are always relayed to the client byte-for-byte unchanged —
+masking only ever rewrites `DataRow` cell values.
+
+**Bind result-format expansion follows the wire protocol exactly.**
+`masking.ExpandResultFormats` implements PostgreSQL's own rule: zero
+result-format codes means every column is text; one code applies to
+every column; exactly N codes (for N result columns) apply positionally;
+any other count, or any code other than 0/1, is rejected. `Execute`'s
+effective mask plan is always derived by combining the resolved shape
+(portal-specific if observed, else the underlying statement's) with this
+expansion of the portal's own `Bind.ResultFormats` — never from a
+statement Describe's placeholder format codes.
+
+**Execute masking preflight runs before any mutation, exactly like the
+existing local-rejection cases.** `ExtendedRuntime.handleFrontendRegisterAndForward`
+now performs, for `Execute` only, when masking is enabled: resolve the
+target portal (read-only) → resolve its effective mask plan → reject
+*before* `State.CreateExecute` if the shape is unknown, a masking-target
+column is binary, format metadata is inconsistent, or shape capacity
+would be exceeded. A rejection here produces the fixed, recoverable
+`gateway.ErrExtendedMaskingPreflightRejected`; `ExtendedFrontend` treats
+it exactly like every other local-rejection category — one synthetic
+`ErrorResponse`, discard-until-`Sync`, real `Sync` always still forwarded,
+no fabricated `ReadyForQuery`. `Execute` is never policy-evaluated. If
+preflight succeeds, the ordering is strict: preflight → `State.
+CreateExecute` → `ResponseSequencer` registration → effective plan commit
+→ upstream write → success acknowledgement — identical in spirit to the
+existing registration-before-forwarding contract.
+
+**`DataRow` masking happens inside `processActions`, the same single
+choke point that already writes every client-bound byte.** For an
+`ActionEmitBackendFrame` whose `MessageType` is `DataRow` and
+`OperationKind` is `Execute`, the event loop looks up the portal
+generation's committed plan and calls the shared `MaskDataRow` core with
+the runtime's own cancellable context (`Run`'s `ctx`, which parent
+cancellation, frontend closure, and runtime shutdown all cancel) —
+`Masker` is called only here, only one at a time, never from a
+background goroutine. A missing plan, malformed `DataRow`, field-count
+mismatch, or `Masker` error never writes the offending frame; instead it
+writes exactly one fixed FATAL `ErrorResponse`
+(`gateway.ErrExtendedMaskingFailed`) and terminates both connections
+fail-closed — this is a terminal backend-response safety failure, never
+routed through `ResponseSequencer` as a local synthetic rejection.
+`PortalSuspended` never clears a portal's committed plan, so a resumed
+`Execute` of the same portal reuses it unchanged.
+
+**Lifecycle cleanup is generation-based, checked after every event.**
+After each frontend/backend event the event loop successfully processes,
+it reconciles `ExtendedTracker` against `State`: any statement/portal
+generation `State` no longer recognizes (removed, or marked failed) has
+its cached shape/plan retired. Because `GenerationID`s are never reused
+or inherited — a replacement unnamed `Parse`/`Bind` always allocates a
+fresh one — a stale shape can never be silently reused by a later
+operation; this reconciliation only reclaims memory promptly rather than
+gating correctness.
+
+**`internal/masking.ExtendedLimits` bounds all retained shape/plan
+metadata** (statement shapes, portal shapes, fields per shape, total
+retained fields) with positive, explicit limits and no best-effort
+partial recording or background eviction — capacity exhaustion before
+`Execute`'s `State` mutation is a recoverable local rejection; capacity
+exhaustion while processing a real backend Describe is terminal
+fail-closed, exactly like a malformed backend message.
 
 ## SSLRequest / GSSENCRequest rejection
 

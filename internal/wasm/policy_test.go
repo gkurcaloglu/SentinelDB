@@ -30,17 +30,38 @@ func (f *fakeEvaluator) Evaluate(ctx context.Context, query string, blockedPhras
 	return f.verdict, f.reason, f.err
 }
 
-func TestPolicy_IgnoresNonQueryMessages(t *testing.T) {
+func TestPolicy_IgnoresNonQueryNonParseMessages(t *testing.T) {
 	fe := &fakeEvaluator{}
 	p := &Policy{rt: fe, blockedPhrases: []string{"DROP TABLE"}}
 
-	v, reason := p.Evaluate(protocol.Message{Type: protocol.MsgParse, Query: "DROP TABLE users;"})
-
-	if v != firewall.Allow || reason != "" {
-		t.Fatalf("expected (Allow, \"\"), got (%v, %q)", v, reason)
+	for _, typ := range []protocol.MessageType{protocol.MsgBind, protocol.MsgDescribe, protocol.MsgExecute, protocol.MsgClose, protocol.MsgFlush, protocol.MsgSync} {
+		v, reason := p.Evaluate(protocol.Message{Type: typ, Query: "DROP TABLE users;"})
+		if v != firewall.Allow || reason != "" {
+			t.Fatalf("type %v: expected (Allow, \"\"), got (%v, %q)", typ, v, reason)
+		}
 	}
 	if fe.calls != 0 {
-		t.Fatalf("expected evaluator to never be called for non-Query messages, got %d calls", fe.calls)
+		t.Fatalf("expected evaluator to never be called for non-Query/non-Parse messages, got %d calls", fe.calls)
+	}
+}
+
+func TestPolicy_TreatsExtendedParseLikeSimpleQuery(t *testing.T) {
+	// bkz. gorev 8: MsgParse SQL sablonunu tasir - Wasm ABI'sine yalnizca
+	// m.Query gectigi icin (m.Type asla sinir gecmez), bu davranis
+	// eklenti tarafinda HICBIR degisiklik gerektirmez.
+	fe := &fakeEvaluator{verdict: wasmproto.VerdictBlock, reason: "blocked"}
+	p := &Policy{rt: fe, blockedPhrases: []string{"DROP TABLE"}}
+
+	v, reason := p.Evaluate(protocol.Message{Type: protocol.MsgParse, Name: "Parse", Query: "DROP TABLE users;"})
+
+	if v != firewall.Block || reason != "blocked" {
+		t.Fatalf("expected (Block, \"blocked\"), got (%v, %q)", v, reason)
+	}
+	if fe.calls != 1 {
+		t.Fatalf("expected evaluator to be called exactly once for a Parse message, got %d calls", fe.calls)
+	}
+	if fe.gotQuery != "DROP TABLE users;" {
+		t.Fatalf("expected the Parse query text forwarded to the evaluator, got %q", fe.gotQuery)
 	}
 }
 

@@ -32,14 +32,43 @@ func TestDenyKeywords_BlocksDangerousQueries(t *testing.T) {
 	}
 }
 
-func TestDenyKeywords_IgnoresNonQueryMessages(t *testing.T) {
+func TestDenyKeywords_IgnoresNonQueryNonParseMessages(t *testing.T) {
 	policy := DenyKeywords("DROP TABLE")
 
-	// Parse (extended protocol) mesajlari da SQL metni tasir, ama DenyKeywords
-	// su an yalnizca Simple Query'yi ('Q') denetliyor; bu davranisi belgeler.
-	v, _ := policy.Evaluate(protocol.Message{Type: protocol.MsgParse, Query: "DROP TABLE users;"})
-	if v != Allow {
-		t.Fatalf("expected non-Query messages to be allowed regardless of content, got %v", v)
+	// Bind/Describe/Execute/Close/Flush/Sync hicbir yeni SQL sablonu
+	// tasimaz (m.Query bos) - DenyKeywords bunlari denetlemez.
+	for _, typ := range []protocol.MessageType{protocol.MsgBind, protocol.MsgDescribe, protocol.MsgExecute, protocol.MsgClose, protocol.MsgFlush, protocol.MsgSync} {
+		v, _ := policy.Evaluate(protocol.Message{Type: typ, Query: "DROP TABLE users;"})
+		if v != Allow {
+			t.Fatalf("type %v: expected non-Query/non-Parse messages to be allowed regardless of content, got %v", typ, v)
+		}
+	}
+}
+
+func TestDenyKeywords_TreatsExtendedParseLikeSimpleQuery(t *testing.T) {
+	// bkz. gorev 8 "Parse-time policy evaluation": Extended Query Parse
+	// (MsgParse) SQL sablonunu tasir - DenyKeywords bunu MsgQuery ile
+	// AYNI kurallarla denetlemelidir (SQL matching bypass edilemez).
+	policy := DenyKeywords("DROP TABLE", "DELETE FROM")
+
+	cases := []struct {
+		query   string
+		wantBlk bool
+	}{
+		{"DROP TABLE users;", true},
+		{"drop   table\tusers;", true},
+		{"DELETE FROM users WHERE id = 1;", true},
+		{"SELECT * FROM users;", false},
+	}
+	for _, tc := range cases {
+		v, reason := policy.Evaluate(protocol.Message{Type: protocol.MsgParse, Name: "Parse", Query: tc.query})
+		blocked := v == Block
+		if blocked != tc.wantBlk {
+			t.Errorf("Parse query %q: got blocked=%v (reason=%q), want %v", tc.query, blocked, reason, tc.wantBlk)
+		}
+		if blocked && reason == "" {
+			t.Errorf("Parse query %q: blocked but reason is empty", tc.query)
+		}
 	}
 }
 

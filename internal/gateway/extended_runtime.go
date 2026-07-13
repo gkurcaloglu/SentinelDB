@@ -20,6 +20,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,27 @@ import (
 
 	"github.com/gkurcaloglu/sentineldb/internal/protocol"
 )
+
+// BackendTransport, ExtendedRuntime'in gercek backend baglantisi uzerinde
+// ihtiyac duydugu TAM G/C yuzeyidir: hem backend'den okuma (sunucu
+// yanitlari) hem backend'e yazma (allowed frontend cercevelerinin upstream
+// iletimi, bkz. RegisterAndForwardFrontendOperation/ForwardFlush/
+// ForwardTerminate) hem de kapatma. Onceki asamada ExtendedRuntime yalnizca
+// io.ReadCloser sahibiydi (upstream yazma sorumlulugu gelecekteki bir
+// cagirana birakilmisti) - bu artik yeterli degil: kayit (State/sequencer)
+// basarili olduktan SONRA cagiranin kendi upstream yazmasi, kismi bir yazma
+// hatasinda runtime'in gercek sunucunun HICBIR ZAMAN gormedigi "canli" bir
+// islem icermesine yol acabilirdi (bkz. gorev 3). Bu yuzden NewExtendedRuntime
+// artik backend transport'un TAMAMINI (okuma+yazma+kapatma) sahiplenir; TEK
+// event-loop goroutine'i hem okur (dolayli olarak, ayri okuyucu goroutine
+// araciligiyla) hem de upstream'e yazar - iki farkli goroutine ASLA ayni
+// anda backend'e erismez (okuyucu yalnizca Read cagirir, event-loop yalnizca
+// Write cagirir).
+type BackendTransport interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}
 
 // backendReadBufferSize, backend okuyucunun tek bir Read çağrısında
 // kullandığı sabit boyutlu tampon boyutudur. internal/firewall/gate.go'nun
@@ -105,6 +127,48 @@ var (
 	// (rollback) denenmez (tam, test edilmis bir State geri alma ilkeli
 	// olmadan).
 	ErrFrontendRegistrationDiverged = errors.New("extendedruntime: State islemi olusturuldu ama sequencer kaydi basarisiz oldu (uyusmazlik)")
+
+	// --- Upstream iletim (bkz. gorev 3-7) ---------------------------------
+
+	// ErrBackendWriteFailed, State/sequencer kaydi BASARILI olduktan SONRA
+	// orijinal frontend cercevesinin backend'e (upstream) yazilmasi
+	// basarisiz oldugunda donulur. Bu HER ZAMAN runtime'i kalici olarak
+	// fail-closed sonlandirir: kayit zaten yapilmis olabilir (backend
+	// kismen ya da hic almamis olabilir) - hicbir "guvenle yeniden
+	// deneyebilirsin" varsayimi yapilamaz, hicbir State geri almasi
+	// denenmez.
+	ErrBackendWriteFailed = errors.New("extendedruntime: frontend cercevesinin backend'e (upstream) yazilmasi basarisiz")
+	// ErrInvalidFrontendFrame, RegisterAndForwardFrontendOperation/
+	// ForwardFlush/ForwardTerminate'e verilen frame, istenen islem turu
+	// icin tam, tek, dogru etiketli bir normal-protokol frontend cercevesi
+	// OLMADIGINDA donulur (bkz. gorev 4: eksik baslik, uzunluk uyusmazligi,
+	// fazla/artik bayt, yanlis tag, Describe/Close hedef secici
+	// uyusmazligi, govde tipi ayristiricinin reddi). Hicbir mutasyon
+	// (State/sequencer) denenmeden reddedilir - runtime saglikli kalir.
+	ErrInvalidFrontendFrame = errors.New("extendedruntime: gecersiz ya da istenen islemle uyusmayan frontend cercevesi")
+	// ErrFrontendFrameTooLarge, verilen frame RuntimeLimits.MaxFrontendFrameBytes'i
+	// astiginda donulur - hicbir mutasyon denenmeden reddedilir.
+	ErrFrontendFrameTooLarge = errors.New("extendedruntime: frontend cercevesi izin verilen en fazla boyutu asiyor")
+	// ErrFrontendTerminateRequested, istemci gecerli bir Terminate
+	// cercevesi gonderdiginde ve bu cerceve basari ile upstream'e
+	// iletildiginde, Run'in birincil (primary) hatasi olarak kullanilir -
+	// runtime bu noktadan sonra kalici olarak sonlanir (bkz.
+	// ForwardTerminate). Bu, ForwardTerminate'in cagirana dondurdugu
+	// (basarili iletimi onaylayan, nil) sonuctan BAGIMSIZDIR.
+	ErrFrontendTerminateRequested = errors.New("extendedruntime: istemci Terminate gonderdi, baglanti kalici olarak sonlandiriliyor")
+	// ErrFrontendClosed, frontend ureticisinin (bkz. NotifyFrontendClosed)
+	// client baglantisinda TEMIZ bir EOF gozlemleyip artik daha fazla
+	// frontend olayi gondermeyecegini bildirdiginde Run'in birincil hatasi
+	// olarak kullanilir.
+	ErrFrontendClosed = errors.New("extendedruntime: frontend ureticisi baglantiyi temiz sekilde kapatti (EOF)")
+	// ErrFrontendReadFailed, frontend ureticisi client baglantisindan
+	// okurken EOF-DISI bir hata ile karsilastigini bildirdiginde kullanilir.
+	ErrFrontendReadFailed = errors.New("extendedruntime: frontend baglantisindan okuma basarisiz")
+	// ErrFrontendProtocolFailure, frontend ureticisi kendi decoder/
+	// cerceveleme katmaninda kurtarilamaz bir hata (ör. bozuk cerceve,
+	// desteklenmeyen steady-state mesaji) bildirdiginde kullanilir - bu
+	// HER ZAMAN fail-closed'dir.
+	ErrFrontendProtocolFailure = errors.New("extendedruntime: frontend decoder/cerceveleme hatasi")
 )
 
 // RuntimeLimits, ExtendedRuntime'in olay kanallari icin pozitif, sinirli
@@ -117,10 +181,17 @@ type RuntimeLimits struct {
 	// BackendEventBuffer, backend okuyucu tarafindan gonderilen
 	// (mesaj/hata/EOF) olaylar icin arabellek kapasitesidir.
 	BackendEventBuffer int
+	// MaxFrontendFrameBytes, RegisterAndForwardFrontendOperation/
+	// ForwardFlush/ForwardTerminate'e verilen TEK bir frontend
+	// cercevesinin (tag + 4 baytlik uzunluk + govde dahil TOPLAM) izin
+	// verilen en fazla bayt boyutudur (bkz. gorev 16). Pozitif olmalidir;
+	// bu sinir asildiginda cagri hicbir mutasyon denenmeden
+	// ErrFrontendFrameTooLarge ile reddedilir.
+	MaxFrontendFrameBytes int
 }
 
 func (l RuntimeLimits) validate() error {
-	if l.FrontendEventBuffer <= 0 || l.BackendEventBuffer <= 0 {
+	if l.FrontendEventBuffer <= 0 || l.BackendEventBuffer <= 0 || l.MaxFrontendFrameBytes <= 0 {
 		return ErrInvalidRuntimeLimits
 	}
 	return nil
@@ -216,26 +287,60 @@ type frontendEventKind int
 
 const (
 	frontendEventRegister frontendEventKind = iota + 1
+	frontendEventRegisterAndForward
 	frontendEventSynthetic
+	frontendEventSyntheticCurrentCycle
+	frontendEventFlush
+	frontendEventTerminate
+	frontendEventClosed
 )
 
-// frontendEvent, RegisterFrontendOperation/SubmitSyntheticError
-// tarafindan olusturulan, degismez bir istek goruntusudur. ack, kapasitesi
-// 1 olan tamponlu bir kanaldir: cagiranin ctx'i olay kabul edildikten
-// SONRA ama sonuc alinmadan ONCE iptal edilirse, olay isleyici
-// goroutine'inin (event loop) gonderim sirasinda asla bloklanmamasini
-// (dolayisiyla sizinti olusmamasini) saglar.
+// FrontendCloseReason, frontend ureticisinin (bkz. NotifyFrontendClosed)
+// client-okuma dongusunun HANGI nedenle sona erdigini bildirdigini
+// belirtir.
+type FrontendCloseReason int
+
+const (
+	// FrontendClosedEOF, client baglantisinda TEMIZ bir EOF gozlemlendigini
+	// belirtir - client baglantiyi normal sekilde kapatmistir.
+	FrontendClosedEOF FrontendCloseReason = iota + 1
+	// FrontendClosedReadError, client baglantisindan EOF-DISI bir okuma
+	// hatasi olustugunu belirtir.
+	FrontendClosedReadError
+	// FrontendClosedProtocolError, frontend ureticisinin kendi decoder/
+	// cerceveleme katmaninda (ör. bozuk cerceve, desteklenmeyen
+	// steady-state mesaji) kurtarilamaz bir hata ile karsilastigini
+	// belirtir - HER ZAMAN fail-closed'dir.
+	FrontendClosedProtocolError
+)
+
+// frontendEvent, RegisterFrontendOperation/RegisterAndForwardFrontendOperation/
+// SubmitSyntheticError/SubmitSyntheticErrorForCurrentCycle/ForwardFlush/
+// ForwardTerminate/NotifyFrontendClosed tarafindan olusturulan, degismez
+// bir istek goruntusudur. ack, kapasitesi 1 olan tamponlu bir kanaldir:
+// cagiranin ctx'i olay kabul edildikten SONRA ama sonuc alinmadan ONCE
+// iptal edilirse, olay isleyici goroutine'inin (event loop) gonderim
+// sirasinda asla bloklanmamasini (dolayisiyla sizinti olusmamasini) saglar.
 type frontendEvent struct {
-	kind  frontendEventKind
-	req   FrontendOperationRequest // yalnizca frontendEventRegister icin
-	cycle protocol.CycleID         // yalnizca frontendEventSynthetic icin
-	frame []byte                   // yalnizca frontendEventSynthetic icin, cagirandan bagimsiz kopya
-	ack   chan frontendAck
+	kind frontendEventKind
+	req  FrontendOperationRequest // yalnizca frontendEventRegister/RegisterAndForward icin
+	// frame, cagirandan BAGIMSIZ bir kopyadir: frontendEventRegisterAndForward
+	// (orijinal frontend cercevesi), frontendEventSynthetic/SyntheticCurrentCycle
+	// (sentetik ErrorResponse cercevesi) ve frontendEventFlush/Terminate
+	// (orijinal Flush/Terminate cercevesi) tarafindan kullanilir.
+	frame []byte
+	cycle protocol.CycleID // yalnizca frontendEventSynthetic icin (acik cycle)
+
+	closeReason FrontendCloseReason // yalnizca frontendEventClosed icin
+	closeCause  error               // yalnizca frontendEventClosed icin (FrontendClosedEOF disinda)
+
+	ack chan frontendAck
 }
 
 type frontendAck struct {
-	reg FrontendRegistration
-	err error
+	reg   FrontendRegistration
+	cycle protocol.CycleID // yalnizca frontendEventSyntheticCurrentCycle basarisinda anlamli
+	err   error
 }
 
 type backendEventKind int
@@ -284,7 +389,7 @@ type ExtendedRuntime struct {
 	state *protocol.State
 	seq   *protocol.ResponseSequencer
 
-	backend io.ReadCloser
+	backend BackendTransport
 	client  io.WriteCloser
 
 	limits RuntimeLimits
@@ -382,7 +487,7 @@ type ExtendedRuntime struct {
 // erismemelidir.
 func NewExtendedRuntime(
 	state *protocol.State,
-	backend io.ReadCloser,
+	backend BackendTransport,
 	client io.WriteCloser,
 	sequencerLimits protocol.SequencerLimits,
 	runtimeLimits RuntimeLimits,
@@ -671,6 +776,128 @@ func (r *ExtendedRuntime) SubmitSyntheticError(ctx context.Context, cycle protoc
 	return err
 }
 
+// RegisterAndForwardFrontendOperation, req'te tanimlanan Extended Query
+// islemini - State.Create* + ResponseSequencer kaydi + orijinal frontend
+// cercevesinin upstream'e (backend'e) YAZILMASI DAHIL - munhasiran
+// event-loop goroutine'i icinde, TEK bir olay turunda gerceklestirir (bkz.
+// gorev 3). frame, cagirandan BAGIMSIZ bir kopya olarak saklanir ve
+// tam olarak istenen req.Kind'a karsilik gelen, tek, tam bir normal-
+// protokol frontend cercevesi olmalidir (bkz. gorev 4) - aksi halde
+// ErrInvalidFrontendFrame ile, hicbir mutasyon denenmeden reddedilir.
+//
+// Kayit-once-iletim degismezi MUTLAKTIR ve event-loop icinde bu SIRAYLA
+// uygulanir: (1) cerceve dogrulanir, (2) State.Create* cagirilir, (3)
+// ResponseSequencer'a kaydedilir, (4) ANCAK BUNDAN SONRA orijinal cerceve
+// backend'e yazilir, (5) basari YALNIZCA tam yazim tamamlandiktan sonra
+// bildirilir. Boylece cagiran (ör. internal/firewall.ExtendedFrontend)
+// basari aldiginda, gercek sunucunun ilgili islemi ZATEN aldigini bilir -
+// kismi bir upstream yazma hatasi runtime'i "gercek sunucunun gormedigi
+// canli bir islem" durumunda birakamaz (bkz. ErrBackendWriteFailed: boyle
+// bir hata HER ZAMAN runtime'i kalici olarak fail-closed sonlandirir,
+// hicbir State geri almasi denenmez).
+//
+// Uc FARKLI reddetme/hata kategorisi vardir:
+//
+//   - Cerceve dogrulamasi BASARISIZ olursa (ErrInvalidFrontendFrame/
+//     ErrFrontendFrameTooLarge) ya da State.Create* KENDISI basarisiz
+//     olursa: hicbir mutasyon uygulanmadi - runtime saglikli kalir, hata
+//     oldugu gibi cagirana dondurulur, hicbir upstream yazma denenmez.
+//   - State.Create* BASARILI olur ama ResponseSequencer.AddForwardedOperation
+//     BASARISIZ olursa: ErrFrontendRegistrationDiverged (mevcut davranis,
+//     bkz. RegisterFrontendOperation) - runtime KALICI olarak sonlanir,
+//     hicbir upstream yazma denenmez.
+//   - State/sequencer kaydi BASARILI olur ama upstream yazma BASARISIZ
+//     olursa: ErrBackendWriteFailed - runtime KALICI olarak fail-closed
+//     sonlanir; cagirana ASLA "iletim guvenli/basarili" sinyali verilmez.
+//
+// Basari ayrica gorev 2'nin ackGate dogrusallastirmasina tabidir (bkz.
+// sendFrontendSuccess): parent-runtime kapanmasi basari ack'inden ONCE
+// dogrusallasirsa, cagiran basari YERINE sabit ErrRuntimeStopped alir.
+func (r *ExtendedRuntime) RegisterAndForwardFrontendOperation(ctx context.Context, req FrontendOperationRequest, frame []byte) (FrontendRegistration, error) {
+	ack := make(chan frontendAck, 1)
+	copiedFrame := append([]byte(nil), frame...)
+	result, err := r.submit(ctx, frontendEvent{kind: frontendEventRegisterAndForward, req: req.copy(), frame: copiedFrame, ack: ack})
+	return result.reg, err
+}
+
+// SubmitSyntheticErrorForCurrentCycle, backend'e hic iletilmemis bir
+// ErrorResponse cercevesini, event-loop'un KENDISININ State'ten okudugu
+// GUNCEL (mevcut) cycle icin sequencer'a sunar (bkz. gorev 5). Cagiran
+// (ör. internal/firewall.ExtendedFrontend) State'e hicbir zaman dogrudan
+// erisemedigi ve dolayisiyla dogru CycleID'yi TAHMIN EDEMEYECEGI icin bu,
+// frontend koprusunun yerel ret senaryolarinda kullanmasi gereken TEK
+// sentetik-hata giris noktasidir - dusuk seviyeli SubmitSyntheticError
+// (acik cycle parametreli) yalnizca mevcut testler/ic cagiranlar icin
+// korunur.
+//
+// Basari yalnizca sentetik birim ResponseSequencer tarafindan KABUL
+// EDILDIKTEN (ve varsa ani cikti eylemleri tam islendikten) SONRA
+// bildirilir; bu durumda kullanilan GERCEK CycleID (sanitize edilmis,
+// sayisal) dondurulur - cagiran bunu, kendi discard-until-Sync durumunun
+// "engellenmis cycle" degeri olarak saklamalidir.
+func (r *ExtendedRuntime) SubmitSyntheticErrorForCurrentCycle(ctx context.Context, frame []byte) (protocol.CycleID, error) {
+	ack := make(chan frontendAck, 1)
+	copied := append([]byte(nil), frame...)
+	result, err := r.submit(ctx, frontendEvent{kind: frontendEventSyntheticCurrentCycle, frame: copied, ack: ack})
+	return result.cycle, err
+}
+
+// ForwardFlush, tam ve gecerli bir Flush ('H') cercevesini upstream'e
+// (backend'e) TAM OLARAK BIR KEZ yazar (bkz. gorev 6). Flush'in gercek
+// protokolde karsilik gelen bir backend onayi yoktur - bu yuzden hicbir
+// State islemi olusturulmaz, hicbir ResponseSequencer plan birimi
+// eklenmez. Basari yalnizca tam yazim tamamlandiktan sonra bildirilir
+// (ackGate dogrusallastirmasina tabidir, bkz. sendFrontendSuccess).
+// Gecersiz/uyumsuz bir cerceve hicbir mutasyon/yazma denenmeden
+// ErrInvalidFrontendFrame ile reddedilir; upstream yazma basarisiz
+// olursa runtime KALICI olarak fail-closed sonlanir (ErrBackendWriteFailed).
+func (r *ExtendedRuntime) ForwardFlush(ctx context.Context, frame []byte) error {
+	ack := make(chan frontendAck, 1)
+	copied := append([]byte(nil), frame...)
+	_, err := r.submit(ctx, frontendEvent{kind: frontendEventFlush, frame: copied, ack: ack})
+	return err
+}
+
+// ForwardTerminate, tam ve gecerli bir Terminate ('X') cercevesini
+// upstream'e (backend'e) TAM OLARAK BIR KEZ yazar (bkz. gorev 6). Flush
+// gibi hicbir State islemi/sequencer plan birimi olusturmaz. Yazim
+// BASARILI olursa cagirana nil (iletim onaylandi) dondurulur - ANCAK
+// runtime bu noktadan itibaren KALICI olarak sonlanma surecine girer: hicbir
+// ReadyForQuery beklenmez, hicbir sonraki is kabul edilmez, her iki
+// baglanti da kapatilir (bkz. Run'in ErrFrontendTerminateRequested
+// birincil hatasi - bu, ForwardTerminate'in cagirana dondurdugu basarili
+// sonuctan BAGIMSIZDIR). Gecersiz bir cerceve hicbir mutasyon/yazma
+// denenmeden reddedilir; upstream yazma basarisiz olursa runtime KALICI
+// olarak fail-closed sonlanir.
+func (r *ExtendedRuntime) ForwardTerminate(ctx context.Context, frame []byte) error {
+	ack := make(chan frontendAck, 1)
+	copied := append([]byte(nil), frame...)
+	_, err := r.submit(ctx, frontendEvent{kind: frontendEventTerminate, frame: copied, ack: ack})
+	return err
+}
+
+// NotifyFrontendClosed, frontend ureticisinin (ör.
+// internal/firewall.ExtendedFrontend/Gate.RunExtended) kendi client-okuma
+// dongusunun SONA ERDIGINI - ve dolayisiyla runtime'in ARTIK hicbir yeni
+// frontend olayi beklememesi gerektigini - bildirir (bkz. gorev 7).
+// reason, sona erme nedenini (temiz EOF/okuma hatasi/decoder-cerceveleme
+// hatasi) belirtir; cause yalnizca EOF-DISI nedenlerde anlamlidir ve
+// baglanti/aktarim duzeyinde GUVENLI bir hata olmalidir (SQL/isim/deger
+// ICERMEMELIDIR - mevcut ErrClientWriteFailed/ErrBackendReadFailed
+// sarmalama kuralindaki AYNI sozlesme).
+//
+// Bu olay ISLENDIGI anda event-loop'u KALICI olarak sonlandirir (bkz.
+// ErrFrontendClosed/ErrFrontendReadFailed/ErrFrontendProtocolFailure) -
+// runtime boylece asla sonsuza kadar "bir sonraki frontend olayini"
+// beklemez. Kapanma nedensellik kurallari (bkz. gorev 1) burada da
+// gecerlidir: bu olay LOOP icinde islendigi anda kendi ic nedenini
+// (markInternalShutdown) kaydeder.
+func (r *ExtendedRuntime) NotifyFrontendClosed(ctx context.Context, reason FrontendCloseReason, cause error) error {
+	ack := make(chan frontendAck, 1)
+	_, err := r.submit(ctx, frontendEvent{kind: frontendEventClosed, closeReason: reason, closeCause: cause, ack: ack})
+	return err
+}
+
 // submit, hem RegisterFrontendOperation hem SubmitSyntheticError
 // tarafindan paylasilan gonderim/geri-bildirim mantigidir. Kanal
 // tukenmesi karsisinda geri basinc uygular: kapasite acilana, cagiranin
@@ -878,8 +1105,18 @@ func (r *ExtendedRuntime) handleFrontendEvent(ev frontendEvent) error {
 	switch ev.kind {
 	case frontendEventRegister:
 		return r.handleFrontendRegister(ev)
+	case frontendEventRegisterAndForward:
+		return r.handleFrontendRegisterAndForward(ev)
 	case frontendEventSynthetic:
 		return r.handleFrontendSynthetic(ev)
+	case frontendEventSyntheticCurrentCycle:
+		return r.handleFrontendSyntheticCurrentCycle(ev)
+	case frontendEventFlush:
+		return r.handleFrontendFlush(ev)
+	case frontendEventTerminate:
+		return r.handleFrontendTerminate(ev)
+	case frontendEventClosed:
+		return r.handleFrontendClosed(ev)
 	default:
 		return nil
 	}
@@ -930,6 +1167,139 @@ func (r *ExtendedRuntime) handleFrontendSynthetic(ev frontendEvent) error {
 		return procErr
 	}
 	return r.sendFrontendSuccess(ev.ack, frontendAck{})
+}
+
+// handleFrontendRegisterAndForward, RegisterAndForwardFrontendOperation'in
+// tam davranis sozlesmesini (bkz. dogum yeri doc yorumu) TEK bir event-loop
+// turunda uygular: cerceve dogrulama -> State.Create* -> sequencer kaydi ->
+// upstream yazma -> basari ack'i - tam bu sirayla.
+func (r *ExtendedRuntime) handleFrontendRegisterAndForward(ev frontendEvent) error {
+	if err := validateFrontendOperationFrame(ev.frame, ev.req, r.limits.MaxFrontendFrameBytes); err != nil {
+		ev.ack <- frontendAck{err: err}
+		return nil
+	}
+
+	op, createErr := r.createStateOperation(ev.req)
+	if createErr != nil {
+		// State kendi sozlesmesi geregi HICBIR mutasyon uygulamadi -
+		// sıradan bir ret, runtime saglikli kalir, hicbir upstream yazma
+		// denenmez.
+		ev.ack <- frontendAck{err: createErr}
+		return nil
+	}
+
+	actions, seqErr := r.seq.AddForwardedOperation(op)
+	if seqErr != nil {
+		divergedErr := fmt.Errorf("%w: %w", ErrFrontendRegistrationDiverged, seqErr)
+		ev.ack <- frontendAck{err: divergedErr}
+		return divergedErr
+	}
+
+	if procErr := r.processActions(actions); procErr != nil {
+		// actions, AddForwardedOperation'in basarili durumunda HER ZAMAN
+		// nil'dir (bkz. o metodun dokumantasyonu) - bu cagri yalnizca
+		// simetri/savunma icindir. Boyle bir hata (varsayimsal bir CLIENT
+		// yazma basarisizligi) upstream yazmadan BAGIMSIZDIR.
+		ev.ack <- frontendAck{err: procErr}
+		return procErr
+	}
+
+	// Kayit-once-iletim degismezi: State + sequencer kaydi ARTIK
+	// tamamlandi - orijinal cerceve ANCAK SIMDI upstream'e yazilir.
+	if err := writeAll(r.backend, ev.frame); err != nil {
+		wrapped := fmt.Errorf("%w: %w", ErrBackendWriteFailed, err)
+		ev.ack <- frontendAck{err: wrapped}
+		return wrapped
+	}
+
+	return r.sendFrontendSuccess(ev.ack, frontendAck{reg: FrontendRegistration{Operation: sanitizeOperation(op)}})
+}
+
+// handleFrontendSyntheticCurrentCycle, SubmitSyntheticErrorForCurrentCycle'in
+// tam davranis sozlesmesini uygular: event-loop KENDISI State.CurrentCycle()'i
+// okur (cagiran hicbir zaman bir cycle tahmin etmez/saglamaz), ardindan
+// AddSyntheticError'i bu tam cycle icin cagirir.
+func (r *ExtendedRuntime) handleFrontendSyntheticCurrentCycle(ev frontendEvent) error {
+	cycle := r.state.CurrentCycle()
+	actions, seqErr := r.seq.AddSyntheticError(cycle, ev.frame)
+	if seqErr != nil {
+		ev.ack <- frontendAck{err: seqErr}
+		return nil
+	}
+	if procErr := r.processActions(actions); procErr != nil {
+		ev.ack <- frontendAck{err: procErr}
+		return procErr
+	}
+	return r.sendFrontendSuccess(ev.ack, frontendAck{cycle: cycle})
+}
+
+// handleFrontendFlush, ForwardFlush'in tam davranis sozlesmesini uygular
+// (bkz. gorev 6): hicbir State/sequencer mutasyonu yapilmaz, cerceve
+// dogrulanip TAM OLARAK BIR KEZ upstream'e yazilir.
+func (r *ExtendedRuntime) handleFrontendFlush(ev frontendEvent) error {
+	if err := validateNoBodyFrontendFrame(ev.frame, protocol.MsgFlush, protocol.ParseFrontendFlush, r.limits.MaxFrontendFrameBytes); err != nil {
+		ev.ack <- frontendAck{err: err}
+		return nil
+	}
+	if err := writeAll(r.backend, ev.frame); err != nil {
+		wrapped := fmt.Errorf("%w: %w", ErrBackendWriteFailed, err)
+		ev.ack <- frontendAck{err: wrapped}
+		return wrapped
+	}
+	return r.sendFrontendSuccess(ev.ack, frontendAck{})
+}
+
+// handleFrontendTerminate, ForwardTerminate'in tam davranis sozlesmesini
+// uygular (bkz. gorev 6): hicbir State/sequencer mutasyonu yapilmaz,
+// cerceve dogrulanip TAM OLARAK BIR KEZ upstream'e yazilir; basarili
+// yazimdan SONRA cagirana basari (nil) ack'lenir VE runtime'in KALICI
+// olarak sonlanmasi icin ErrFrontendTerminateRequested dondurulur.
+func (r *ExtendedRuntime) handleFrontendTerminate(ev frontendEvent) error {
+	if err := validateNoBodyFrontendFrame(ev.frame, protocol.MsgTerminate, protocol.ParseFrontendTerminate, r.limits.MaxFrontendFrameBytes); err != nil {
+		ev.ack <- frontendAck{err: err}
+		return nil
+	}
+	if err := writeAll(r.backend, ev.frame); err != nil {
+		wrapped := fmt.Errorf("%w: %w", ErrBackendWriteFailed, err)
+		ev.ack <- frontendAck{err: wrapped}
+		return wrapped
+	}
+	if err := r.sendFrontendSuccess(ev.ack, frontendAck{}); err != nil {
+		// ackGate ZATEN kapanmisti (parent kapanma once dogrusallasti) -
+		// bu, kendi (parent-kaynakli) nedenselligiyle zaten loop()'u
+		// sonlandiracaktir; ErrFrontendTerminateRequested'i UZERINE
+		// yazmaya gerek yok.
+		return err
+	}
+	return ErrFrontendTerminateRequested
+}
+
+// handleFrontendClosed, NotifyFrontendClosed'in tam davranis sozlesmesini
+// uygular (bkz. gorev 7): reason'a gore sabit, guvenli bir birincil hata
+// secer, cagirana bunu ack'ler VE ayni hatayi dondurerek event-loop'u
+// KALICI olarak sonlandirir.
+func (r *ExtendedRuntime) handleFrontendClosed(ev frontendEvent) error {
+	var result error
+	switch ev.closeReason {
+	case FrontendClosedEOF:
+		result = ErrFrontendClosed
+	case FrontendClosedReadError:
+		if ev.closeCause != nil {
+			result = fmt.Errorf("%w: %w", ErrFrontendReadFailed, ev.closeCause)
+		} else {
+			result = ErrFrontendReadFailed
+		}
+	case FrontendClosedProtocolError:
+		if ev.closeCause != nil {
+			result = fmt.Errorf("%w: %w", ErrFrontendProtocolFailure, ev.closeCause)
+		} else {
+			result = ErrFrontendProtocolFailure
+		}
+	default:
+		result = ErrFrontendClosed
+	}
+	ev.ack <- frontendAck{err: result}
+	return result
 }
 
 // createStateOperation, req.Kind'a gore DOGRU State.Create* metodunu
@@ -1026,6 +1396,134 @@ func writeAll(w io.Writer, p []byte) error {
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// --- Frontend cerceve dogrulamasi (bkz. gorev 4) ---------------------------
+//
+// Bu bolumdeki yardimcilar, RegisterAndForwardFrontendOperation/ForwardFlush/
+// ForwardTerminate'e verilen HAM cercevenin upstream'e yazilmadan ONCE tam,
+// tek, dogru etiketli bir normal-protokol frontend cercevesi oldugunu
+// dogrudan (protocol.Decoder'in akis-durumlu, TEK GECIS ayristirmasindan
+// BAGIMSIZ olarak) yeniden dogrular - savunma amaclidir (cagiran, ör.
+// internal/firewall.ExtendedFrontend, kendi decoder'i araciligiyla zaten
+// dogrulamis olsa bile). Hicbir donen hata ham baytlar/SQL/isim/deger
+// icermez.
+
+// frontendFrameRequirements, req.Kind icin BEKLENEN frontend mesaj tipini
+// ve (yalnizca Describe/Close icin) hedef seciciyi dondurur. wantTarget
+// sifir (gecersiz TargetType) ise hedef secici dogrulamasi atlanir.
+func frontendFrameRequirements(kind protocol.OperationKind) (msgType protocol.MessageType, wantTarget protocol.TargetType, err error) {
+	switch kind {
+	case protocol.OpParse:
+		return protocol.MsgParse, 0, nil
+	case protocol.OpBind:
+		return protocol.MsgBind, 0, nil
+	case protocol.OpDescribeStatement:
+		return protocol.MsgDescribe, protocol.TargetStatement, nil
+	case protocol.OpDescribePortal:
+		return protocol.MsgDescribe, protocol.TargetPortal, nil
+	case protocol.OpExecute:
+		return protocol.MsgExecute, 0, nil
+	case protocol.OpCloseStatement:
+		return protocol.MsgClose, protocol.TargetStatement, nil
+	case protocol.OpClosePortal:
+		return protocol.MsgClose, protocol.TargetPortal, nil
+	case protocol.OpSync:
+		return protocol.MsgSync, 0, nil
+	default:
+		return 0, 0, ErrInvalidOperationKind
+	}
+}
+
+// validateFrontendFrameHeader, frame'in gecerli bir normal-protokol
+// cercevesi (tag(1) + uzunluk(4) + govde) oldugunu dogrular: verilen
+// maxFrame sinirini asmadigini, tag'in wantType ile eslestigini, uzunluk
+// alaninin en az 4 oldugunu ve TAM OLARAK frame'in geri kalanina denk
+// geldigini (ne eksik ne fazla/artik bayt) kontrol eder. Basarili olursa
+// govdeyi (payload) dondurur.
+func validateFrontendFrameHeader(frame []byte, wantType protocol.MessageType, maxFrame int) ([]byte, error) {
+	if maxFrame > 0 && len(frame) > maxFrame {
+		return nil, ErrFrontendFrameTooLarge
+	}
+	if len(frame) < 5 {
+		return nil, fmt.Errorf("%w: cerceve basligi (tag+uzunluk) eksik", ErrInvalidFrontendFrame)
+	}
+	if protocol.MessageType(frame[0]) != wantType {
+		return nil, fmt.Errorf("%w: mesaj tipi istenen islemle uyusmuyor", ErrInvalidFrontendFrame)
+	}
+	length := int(binary.BigEndian.Uint32(frame[1:5]))
+	if length < 4 {
+		return nil, fmt.Errorf("%w: gecersiz uzunluk alani", ErrInvalidFrontendFrame)
+	}
+	total := 1 + length
+	if total != len(frame) {
+		return nil, fmt.Errorf("%w: uzunluk alani cerceve boyutuyla uyusmuyor (eksik ya da artik bayt)", ErrInvalidFrontendFrame)
+	}
+	return frame[5:total], nil
+}
+
+// validateFrontendOperationFrame, RegisterAndForwardFrontendOperation icin
+// TAM cerceve dogrulamasini uygular: baslik dogrulamasi + req.Kind icin
+// dogru tipli govde ayristiricisinin cagrilmasi + (Describe/Close icin)
+// hedef secicinin req.Kind ile uyusmasi.
+func validateFrontendOperationFrame(frame []byte, req FrontendOperationRequest, maxFrame int) error {
+	msgType, wantTarget, err := frontendFrameRequirements(req.Kind)
+	if err != nil {
+		return err
+	}
+	payload, err := validateFrontendFrameHeader(frame, msgType, maxFrame)
+	if err != nil {
+		return err
+	}
+	switch req.Kind {
+	case protocol.OpParse:
+		if _, perr := protocol.ParseFrontendParse(payload); perr != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidFrontendFrame, perr)
+		}
+	case protocol.OpBind:
+		if _, perr := protocol.ParseFrontendBind(payload); perr != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidFrontendFrame, perr)
+		}
+	case protocol.OpDescribeStatement, protocol.OpDescribePortal:
+		d, perr := protocol.ParseFrontendDescribe(payload)
+		if perr != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidFrontendFrame, perr)
+		}
+		if wantTarget != 0 && d.Target != wantTarget {
+			return fmt.Errorf("%w: describe hedef secici istenen islem turuyle uyusmuyor", ErrInvalidFrontendFrame)
+		}
+	case protocol.OpExecute:
+		if _, perr := protocol.ParseFrontendExecute(payload); perr != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidFrontendFrame, perr)
+		}
+	case protocol.OpCloseStatement, protocol.OpClosePortal:
+		c, perr := protocol.ParseFrontendClose(payload)
+		if perr != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidFrontendFrame, perr)
+		}
+		if wantTarget != 0 && c.Target != wantTarget {
+			return fmt.Errorf("%w: close hedef secici istenen islem turuyle uyusmuyor", ErrInvalidFrontendFrame)
+		}
+	case protocol.OpSync:
+		if perr := protocol.ParseFrontendSync(payload); perr != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidFrontendFrame, perr)
+		}
+	}
+	return nil
+}
+
+// validateNoBodyFrontendFrame, Flush/Terminate gibi hicbir alani olmayan
+// mesajlar icin baslik dogrulamasi + govde-bos kontrolunu (verilen parse
+// fonksiyonu araciligiyla) uygular.
+func validateNoBodyFrontendFrame(frame []byte, wantType protocol.MessageType, parse func([]byte) error, maxFrame int) error {
+	payload, err := validateFrontendFrameHeader(frame, wantType, maxFrame)
+	if err != nil {
+		return err
+	}
+	if perr := parse(payload); perr != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidFrontendFrame, perr)
 	}
 	return nil
 }

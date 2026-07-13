@@ -33,14 +33,24 @@ destroys its own unnamed objects at the same early point, and waiting for
 Query messages without waiting for it. Each correction is marked inline
 where it applies. **Still not approved for implementation.**
 
-**No implementation exists yet.** This document is a design proposal only.
-Nothing described below — no connection-state model, no policy-evaluation
-change, no masking change — has been implemented. As of this document,
-SentinelDB continues to reject every Extended Query Protocol message
-(`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`) with a `FATAL`
-`ErrorResponse` and closes the connection
+**No LIVE implementation exists yet; several standalone stages do.**
+`internal/protocol` (parsing, connection-state model, correlation,
+response sequencer), `internal/gateway.ExtendedRuntime` (event-driven
+runtime, including upstream forwarding via
+`RegisterAndForwardFrontendOperation`/`ForwardFlush`/`ForwardTerminate`),
+and an opt-in `firewall.Gate.RunExtended`/`firewall.ExtendedFrontend`
+frontend bridge (Parse-time policy evaluation, local rejection,
+discard-until-`Sync`) now exist and are unit/integration-tested — see
+`docs/postgresql-protocol.md`'s "Opt-in Extended Query frontend bridge"
+section for the precise, current behavior. None of this is wired into
+`cmd/gateway`. As of this document, the LIVE gateway (`cmd/gateway`,
+`firewall.Gate.Run`) continues to reject every Extended Query Protocol
+message (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`) with a
+`FATAL` `ErrorResponse` and closes the connection
 (`internal/firewall/gate.go`'s `rejectExtendedProtocol`,
-`ErrUnsupportedProtocol`). Nothing in this document changes that today.
+`ErrUnsupportedProtocol`). Mixed Simple/Extended Query support and
+response masking across the Extended Query flow remain unimplemented.
+Nothing in this document's design proposal changes live behavior today.
 
 ## Context
 

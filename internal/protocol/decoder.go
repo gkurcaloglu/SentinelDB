@@ -134,6 +134,25 @@ func NewServerDecoder(h Handler, onError func(error)) *Decoder {
 	return d
 }
 
+// NewSteadyStateClientDecoder, client -> server yönü için, ama
+// NewClientDecoder'ın aksine startup/authentication aşamasını hiç
+// beklemeden DOĞRUDAN normal (tag+length) çerçeveleme moduyla başlayan bir
+// Decoder oluşturur.
+//
+// Kullanım amacı: internal/firewall'daki opt-in, test-only Extended Query
+// frontend köprüsü (bkz. firewall.ExtendedFrontend/Gate.RunExtended) yalnızca
+// authentication TAMAMLANDIKTAN sonraki steady-state trafiği tüketir -
+// startup/authentication yönlendirmesi bu aşamanın kapsamı dışındadır (bkz.
+// docs/design/0001-extended-query.md). Bu constructor, o varsayımı Decoder
+// düzeyinde açıkça kodlar; canlı cmd/gateway akışı hâlâ NewClientDecoder'ı
+// (startup fazından başlayan) kullanmaya devam eder ve bu yeni constructor'dan
+// ETKİLENMEZ.
+func NewSteadyStateClientDecoder(h Handler, onError func(error)) *Decoder {
+	d := &Decoder{dir: Frontend, handler: h, onError: onError}
+	d.setPhase(phaseNormal)
+	return d
+}
+
 func (d *Decoder) getPhase() phase {
 	return phase(d.phase.Load())
 }

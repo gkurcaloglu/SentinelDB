@@ -326,6 +326,135 @@ is still rejected fail-closed at runtime, exactly as described above —
 this component exists purely so the response-ordering logic a later stage
 needs can be built and tested in isolation.
 
+### Standalone event-driven runtime loop (no runtime wiring)
+
+`internal/gateway/extended_runtime.go` adds a standalone,
+connection-local `gateway.ExtendedRuntime` that combines frontend
+operation requests, locally generated synthetic `ErrorResponse` events,
+and decoded backend-frame events into a single ordered stream of client
+writes, using the `protocol.ResponseSequencer` described above
+internally. It lives in a new `internal/gateway` package — deliberately
+*not* inside `internal/protocol`, which every Extended Query component so
+far has kept free of I/O and goroutines by design — following the same
+dependency direction already used by `internal/firewall` and
+`internal/masking` (both depend on `internal/protocol`, never the
+reverse).
+
+Unlike the earlier Extended Query components, `ExtendedRuntime` *does*
+use goroutines, channels, and real `net.Conn`-shaped I/O
+(`io.ReadCloser`/`io.WriteCloser`).
+
+**`ExtendedRuntime` exclusively owns `protocol.State` while running.**
+`protocol.State` is designed for serial access by a single goroutine.
+`NewExtendedRuntime` accepts a freshly constructed `*protocol.State`
+purely for dependency injection — from the moment `Run` starts, the
+event-loop goroutine is `State`'s sole owner and sole mutator, and no
+public method ever exposes the underlying `*State`. Frontend producers
+never call `State.Create*`/`Apply*`/lookup methods themselves; instead
+they submit a `FrontendOperationRequest` (statement/portal names, query
+text, parameter OIDs/format codes/null flags/result formats — **never**
+Bind parameter *values*) via `RegisterFrontendOperation`, which copies
+every slice field before it crosses the channel boundary. The event loop
+calls the matching `State.Create*` method and registers the result with
+`ResponseSequencer` in the *same* turn, returning an immutable
+`FrontendRegistration` snapshot only once both steps — plus processing of
+any output actions they immediately produced — have fully succeeded. A
+future frontend caller may forward the original frontend frame upstream
+only after that success.
+
+**`FrontendRegistration` never exposes a client-supplied name.**
+`protocol.PendingOperation` (the value `State.Create*` actually returns)
+carries `TargetName` — the statement/portal name the client supplied.
+`FrontendRegistration.Operation` is `protocol.CorrelatedOperation`
+instead — the same sanitized snapshot type `BackendCorrelator` already
+uses for `CorrelationResult` — carrying only `ID`/`Cycle`/`Kind`/
+`TargetGeneration`. The runtime's own `sanitizeOperation` helper is the
+single conversion point; `protocol.PendingOperation` itself is never
+returned from any public runtime method.
+
+**State/sequencer divergence fails the connection closed.** Creating a
+`State` operation and registering it with the sequencer are two separate
+steps; if `State.Create*` itself fails (e.g. an unknown statement name),
+that is guaranteed mutation-free and is returned as an ordinary rejection
+— the runtime stays healthy. But if `State.Create*` *succeeds* and the
+following `ResponseSequencer.AddForwardedOperation` call fails (e.g. plan
+capacity exhausted), `State` has already mutated while the sequencer's
+plan does not reflect it — an unrecoverable divergence. The runtime never
+attempts a speculative rollback; it returns `ErrFrontendRegistrationDiverged`,
+permanently terminates, and closes both connections. No caller is ever
+told it can safely retry or forward a frame after this.
+
+**Accepted frontend submissions always resolve definitively.** Caller
+context cancellation can only abort a `RegisterFrontendOperation` /
+`SubmitSyntheticError` call *before* the request is enqueued into the
+runtime-owned channel — checked explicitly immediately before the enqueue
+attempt, so an already-canceled caller context can never win a race
+against a channel send that happens to be immediately ready (Go's
+`select` picks pseudo-randomly among ready cases, which previously made
+this possible). Once enqueued, ownership transfers to the runtime and the
+caller is guaranteed one of exactly two outcomes: the event loop's own
+acknowledgement, or runtime termination — never an ambiguous `ctx.Err()`
+for an event that may already be in flight or already processed.
+
+**Truncated backend messages at end-of-input fail closed, not clean.**
+`protocol.Decoder.Finalize()` reports whether any buffered-but-incomplete
+bytes remain (a partial header, a frame with a truncated body, or a
+complete frame followed by a partial next one) without exposing their
+content. The backend reader calls it whenever the upstream read returns
+EOF: a truncated remainder is treated as a backend protocol failure
+(never both a decode failure and a clean stop for the same read-ending),
+even when the sequencer has no other pending work — a real PostgreSQL
+frame cannot be recovered from mid-message.
+
+One backend-reader goroutine decodes bytes from the upstream connection
+into `protocol.Message` values and feeds them, and its own read/decode/
+truncation failures, through a bounded channel; one event-loop goroutine
+— the **only** component that ever touches `State`, calls
+`ResponseSequencer`, or writes to the client — drains that channel and a
+second, separate bounded channel of frontend events. The backend reader
+applies real backpressure: a full backend event channel blocks further
+reads from the real upstream socket rather than dropping frames.
+
+**A separate shutdown watcher, not the event loop itself, closes the
+owned connections.** The event loop can be blocked deep inside a single
+`client.Write` call while processing a `ResponseSequencer` output
+action — a plain blocking `io.Writer.Write`, which observes no context at
+all. If `Run` waited for the event loop to return before closing
+anything, a parent-context cancellation arriving while the loop is stuck
+in that `Write` would deadlock: nothing would ever reach the code that
+closes the connections to unblock it. `Run` instead starts a third,
+independently joined goroutine — the shutdown watcher — *before* calling
+the event loop. It does nothing but wait for the internal (parent-derived)
+context to end and then close both connections; it never writes client
+bytes and never touches `State` or `ResponseSequencer`. Because it runs
+concurrently, it can unblock a stuck `Write`/backend `Read` regardless of
+what the event loop is currently doing.
+
+**The primary returned error reflects who actually initiated shutdown,**
+not just whatever error happened to surface last. A single
+compare-and-swap flag records whether the parent context or an internal
+condition (a sequencer termination action, a genuine backend protocol
+failure, an independent write error, …) closed the connections first —
+determined by checking the *parent* context's own `Err()`, not the
+internal derived one, so the runtime's own housekeeping cancellation is
+never confused with a real caller cancellation. If the parent context
+was the initiator, `Run` returns `context.Canceled`/
+`context.DeadlineExceeded` even though the event loop's own return value
+in that case is typically just a symptom of the forced close (e.g.
+`ErrClientWriteFailed` from a `Write` that only failed because the
+watcher closed the connection to unblock it). If an internal condition
+initiated shutdown first, that error remains primary — causality is never
+determined by inspecting an OS error string.
+
+**This is still not part of the live gateway.** `ExtendedRuntime` is not
+constructed or called anywhere in `cmd/gateway`, `firewall.Gate`, or
+`masking.Transformer` — it has no call site outside its own tests.
+Extended Query is still rejected fail-closed at runtime, exactly as
+described above; this component exists purely so the event-driven
+execution shell a later integration stage needs (wiring `firewall.Gate`
+as the frontend producer, connecting the real upstream socket) can be
+built and tested in isolation first.
+
 ## SSLRequest / GSSENCRequest rejection
 
 SentinelDB always answers `SSLRequest` and `GSSENCRequest` with a single

@@ -2,9 +2,16 @@ package protocol
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync/atomic"
 )
+
+// ErrTruncatedMessage, Finalize tarafindan, alttaki baglanti bir mesajin
+// ortasinda (tam bir tag+length+payload cercevesi tamamlanmadan) kapandigini
+// tespit ettiginde dondurulur. Bu bir "temiz" EOF DEGILDIR - PostgreSQL
+// cerceveleme boyle bir kesintiden guvenle kurtulamaz (bkz. Finalize).
+var ErrTruncatedMessage = errors.New("protocol: baglanti bir mesaj tam olarak alinmadan kapandi")
 
 // Direction, bir mesajın akış yönünü belirtir.
 type Direction int
@@ -161,6 +168,33 @@ func (d *Decoder) Write(p []byte) {
 			return
 		}
 	}
+}
+
+// Finalize, alttaki baglantida artik daha fazla veri gelmeyecegini (ör.
+// EOF) tespit eden cagiran tarafindan cagirilir. Decoder'in ic
+// tamponunda hala cozumlenmemis (eksik oldugu icin bir onceki Write
+// cagrisinda islenemeyen) bayt kalip kalmadigini bildirir: eger varsa,
+// bu bir "temiz" baglanti kapanisi DEGIL, bir mesajin ortasinda kesilmis
+// bir baglantidir - PostgreSQL cerceveleme boyle bir durumdan guvenle
+// kurtulamaz (bkz. ErrTruncatedMessage).
+//
+// Tampon ICERIGI (ne kadar bayt, hangi degerler) hicbir zaman disariya
+// yansitilmaz - yalnizca "eksik bayt var mi" bilgisi dondurulur. Decoder
+// zaten passthrough durumundaysa (bkz. fail, kendi hata yolunu zaten
+// isletmis ve tamponu temizlemistir), Finalize basari (nil) doner -
+// bunu tekrar raporlamaz.
+//
+// Finalize, Decoder'in durumunu DEGISTIRMEZ (ne tamponu ne fazı) - bu
+// yuzden idempotenttir: art arda cagirmak ayni sonucu dondurur ve
+// zararsizdir.
+func (d *Decoder) Finalize() error {
+	if d.getPhase() == phasePassthrough {
+		return nil
+	}
+	if len(d.buf) == 0 {
+		return nil
+	}
+	return ErrTruncatedMessage
 }
 
 func (d *Decoder) fail(err error) {

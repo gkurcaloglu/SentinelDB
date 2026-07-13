@@ -114,6 +114,11 @@ type Decoder struct {
 	buf     []byte
 	handler Handler
 	onError func(error)
+	// framingOnly, yalnizca NewSteadyStateFrontendFrameDecoder tarafindan
+	// true olarak ayarlanir: consumeNormal'in tipli Extended Query govde
+	// ayristiricilarini (Frontend yonu icin) HIC cagirmamasini saglar -
+	// yalnizca tag+length cerceveleme sinirlari dogrulanir.
+	framingOnly bool
 }
 
 // NewClientDecoder, client -> server yönü için bir Decoder oluşturur.
@@ -134,21 +139,37 @@ func NewServerDecoder(h Handler, onError func(error)) *Decoder {
 	return d
 }
 
-// NewSteadyStateClientDecoder, client -> server yönü için, ama
+// NewSteadyStateFrontendFrameDecoder, client -> server yönü için,
 // NewClientDecoder'ın aksine startup/authentication aşamasını hiç
-// beklemeden DOĞRUDAN normal (tag+length) çerçeveleme moduyla başlayan bir
-// Decoder oluşturur.
+// beklemeden DOĞRUDAN normal (tag+length) çerçeveleme moduyla başlayan VE
+// - normal NewClientDecoder'dan farklı olarak - TİPLİ Extended Query
+// gövde ayrıştırıcılarını (ParseFrontendParse/Bind/Describe/Execute/
+// Close/Flush/Sync) HİÇ ÇAĞIRMAYAN, yalnızca çerçeveleme (framing)
+// sınırlarını doğrulayan bir Decoder oluşturur.
 //
-// Kullanım amacı: internal/firewall'daki opt-in, test-only Extended Query
-// frontend köprüsü (bkz. firewall.ExtendedFrontend/Gate.RunExtended) yalnızca
-// authentication TAMAMLANDIKTAN sonraki steady-state trafiği tüketir -
-// startup/authentication yönlendirmesi bu aşamanın kapsamı dışındadır (bkz.
-// docs/design/0001-extended-query.md). Bu constructor, o varsayımı Decoder
-// düzeyinde açıkça kodlar; canlı cmd/gateway akışı hâlâ NewClientDecoder'ı
-// (startup fazından başlayan) kullanmaya devam eder ve bu yeni constructor'dan
+// Dönen Message yalnızca güvenli çerçeveleme meta-verisini taşır
+// (Direction/Type/Name/Length/bağımsız bir Raw kopyası) - Query/Parse/
+// Bind/Describe/Execute/Close alanları HİÇBİR ZAMAN doldurulmaz.
+//
+// Kullanım amacı: internal/firewall'daki opt-in Extended Query frontend
+// köprüsü (bkz. firewall.ExtendedFrontend/Gate.RunExtended), bir mesajın
+// gövdesini ayrıştırmadan ÖNCE kendi discard-until-Sync kararını vermek
+// ZORUNDADIR - aksi halde discard aktifken tamamen çerçevelenmiş ama
+// KASITLI OLARAK bozuk bir gövde (ör. testler ya da protokolü kötüye
+// kullanmaya çalışan bir istemci), asıl bu gövdenin hiç önemi
+// olmamasına rağmen, decoder düzeyinde kurtarılamaz bir hataya (bkz.
+// fail, phasePassthrough) yol açardı - sessizce düşürülmesi gerekirken.
+// Gövde ayrıştırması bu yüzden ExtendedFrontend'in kendi, discard-farkında
+// dispatch mantığına taşınmıştır (bkz. extended_frontend.go); bu decoder
+// yalnızca "tam, tek, doğru etiketli bir çerçeve mi" sorusuna cevap
+// verir. authentication TAMAMLANDIKTAN sonraki steady-state trafiği
+// tüketir - startup/authentication yönlendirmesi bu aşamanın kapsamı
+// dışındadır (bkz. docs/design/0001-extended-query.md). Canlı
+// cmd/gateway akışı hâlâ NewClientDecoder'ı (startup fazından başlayan,
+// tipli ayrıştırma yapan) kullanmaya devam eder ve bu yeni constructor'dan
 // ETKİLENMEZ.
-func NewSteadyStateClientDecoder(h Handler, onError func(error)) *Decoder {
-	d := &Decoder{dir: Frontend, handler: h, onError: onError}
+func NewSteadyStateFrontendFrameDecoder(h Handler, onError func(error)) *Decoder {
+	d := &Decoder{dir: Frontend, handler: h, onError: onError, framingOnly: true}
 	d.setPhase(phaseNormal)
 	return d
 }
@@ -310,7 +331,7 @@ func (d *Decoder) consumeNormal() bool {
 		Length:    length,
 		Raw:       append([]byte(nil), d.buf[0:total]...),
 	}
-	if d.dir == Frontend {
+	if d.dir == Frontend && !d.framingOnly {
 		switch msgType {
 		case MsgQuery:
 			msg.Query = trimNullTerminator(payload)

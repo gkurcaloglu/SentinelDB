@@ -92,6 +92,59 @@ func feQueryFrame(sql string) []byte {
 	return buildFrame(protocol.MsgQuery, cstr(sql))
 }
 
+// --- Test helpers: COMPLETELY FRAMED but semantically malformed bodies ----
+//
+// Each of these builds a frame whose OUTER tag+length framing is fully
+// self-consistent (buildFrame always derives the declared length from the
+// actual body) - the framing-only decoder (bkz. gorev 1) accepts every one
+// of these as a single complete frame. Only the INNER body is deliberately
+// invalid, so only ExtendedFrontend's own typed body parser (bkz. gorev 2)
+// - never the decoder - can detect and reject it.
+
+// malformedParseFrame omits the query string's terminating NUL.
+func malformedParseFrame(stmt string) []byte {
+	body := append(cstr(stmt), []byte("SELECT 1")...) // no trailing NUL
+	return buildFrame(protocol.MsgParse, body)
+}
+
+// malformedBindFrame declares an out-of-range parameter format code
+// (neither 0 nor 1).
+func malformedBindFrame(portal, stmt string) []byte {
+	body := append(cstr(portal), cstr(stmt)...)
+	body = append(body, int16b(1)...) // 1 format code follows
+	body = append(body, int16b(7)...) // invalid code
+	body = append(body, int16b(0)...) // 0 params
+	body = append(body, int16b(0)...) // 0 result formats
+	return buildFrame(protocol.MsgBind, body)
+}
+
+// malformedDescribeFrame uses an invalid target selector byte.
+func malformedDescribeFrame(name string) []byte {
+	body := append([]byte{'X'}, cstr(name)...)
+	return buildFrame(protocol.MsgDescribe, body)
+}
+
+// malformedExecuteFrame omits the trailing 4-byte MaxRows field.
+func malformedExecuteFrame(portal string) []byte {
+	body := cstr(portal) // missing Int32 MaxRows
+	return buildFrame(protocol.MsgExecute, body)
+}
+
+// malformedCloseFrame uses an invalid target selector byte.
+func malformedCloseFrame(name string) []byte {
+	body := append([]byte{'X'}, cstr(name)...)
+	return buildFrame(protocol.MsgClose, body)
+}
+
+// malformedFlushFrame has a non-empty body (Flush must be empty).
+func malformedFlushFrame() []byte { return buildFrame(protocol.MsgFlush, []byte{1}) }
+
+// malformedSyncFrame has a non-empty body (Sync must be empty).
+func malformedSyncFrame() []byte { return buildFrame(protocol.MsgSync, []byte{1}) }
+
+// malformedTerminateFrame has a non-empty body (Terminate must be empty).
+func malformedTerminateFrame() []byte { return buildFrame(protocol.MsgTerminate, []byte{1}) }
+
 func beEmpty(t protocol.MessageType) []byte { return buildFrame(t, nil) }
 func beRFQ(status byte) []byte              { return buildFrame(protocol.MsgReadyForQuery, []byte{status}) }
 func beDataRow() []byte                     { return buildFrame(protocol.MsgDataRow, []byte{0, 0}) }
@@ -470,13 +523,12 @@ func TestExtendedFrontend_LocalRejection_MalformedParseBody(t *testing.T) {
 	h := newHarness(t, nil, nil)
 	defer h.close()
 
-	// Directly drive the bridge's handler with a Message claiming Type
-	// MsgParse but a nil typed body - the real decoder never produces
-	// this (bkz. handleParse doc comment), but this is the ONLY way to
-	// deterministically exercise the malformed-body local-rejection path
-	// without relying on the decoder's own (unrecoverable) framing
-	// failure behavior.
-	h.frontend.handle(context.Background(), protocol.Message{Type: protocol.MsgParse, Name: "Parse"})
+	// A REAL, wire-accurate, COMPLETELY framed Parse frame whose body is
+	// deliberately invalid (bkz. gorev 1/2/7: "real raw-byte tests through
+	// Gate.RunExtended, not only direct calls to ExtendedFrontend.handle").
+	// The framing-only decoder accepts this as one complete frame; only
+	// ExtendedFrontend's own body parser rejects it.
+	h.sendClient(malformedParseFrame("s1"))
 
 	deadline := time.Now().Add(2 * time.Second)
 	for len(h.clientBound.Snapshot()) == 0 && time.Now().Before(deadline) {
@@ -488,6 +540,11 @@ func TestExtendedFrontend_LocalRejection_MalformedParseBody(t *testing.T) {
 	}
 	if !h.frontend.discarding() {
 		t.Fatal("expected the bridge to enter discard-until-Sync after a malformed body")
+	}
+	// The decoder must NOT have failed closed (bkz. gorev 1) - the
+	// runtime/RunExtended must both remain alive and usable.
+	if h.frontend.isTerminal() {
+		t.Fatal("expected the bridge to remain non-terminal after a recoverable malformed body")
 	}
 }
 
@@ -938,20 +995,36 @@ func TestExtendedFrontend_NonDisclosure_GoErrorsNeverContainSQL(t *testing.T) {
 	h := newHarness(t, DenyKeywords("DROP TABLE"), nil)
 	defer h.close()
 
-	h.frontend.handle(context.Background(), protocol.Message{Type: protocol.MsgParse, Name: "Parse", Parse: &protocol.ParseMessage{Query: secretSQL}})
+	// A REAL wire-accurate Parse frame carrying the marker (bkz. gorev 7:
+	// real raw-byte tests through Gate.RunExtended). This particular query
+	// does not match the deny list, so it registers successfully; the
+	// important assertion is that no internal error (there shouldn't be
+	// one) ever echoes the marker. The backend ParseComplete is
+	// acknowledged so the plan head clears - otherwise the LATER Bind
+	// rejection's synthetic frame would remain correctly QUEUED behind
+	// the still-pending Parse (bkz. existing queued-ordering semantics,
+	// internal/gateway's TestExtendedRuntime_QueuedOrdering_*) and never
+	// become client-visible within this test's bounded wait.
+	parseFrame := feParseFrame("s1", secretSQL, nil)
+	h.sendClient(parseFrame)
+	waitForAccumulated(t, h.upstream, parseFrame)
+	h.sendBackend(beEmpty(protocol.MsgParseComplete))
+	waitForAccumulated(t, h.clientBound, beEmpty(protocol.MsgParseComplete))
 
-	// This particular query does not match the deny list, so it registers
-	// successfully; the important assertion is that no internal error
-	// (there shouldn't be one) ever echoes the marker. Force a genuine
-	// error path too: an unknown-statement Bind using the marker as the
-	// statement name.
+	// Force a genuine error path too: an unknown-statement Bind using the
+	// marker as the statement name.
+	prefixLen := len(h.clientBound.Snapshot())
 	h.sendClient(feBindFrame("p1", secretSQL, nil, nil, nil))
 	deadline := time.Now().Add(2 * time.Second)
-	for len(h.clientBound.Snapshot()) == 0 && time.Now().Before(deadline) {
+	for len(h.clientBound.Snapshot()) <= prefixLen && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if strings.Contains(string(h.clientBound.Snapshot()), secretSQL) {
-		t.Fatalf("client-bound bytes leaked the SQL/name marker: %x", h.clientBound.Snapshot())
+	got := h.clientBound.Snapshot()
+	if len(got) <= prefixLen {
+		t.Fatal("expected a synthetic ErrorResponse for the unknown-statement Bind, got no new client-bound bytes")
+	}
+	if strings.Contains(string(got), secretSQL) {
+		t.Fatalf("client-bound bytes leaked the SQL/name marker: %x", got)
 	}
 }
 
@@ -1068,5 +1141,553 @@ func TestExtendedFrontend_Stress(t *testing.T) {
 				t.Fatalf("upstream bytes leaked the blocked name marker: %x", upstreamBytes)
 			}
 		})
+	}
+}
+
+// ==========================================================================
+// Framing-versus-parsing (sertlestirme incelemesi, gorev 1/2/7)
+// ==========================================================================
+
+// waitForSynthetic waits for exactly one ErrorResponse to appear
+// client-bound and returns it.
+func waitForSynthetic(t *testing.T, h *harness) []byte {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := h.clientBound.Snapshot()
+		if len(got) > 0 {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for a synthetic ErrorResponse")
+	return nil
+}
+
+func TestExtendedFrontend_Framing_ValidParseParsedAndForwarded(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	frame := feParseFrame("s1", "SELECT 1", nil)
+	h.sendClient(frame)
+	waitForAccumulated(t, h.upstream, frame)
+}
+
+func TestExtendedFrontend_Framing_MalformedParseProducesOneSyntheticAndDiscard(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	h.sendClient(malformedParseFrame("s1"))
+	got := waitForSynthetic(t, h)
+	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
+	}
+	if !h.frontend.discarding() {
+		t.Fatal("expected the bridge to enter discard-until-Sync")
+	}
+	if h.frontend.isTerminal() {
+		t.Fatal("expected the decoder to NOT fail closed for a completely framed malformed body")
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the malformed Parse never forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_Framing_MalformedBindProducesOneSyntheticAndDiscard(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	h.sendClient(malformedBindFrame("p1", "s1"))
+	got := waitForSynthetic(t, h)
+	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
+	}
+	if !h.frontend.discarding() {
+		t.Fatal("expected the bridge to enter discard-until-Sync")
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the malformed Bind never forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_Framing_MalformedDescribeProducesOneSyntheticAndDiscard(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	h.sendClient(malformedDescribeFrame("s1"))
+	got := waitForSynthetic(t, h)
+	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
+	}
+	if !h.frontend.discarding() {
+		t.Fatal("expected the bridge to enter discard-until-Sync")
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the malformed Describe never forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_Framing_MalformedExecuteProducesOneSyntheticAndDiscard(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	h.sendClient(malformedExecuteFrame("p1"))
+	got := waitForSynthetic(t, h)
+	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
+	}
+	if !h.frontend.discarding() {
+		t.Fatal("expected the bridge to enter discard-until-Sync")
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the malformed Execute never forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_Framing_MalformedCloseProducesOneSyntheticAndDiscard(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	h.sendClient(malformedCloseFrame("s1"))
+	got := waitForSynthetic(t, h)
+	if protocol.MessageType(got[0]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected an ErrorResponse frame, got tag %q", got[0])
+	}
+	if !h.frontend.discarding() {
+		t.Fatal("expected the bridge to enter discard-until-Sync")
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the malformed Close never forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_Framing_MalformedSyncFailsClosedNeverForwarded(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	h.sendClient(malformedSyncFrame())
+
+	gateErr := h.waitGateDone()
+	if !errors.Is(gateErr, ErrExtendedFrontendMalformedFrame) {
+		t.Fatalf("expected ErrExtendedFrontendMalformedFrame, got %v", gateErr)
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the malformed Sync never forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_Framing_MalformedTerminateFailsClosedNeverForwarded(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	h.sendClient(malformedTerminateFrame())
+
+	gateErr := h.waitGateDone()
+	if !errors.Is(gateErr, ErrExtendedFrontendMalformedFrame) {
+		t.Fatalf("expected ErrExtendedFrontendMalformedFrame, got %v", gateErr)
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the malformed Terminate never forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+// ==========================================================================
+// Discard-before-parsing: the CORE regression scenario (gorev 3)
+// ==========================================================================
+//
+// "A policy-blocked Parse followed by a deliberately malformed Bind and
+// then a valid Sync must: (1) produce exactly one synthetic ErrorResponse;
+// (2) discard the malformed Bind without decoder failure; (3) register and
+// forward the valid Sync; (4) relay the real ReadyForQuery later; (5) keep
+// the runtime usable for the next cycle."
+
+func TestExtendedFrontend_DiscardBeforeParsing_BlockedParseThenMalformedBindThenSync(t *testing.T) {
+	var policyCalls int32
+	countingPolicy := PolicyFunc(func(m protocol.Message) (Verdict, string) {
+		policyCalls++
+		return DenyKeywords("DROP TABLE").Evaluate(m)
+	})
+	h := newHarness(t, countingPolicy, nil)
+	defer h.close()
+
+	// 1. Blocked Parse.
+	h.sendClient(feParseFrame("s1", "DROP TABLE users;", nil))
+	synthetic := waitForSynthetic(t, h)
+	if protocol.MessageType(synthetic[0]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected exactly one synthetic ErrorResponse, got %x", synthetic)
+	}
+	callsAfterBlock := policyCalls
+
+	// 2. Malformed Bind while discarding - must be silently dropped
+	// WITHOUT any decoder failure and WITHOUT invoking policy again.
+	h.sendClient(malformedBindFrame("p1", "s1"))
+	time.Sleep(20 * time.Millisecond) // bounded settling for the (absence of) processing
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the discarded malformed Bind never forwarded, got %x", h.upstream.Snapshot())
+	}
+	if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
+		t.Fatalf("expected NO additional synthetic error for the discarded malformed Bind, got %x (was %x)", h.clientBound.Snapshot(), synthetic)
+	}
+	if policyCalls != callsAfterBlock {
+		t.Fatalf("expected policy NOT invoked for the discarded malformed Bind, calls went from %d to %d", callsAfterBlock, policyCalls)
+	}
+	if h.frontend.isTerminal() {
+		t.Fatal("expected the decoder to NOT fail closed for the discarded malformed Bind")
+	}
+
+	// 3. Valid Sync - must still be registered and forwarded.
+	sync := feSyncFrame()
+	h.sendClient(sync)
+	waitForAccumulated(t, h.upstream, sync)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for h.frontend.discarding() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if h.frontend.discarding() {
+		t.Fatal("expected discard to clear after Sync was forwarded")
+	}
+
+	// 4. Real ReadyForQuery completes the cycle.
+	rfq := beRFQ(protocol.TxStatusIdle)
+	h.sendBackend(rfq)
+	waitForAccumulated(t, h.clientBound, append(append([]byte{}, synthetic...), rfq...))
+
+	// 5. Runtime remains usable for the next cycle.
+	parse2 := feParseFrame("s2", "SELECT 2", nil)
+	h.sendClient(parse2)
+	waitForAccumulated(t, h.upstream, append(sync, parse2...))
+}
+
+func TestExtendedFrontend_DiscardBeforeParsing_BlockedParseThenMalformedParseThenSync(t *testing.T) {
+	h := newHarness(t, DenyKeywords("DROP TABLE"), nil)
+	defer h.close()
+
+	h.sendClient(feParseFrame("s1", "DROP TABLE users;", nil))
+	synthetic := waitForSynthetic(t, h)
+
+	h.sendClient(malformedParseFrame("s2"))
+	time.Sleep(20 * time.Millisecond)
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the discarded malformed Parse never forwarded, got %x", h.upstream.Snapshot())
+	}
+	if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
+		t.Fatalf("expected NO additional synthetic error, got %x (was %x)", h.clientBound.Snapshot(), synthetic)
+	}
+	if h.frontend.isTerminal() {
+		t.Fatal("expected the decoder to NOT fail closed for the discarded malformed Parse")
+	}
+
+	sync := feSyncFrame()
+	h.sendClient(sync)
+	waitForAccumulated(t, h.upstream, sync)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for h.frontend.discarding() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if h.frontend.discarding() {
+		t.Fatal("expected discard to clear after Sync was forwarded")
+	}
+}
+
+func TestExtendedFrontend_DiscardBeforeParsing_BlockedParseThenMalformedFlushThenSync(t *testing.T) {
+	h := newHarness(t, DenyKeywords("DROP TABLE"), nil)
+	defer h.close()
+
+	h.sendClient(feParseFrame("s1", "DROP TABLE users;", nil))
+	synthetic := waitForSynthetic(t, h)
+
+	h.sendClient(malformedFlushFrame())
+	time.Sleep(20 * time.Millisecond)
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected the discarded malformed Flush never forwarded, got %x", h.upstream.Snapshot())
+	}
+	if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
+		t.Fatalf("expected NO additional synthetic error, got %x (was %x)", h.clientBound.Snapshot(), synthetic)
+	}
+	if h.frontend.isTerminal() {
+		t.Fatal("expected the decoder to NOT fail closed for the discarded malformed Flush")
+	}
+
+	sync := feSyncFrame()
+	h.sendClient(sync)
+	waitForAccumulated(t, h.upstream, sync)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for h.frontend.discarding() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if h.frontend.discarding() {
+		t.Fatal("expected discard to clear after Sync was forwarded")
+	}
+}
+
+// ==========================================================================
+// EOF finalization (gorev 4)
+// ==========================================================================
+
+func TestExtendedFrontend_EOF_EmptyBufferIsClean(t *testing.T) {
+	h := newHarness(t, nil, nil)
+
+	if err := h.clientTest.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gateErr := h.waitGateDone(); gateErr != nil {
+		t.Fatalf("expected clean EOF (nil), got %v", gateErr)
+	}
+	runErr := h.waitRuntimeDone()
+	if !errors.Is(runErr, gateway.ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed, got %v", runErr)
+	}
+	h.cancel()
+}
+
+func TestExtendedFrontend_EOF_PartialHeaderFailsClosed(t *testing.T) {
+	for n := 1; n <= 4; n++ {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			h := newHarness(t, nil, nil)
+			defer h.close()
+
+			full := feSyncFrame()
+			h.sendClient(full[:n])
+			if err := h.clientTest.Close(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			gateErr := h.waitGateDone()
+			if !errors.Is(gateErr, ErrExtendedFrontendDecodeFailed) {
+				t.Fatalf("expected ErrExtendedFrontendDecodeFailed, got %v", gateErr)
+			}
+			if len(h.upstream.Snapshot()) != 0 {
+				t.Fatalf("expected no upstream bytes, got %x", h.upstream.Snapshot())
+			}
+		})
+	}
+}
+
+func TestExtendedFrontend_EOF_TruncatedBodyFailsClosed(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	full := feParseFrame("s1", "SELECT 1", nil)
+	h.sendClient(full[:len(full)-2]) // tag+length present, body cut short
+	if err := h.clientTest.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gateErr := h.waitGateDone()
+	if !errors.Is(gateErr, ErrExtendedFrontendDecodeFailed) {
+		t.Fatalf("expected ErrExtendedFrontendDecodeFailed, got %v", gateErr)
+	}
+	if len(h.upstream.Snapshot()) != 0 {
+		t.Fatalf("expected no upstream bytes, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_EOF_CompleteFramePlusPartialNext_ProcessesOnceThenFailsClosed(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	complete := feFlushFrame()
+	partialNext := feSyncFrame()[:2]
+	h.sendClient(append(append([]byte{}, complete...), partialNext...))
+	waitForAccumulated(t, h.upstream, complete)
+
+	if err := h.clientTest.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gateErr := h.waitGateDone()
+	if !errors.Is(gateErr, ErrExtendedFrontendDecodeFailed) {
+		t.Fatalf("expected ErrExtendedFrontendDecodeFailed, got %v", gateErr)
+	}
+	// The complete frame must have been forwarded EXACTLY once - no
+	// partial trailing bytes ever reach the backend.
+	if !bytes.Equal(h.upstream.Snapshot(), complete) {
+		t.Fatalf("expected exactly the one complete frame forwarded, got %x", h.upstream.Snapshot())
+	}
+}
+
+func TestExtendedFrontend_EOF_SeveralCompleteFramesRemainClean(t *testing.T) {
+	h := newHarness(t, nil, nil)
+
+	f1 := feFlushFrame()
+	f2 := feSyncFrame()
+	h.sendClient(append(append([]byte{}, f1...), f2...))
+	waitForAccumulated(t, h.upstream, append(append([]byte{}, f1...), f2...))
+
+	if err := h.clientTest.Close(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gateErr := h.waitGateDone(); gateErr != nil {
+		t.Fatalf("expected clean EOF (nil), got %v", gateErr)
+	}
+	h.cancel()
+	h.waitRuntimeDone()
+}
+
+// ==========================================================================
+// Non-disclosure for malformed bodies (gorev 6/17)
+// ==========================================================================
+
+func TestExtendedFrontend_NonDisclosure_MalformedBodyMarkersNeverInErrors(t *testing.T) {
+	const secretMarker = "SECRET_MALFORMED_BODY_MARKER"
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	// Embed the marker in the (malformed) Bind's statement name field -
+	// even though the body is malformed elsewhere (invalid format code),
+	// the marker must never surface in any client-bound or Go error.
+	body := append(cstr("p1"), cstr(secretMarker)...)
+	body = append(body, int16b(1)...)
+	body = append(body, int16b(7)...) // invalid format code
+	body = append(body, int16b(0)...)
+	body = append(body, int16b(0)...)
+	h.sendClient(buildFrame(protocol.MsgBind, body))
+
+	got := waitForSynthetic(t, h)
+	if bytes.Contains(got, []byte(secretMarker)) {
+		t.Fatalf("synthetic ErrorResponse leaked the malformed-body marker: %x", got)
+	}
+}
+
+func TestExtendedFrontend_NonDisclosure_UnknownTagNeverInErrors(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	// An unrecognized frontend tag byte with a distinctive length so any
+	// accidental leak of the numeric tag/length would be easy to spot -
+	// but ErrExtendedFrontendUnsupportedMessage is a FIXED sentinel with
+	// no dynamic content at all.
+	h.sendClient(buildFrame(protocol.MessageType(0x7F), []byte{1, 2, 3, 4, 5}))
+
+	gateErr := h.waitGateDone()
+	if !errors.Is(gateErr, ErrExtendedFrontendUnsupportedMessage) {
+		t.Fatalf("expected ErrExtendedFrontendUnsupportedMessage, got %v", gateErr)
+	}
+	if gateErr.Error() != ErrExtendedFrontendUnsupportedMessage.Error() {
+		t.Fatalf("expected the EXACT fixed sentinel with no appended detail, got %q", gateErr.Error())
+	}
+}
+
+func TestExtendedFrontend_NonDisclosure_DecodeErrorIsExactFixedSentinel(t *testing.T) {
+	h := newHarness(t, nil, nil)
+	defer h.close()
+
+	bad := []byte{byte(protocol.MsgParse), 0, 0, 0, 1} // declared length < 4
+	h.sendClient(bad)
+
+	gateErr := h.waitGateDone()
+	if !errors.Is(gateErr, ErrExtendedFrontendDecodeFailed) {
+		t.Fatalf("expected ErrExtendedFrontendDecodeFailed, got %v", gateErr)
+	}
+	if gateErr.Error() != ErrExtendedFrontendDecodeFailed.Error() {
+		t.Fatalf("expected the EXACT fixed sentinel (no declared-length/tag detail appended), got %q", gateErr.Error())
+	}
+}
+
+// erroringReader is an io.Reader whose Read ALWAYS returns a fixed,
+// marker-bearing, non-EOF error - used to prove RunExtended's returned
+// error is the EXACT fixed ErrExtendedFrontendReadFailed sentinel, never
+// the underlying error's own text (bkz. gorev 6).
+type erroringReader struct{ err error }
+
+func (r erroringReader) Read(p []byte) (int, error) { return 0, r.err }
+
+func TestExtendedFrontend_NonDisclosure_ReadErrorIsExactFixedSentinel(t *testing.T) {
+	backendRuntimeSide, backendPeer := net.Pipe()
+	defer backendPeer.Close()
+	clientRuntimeSide, clientPeer := net.Pipe()
+	defer clientPeer.Close()
+
+	s := protocol.NewState()
+	limits := gateway.RuntimeLimits{FrontendEventBuffer: 8, BackendEventBuffer: 8, MaxFrontendFrameBytes: 64 * 1024}
+	rt, err := gateway.NewExtendedRuntime(s, backendRuntimeSide, clientRuntimeSide, protocol.DefaultSequencerLimits(), limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	frontend, err := NewExtendedFrontend(rt, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rtDone := make(chan error, 1)
+	go func() { rtDone <- rt.Run(ctx) }()
+	waitRuntimeStarted(t, rt)
+
+	const secretDetail = "SECRET_READ_ERROR_DETAIL_MARKER"
+	injected := errors.New(secretDetail)
+
+	gate := &Gate{}
+	gateErr := gate.RunExtended(ctx, erroringReader{err: injected}, frontend)
+	if !errors.Is(gateErr, ErrExtendedFrontendReadFailed) {
+		t.Fatalf("expected ErrExtendedFrontendReadFailed, got %v", gateErr)
+	}
+	if gateErr.Error() != ErrExtendedFrontendReadFailed.Error() {
+		t.Fatalf("expected the EXACT fixed sentinel (no underlying detail appended), got %q", gateErr.Error())
+	}
+	if strings.Contains(gateErr.Error(), secretDetail) {
+		t.Fatalf("RunExtended's error leaked the underlying read-error detail: %q", gateErr.Error())
+	}
+
+	cancel()
+	<-rtDone
+}
+
+// ==========================================================================
+// Repeated stress: critical discard/framing/shutdown behavior (gorev 7,9)
+// ==========================================================================
+
+func TestExtendedFrontend_DiscardBeforeParsing_Repeated(t *testing.T) {
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		func() {
+			h := newHarness(t, DenyKeywords("DROP TABLE"), nil)
+			defer h.close()
+
+			h.sendClient(feParseFrame("s1", "DROP TABLE users;", nil))
+			synthetic := waitForSynthetic(t, h)
+
+			h.sendClient(malformedBindFrame("p1", "s1"))
+			time.Sleep(2 * time.Millisecond)
+			if len(h.upstream.Snapshot()) != 0 {
+				t.Fatalf("iteration %d: expected no upstream bytes, got %x", i, h.upstream.Snapshot())
+			}
+			if !bytes.Equal(h.clientBound.Snapshot(), synthetic) {
+				t.Fatalf("iteration %d: expected exactly one synthetic error, got %x", i, h.clientBound.Snapshot())
+			}
+			if h.frontend.isTerminal() {
+				t.Fatalf("iteration %d: expected the decoder to NOT fail closed", i)
+			}
+
+			sync := feSyncFrame()
+			h.sendClient(sync)
+			waitForAccumulated(t, h.upstream, sync)
+		}()
+	}
+}
+
+func TestExtendedFrontend_EOF_TruncatedBody_Repeated(t *testing.T) {
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		func() {
+			h := newHarness(t, nil, nil)
+			defer h.close()
+
+			full := feParseFrame("s1", "SELECT 1", nil)
+			h.sendClient(full[:len(full)-2])
+			if err := h.clientTest.Close(); err != nil {
+				t.Fatalf("iteration %d: unexpected error: %v", i, err)
+			}
+			gateErr := h.waitGateDone()
+			if !errors.Is(gateErr, ErrExtendedFrontendDecodeFailed) {
+				t.Fatalf("iteration %d: expected ErrExtendedFrontendDecodeFailed, got %v", i, gateErr)
+			}
+			if len(h.upstream.Snapshot()) != 0 {
+				t.Fatalf("iteration %d: expected no upstream bytes, got %x", i, h.upstream.Snapshot())
+			}
+		}()
 	}
 }

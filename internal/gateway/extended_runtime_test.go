@@ -3999,3 +3999,356 @@ func TestExtendedRuntime_NotifyFrontendClosed_StopsWaitingForFrontendEvents(t *t
 	}
 	waitDone(t, done)
 }
+
+// ==========================================================================
+// Frontend-close shutdown supervisor: independent of a blocked event loop
+// (bkz. gorev 5, sertlestirme incelemesi)
+// ==========================================================================
+
+// TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendWrite proves
+// NotifyFrontendClosed can close the owned transports - and thereby
+// unblock the event loop - even while the event loop is genuinely, still
+// blocked deep inside a backend.Write call processing an EARLIER accepted
+// event. The old (pre-hardening) design routed NotifyFrontendClosed
+// through the same frontendEvents channel the blocked event loop was
+// trying to drain, so it could never be delivered in this scenario.
+func TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendWrite(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newBlockingBackendTransport(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+		submitDone <- err
+	}()
+
+	select {
+	case <-backend.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked backend Write")
+	}
+
+	notifyDone := make(chan error, 1)
+	go func() {
+		notifyDone <- rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil)
+	}()
+
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("expected the blocked submitter to receive a definitive non-nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("submit did not unblock after frontend closure - backend.Write was not interrupted")
+	}
+
+	if !backend.Closed() {
+		t.Fatal("expected backend Close to have been called to unblock the write")
+	}
+	if !client.Closed() {
+		t.Fatal("expected the client connection closed too")
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed to be primary, got %v", runErr)
+	}
+
+	select {
+	case err := <-notifyDone:
+		if !errors.Is(err, ErrFrontendClosed) {
+			t.Fatalf("expected NotifyFrontendClosed to return ErrFrontendClosed, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("NotifyFrontendClosed did not return within the bounded deadline")
+	}
+}
+
+// TestExtendedRuntime_FrontendShutdown_UnblocksBlockedClientWrite is the
+// client-write analogue of the backend-write test above: the event loop
+// is blocked writing a CLIENT-bound frame (ör. a synthetic ErrorResponse)
+// when a frontend read failure is reported.
+func TestExtendedRuntime_FrontendShutdown_UnblocksBlockedClientWrite(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newBlockingWriteCloser()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+
+	select {
+	case <-client.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked client Write")
+	}
+
+	injected := errors.New("test: simulated frontend read failure")
+	notifyDone := make(chan error, 1)
+	go func() {
+		notifyDone <- rt.NotifyFrontendClosed(context.Background(), FrontendClosedReadError, injected)
+	}()
+
+	select {
+	case err := <-submitDone:
+		if err == nil {
+			t.Fatal("expected the blocked submitter to receive a definitive non-nil error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("submit did not unblock after frontend closure - client.Write was not interrupted")
+	}
+
+	if !client.Closed() {
+		t.Fatal("expected client Close to have been called to unblock the write")
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendReadFailed) {
+		t.Fatalf("expected ErrFrontendReadFailed to be primary, got %v", runErr)
+	}
+
+	select {
+	case err := <-notifyDone:
+		if !errors.Is(err, ErrFrontendReadFailed) {
+			t.Fatalf("expected NotifyFrontendClosed to return ErrFrontendReadFailed, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("NotifyFrontendClosed did not return within the bounded deadline")
+	}
+}
+
+// TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendRead proves
+// the backend-reader goroutine (permanently blocked in Read, no data ever
+// sent) is still joined promptly once a frontend protocol failure is
+// reported - no goroutine leak.
+func TestExtendedRuntime_FrontendShutdown_UnblocksBlockedBackendRead(t *testing.T) {
+	before := runtime.NumGoroutine()
+
+	backendR, _ := io.Pipe() // never written to, never closed by the test
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	injected := errors.New("test: simulated frontend protocol failure")
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedProtocolError, injected); !errors.Is(err, ErrFrontendProtocolFailure) {
+		t.Fatalf("expected ErrFrontendProtocolFailure, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendProtocolFailure) {
+		t.Fatalf("expected ErrFrontendProtocolFailure to be primary, got %v", runErr)
+	}
+
+	assertNoGoroutineLeak(t, before)
+}
+
+// TestExtendedRuntime_FrontendShutdown_NoSubmitterRemainsBlocked drives
+// several concurrent accepted submitters while the event loop is blocked
+// in a backend Write, then triggers a frontend close - every submitter
+// must receive a definitive result, none may hang.
+func TestExtendedRuntime_FrontendShutdown_NoSubmitterRemainsBlocked(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newBlockingBackendTransport(backendPipeR)
+	client := newTrackingWriter()
+	s := protocol.NewState()
+	limits := RuntimeLimits{FrontendEventBuffer: 4, BackendEventBuffer: 4, MaxFrontendFrameBytes: 64 * 1024}
+	rt, err := NewExtendedRuntime(s, backend, client, protocol.DefaultSequencerLimits(), limits)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	const n = 3
+	results := make([]chan error, n)
+	for i := 0; i < n; i++ {
+		results[i] = make(chan error, 1)
+		go func(i int) {
+			name := fmt.Sprintf("s%d", i)
+			_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpParse, StatementName: name, Query: "SELECT 1"}, feParseFrame(name, "SELECT 1", nil))
+			results[i] <- err
+		}(i)
+	}
+
+	select {
+	case <-backend.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked backend Write")
+	}
+
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil); !errors.Is(err, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed, got %v", err)
+	}
+
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-results[i]:
+			if err == nil {
+				t.Fatalf("submitter %d: expected a definitive non-nil error", i)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("submitter %d did not receive a definitive result", i)
+		}
+	}
+
+	waitDone(t, done)
+}
+
+// --- Causality: frontend close versus internal failure versus parent ctx --
+
+// TestExtendedRuntime_FrontendShutdown_InternalFailureBeforeLaterFrontendClose_InternalWins
+// mirrors the existing parent-cancellation causality tests: an internal
+// write failure that linearized FIRST must remain primary even if a
+// frontend close notification arrives afterward.
+func TestExtendedRuntime_FrontendShutdown_InternalFailureBeforeLaterFrontendClose_InternalWins(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	injected := errors.New("test: injected write failure for causality ordering")
+	client.writeErrOnce = injected
+	rt := newTestRuntime(t, backendR, client)
+
+	loopReturned := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onLoopReturned = func() {
+		close(loopReturned)
+		<-resume
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+
+	select {
+	case <-loopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for loop() to return")
+	}
+
+	// The internal cause was ALREADY recorded inside loop() before it
+	// returned - a frontend close arriving only now must not win the
+	// causality race.
+	notifyDone := make(chan error, 1)
+	go func() {
+		notifyDone <- rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil)
+	}()
+	close(resume)
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrClientWriteFailed) {
+		t.Fatalf("expected ErrClientWriteFailed to remain primary, got %v", runErr)
+	}
+	if errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("did not expect ErrFrontendClosed to override the earlier internal cause, got %v", runErr)
+	}
+	if err := <-submitDone; !errors.Is(err, ErrClientWriteFailed) {
+		t.Fatalf("expected the submitter to observe ErrClientWriteFailed, got %v", err)
+	}
+
+	select {
+	case err := <-notifyDone:
+		if !errors.Is(err, ErrClientWriteFailed) {
+			t.Fatalf("expected NotifyFrontendClosed to observe the SAME primary result (ErrClientWriteFailed), got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("NotifyFrontendClosed did not return within the bounded deadline")
+	}
+}
+
+// TestExtendedRuntime_FrontendShutdown_FrontendCloseBeforeLaterWriteFailure_FrontendCloseWins
+// proves the reverse ordering: a frontend close that linearizes FIRST
+// remains primary even though the connection closure it triggers produces
+// a LATER ErrBackendWriteFailed symptom from the event loop's own blocked
+// Write.
+func TestExtendedRuntime_FrontendShutdown_FrontendCloseBeforeLaterWriteFailure_FrontendCloseWins(t *testing.T) {
+	backendPipeR, _ := io.Pipe()
+	backend := newBlockingBackendTransport(backendPipeR)
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backend, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		_, err := rt.RegisterAndForwardFrontendOperation(context.Background(), FrontendOperationRequest{Kind: protocol.OpSync}, feSyncFrame())
+		submitDone <- err
+	}()
+
+	select {
+	case <-backend.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to enter the blocked backend Write")
+	}
+
+	if err := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil); !errors.Is(err, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed to remain primary despite the later close-induced write failure, got %v", runErr)
+	}
+	if errors.Is(runErr, ErrBackendWriteFailed) {
+		t.Fatalf("did not expect the write-failure symptom to leak as the primary error, got %v", runErr)
+	}
+	<-submitDone // the blocked submitter must still resolve definitively
+}
+
+// TestExtendedRuntime_FrontendShutdown_ParentCancellationBeforeFrontendClose_ParentWins
+// proves parent-context cancellation that linearizes FIRST retains its
+// existing precedence over a later, now-redundant frontend close request.
+func TestExtendedRuntime_FrontendShutdown_ParentCancellationBeforeFrontendClose_ParentWins(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	watcherDone := make(chan struct{})
+	rt.onWatcherShutdownBegun = func() { close(watcherDone) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	cancel()
+	select {
+	case <-watcherDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the watcher to linearize parent shutdown")
+	}
+
+	// The frontend close request is now redundant - the watcher's
+	// one-shot select already committed to the parent-ctx branch.
+	notifyErr := rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil)
+	if !errors.Is(notifyErr, context.Canceled) {
+		t.Fatalf("expected NotifyFrontendClosed to observe the parent's context.Canceled, got %v", notifyErr)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled to remain primary, got %v", runErr)
+	}
+}

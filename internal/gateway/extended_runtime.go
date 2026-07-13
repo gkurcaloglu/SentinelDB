@@ -292,7 +292,6 @@ const (
 	frontendEventSyntheticCurrentCycle
 	frontendEventFlush
 	frontendEventTerminate
-	frontendEventClosed
 )
 
 // FrontendCloseReason, frontend ureticisinin (bkz. NotifyFrontendClosed)
@@ -316,11 +315,17 @@ const (
 
 // frontendEvent, RegisterFrontendOperation/RegisterAndForwardFrontendOperation/
 // SubmitSyntheticError/SubmitSyntheticErrorForCurrentCycle/ForwardFlush/
-// ForwardTerminate/NotifyFrontendClosed tarafindan olusturulan, degismez
-// bir istek goruntusudur. ack, kapasitesi 1 olan tamponlu bir kanaldir:
-// cagiranin ctx'i olay kabul edildikten SONRA ama sonuc alinmadan ONCE
-// iptal edilirse, olay isleyici goroutine'inin (event loop) gonderim
-// sirasinda asla bloklanmamasini (dolayisiyla sizinti olusmamasini) saglar.
+// ForwardTerminate tarafindan olusturulan, degismez bir istek goruntusudur.
+// ack, kapasitesi 1 olan tamponlu bir kanaldir: cagiranin ctx'i olay kabul
+// edildikten SONRA ama sonuc alinmadan ONCE iptal edilirse, olay isleyici
+// goroutine'inin (event loop) gonderim sirasinda asla bloklanmamasini
+// (dolayisiyla sizinti olusmamasini) saglar.
+//
+// NotifyFrontendClosed BURAYA DAHIL DEGILDIR (bkz. gorev 5): frontend
+// kapanmasi artik frontendEvents kanalindan/event-loop'tan GECMEZ - event
+// loop backend.Write/client.Write icinde bloklu olsa BILE isleyebilecek
+// AYRI, bagimsiz bir kapanma-istegi yolu kullanir (bkz.
+// frontendShutdownRequest, beginFrontendShutdown).
 type frontendEvent struct {
 	kind frontendEventKind
 	req  FrontendOperationRequest // yalnizca frontendEventRegister/RegisterAndForward icin
@@ -330,9 +335,6 @@ type frontendEvent struct {
 	// (orijinal Flush/Terminate cercevesi) tarafindan kullanilir.
 	frame []byte
 	cycle protocol.CycleID // yalnizca frontendEventSynthetic icin (acik cycle)
-
-	closeReason FrontendCloseReason // yalnizca frontendEventClosed icin
-	closeCause  error               // yalnizca frontendEventClosed icin (FrontendClosedEOF disinda)
 
 	ack chan frontendAck
 }
@@ -441,6 +443,37 @@ type ExtendedRuntime struct {
 	// yalnizca sabit ErrRuntimeStopped donebilir.
 	ackGateClosed bool
 
+	// frontendShutdownCh, NotifyFrontendClosed'in (bkz. gorev 5) event
+	// loop'tan TAMAMEN BAGIMSIZ kapanma-istegi yoludur - kapasitesi 1,
+	// yalnizca kapanma gozetmeni tarafindan gozlemlenir. Bunun frontendEvents
+	// KANALINDAN GECMEMESI KRITIKTIR: event loop backend.Write/client.Write
+	// icinde bloklu olsa BILE, gozetmen bu kanali BAGIMSIZ olarak
+	// gozlemleyip baglantilari kapatabilir.
+	frontendShutdownCh chan frontendShutdownRequest
+	// frontendShutdownOnce, NotifyFrontendClosed'in frontendShutdownCh'e
+	// TAM OLARAK BIR KEZ gonderim yapmasini saglar - art arda cagrilar
+	// (ör. testler, ya da savunma amacli ikinci bir cagiran) kanalin
+	// TEK GOZLEMCISI (gozetmen, TEK SEFERLIK select) tarafindan zaten
+	// tuketilmis olsa bile guvenle sonuc bekleyebilir (bkz. asagida
+	// finalErr/stopped).
+	frontendShutdownOnce sync.Once
+	// frontendCloseErr, beginFrontendShutdown TARAFINDAN, shutdownCause
+	// CAS'i shutdownCauseFrontendClosed'i BASARIYLA kaydettiginde (yani
+	// frontend kapanmasi GERCEKTEN birincil neden olduğunda) yazilir;
+	// Run bunu primaryErr olarak kullanir. Gozetmen goroutine'i icinde,
+	// ackGate altinda yazilir; Run tarafindan yalnizca wg.Wait() sonrasi
+	// (gozetmen KESIN olarak bitmisken) okunur - ek senkronizasyona
+	// gerek yoktur.
+	frontendCloseErr error
+	// finalErr, Run'in dondurdugu KESIN birincil hatanin (varsa nil)
+	// bir kopyasidir - close(stopped)'DAN HEMEN ONCE tam olarak bir kez
+	// yazilir. NotifyFrontendClosed (ve gelecekte benzer "runtime'in
+	// KESIN sonucunu bilmek isteyen" cagiranlar), <-stopped'i
+	// gozlemledikten SONRA bu alani okur - Go bellek modelinin
+	// close(kanal) -> alma happens-before garantisi, ek kilitlemeye
+	// gerek kalmadan guvenli okumayi saglar.
+	finalErr error
+
 	// onFrontendEventEnqueued/onFrontendEventAccepted/onLoopReturned/
 	// onBeforeAckLinearization/onWatcherShutdownBegun, YALNIZCA PAKET
 	// TESTLERI tarafindan ayarlanan isteğe bagli kancalardir (hooks).
@@ -458,10 +491,11 @@ type ExtendedRuntime struct {
 	//   - onBeforeAckLinearization, sendFrontendSuccess ackGate'i
 	//     kilitlemeden HEMEN ONCE cagrilir - basarili-ack
 	//     dogrusallastirma (gorev 2) testleri icindir.
-	//   - onWatcherShutdownBegun, beginWatcherShutdown ackGate'i
-	//     BIRAKTIKTAN hemen sonra cagrilir - testlerin watcher'in
-	//     gecisini GERCEKTEN tamamladigini uykuya basvurmadan
-	//     bilebilmesi icindir.
+	//   - onWatcherShutdownBegun, beginWatcherShutdown YA DA
+	//     beginFrontendShutdown ackGate'i BIRAKTIKTAN hemen sonra
+	//     cagrilir - testlerin gozetmenin gecisini (parent ctx iptali
+	//     YA DA frontend kapanma istegi tetiklemis olsun) GERCEKTEN
+	//     tamamladigini uykuya basvurmadan bilebilmesi icindir.
 	// Bu alanlarin yalnizca Run baslamadan ONCE ayarlanmasi (ya da -
 	// mevcut kod tabaninda oldugu gibi - kendi olayinin kanal gonderimi
 	// ONCESINDE, ayni cagiran goroutine icinde AYARLANMASI) gerekir; bu,
@@ -509,15 +543,16 @@ func NewExtendedRuntime(
 		return nil, err
 	}
 	return &ExtendedRuntime{
-		state:          state,
-		seq:            seq,
-		backend:        backend,
-		client:         client,
-		limits:         runtimeLimits,
-		frontendEvents: make(chan frontendEvent, runtimeLimits.FrontendEventBuffer),
-		backendEvents:  make(chan backendEvent, runtimeLimits.BackendEventBuffer),
-		started:        make(chan struct{}),
-		stopped:        make(chan struct{}),
+		state:              state,
+		seq:                seq,
+		backend:            backend,
+		client:             client,
+		limits:             runtimeLimits,
+		frontendEvents:     make(chan frontendEvent, runtimeLimits.FrontendEventBuffer),
+		backendEvents:      make(chan backendEvent, runtimeLimits.BackendEventBuffer),
+		frontendShutdownCh: make(chan frontendShutdownRequest, 1),
+		started:            make(chan struct{}),
+		stopped:            make(chan struct{}),
 	}, nil
 }
 
@@ -546,6 +581,18 @@ const (
 	// BASLATTIGINI belirtir - bu durumda loop()'un kendi donus degeri
 	// birincil hata olarak KORUNUR.
 	shutdownCauseInternal
+	// shutdownCauseFrontendClosed, frontend ureticisinin (bkz.
+	// NotifyFrontendClosed, gorev 5) client-okuma dongusunun sona
+	// erdigini (temiz EOF, okuma hatasi ya da kurtarilamaz bir
+	// cerceveleme hatasi) BASLATTIGINI belirtir. Bu istek event loop'tan
+	// TAMAMEN BAGIMSIZ, kapanma gozetmeni araciligiyla islenir (bkz.
+	// beginFrontendShutdown) - boylece event loop backend.Write/
+	// client.Write icinde bloklu olsa BILE bu neden kaydedilebilir. Bu
+	// isaretliyse, Run'in birincil hatasi r.frontendCloseErr'dur -
+	// loop()'un kendi donus degeri (varsa) yalnizca bu ZORLA kapatmanin
+	// bir SEMPTOMU olabilir (ör. baglantilar kapatildigi icin basarisiz
+	// olan bir ErrBackendWriteFailed/ErrClientWriteFailed).
+	shutdownCauseFrontendClosed
 )
 
 // markInternalShutdown, kapanmayi BASLATAN nedenin event-loop'un KENDI ic
@@ -586,6 +633,61 @@ func (r *ExtendedRuntime) beginWatcherShutdown(parentCanceled bool) {
 	r.ackGate.Lock()
 	if parentCanceled {
 		r.markParentShutdown()
+	}
+	r.ackGateClosed = true
+	r.ackGate.Unlock()
+	if r.onWatcherShutdownBegun != nil {
+		r.onWatcherShutdownBegun()
+	}
+}
+
+// frontendShutdownRequest, NotifyFrontendClosed'in kapanma gozetmenine
+// gonderdigi TEK, degismez istektir (bkz. gorev 5).
+type frontendShutdownRequest struct {
+	reason FrontendCloseReason
+	cause  error
+}
+
+// frontendCloseFixedError, bir FrontendCloseReason'i (ve varsa guvenli bir
+// alt nedeni) Run'in birincil hatasi olarak kullanilacak sabit, guvenli bir
+// hataya cevirir. cause yalnizca reponun ANLAMLI oldugu durumlarda
+// (FrontendClosedEOF haric) sarilir - ve YALNIZCA zaten belgelenmis
+// guvenli-sarma kuralina tabi, baglanti/aktarim duzeyinde bir hata
+// olmasi beklenir (bkz. gorev 6 - cagiran, ExtendedFrontend, artik
+// kendi decoder/parser hatalarini buraya asla cig sekilde iletmez;
+// yalnizca kendi sabit kategorilerini gonderir).
+func frontendCloseFixedError(reason FrontendCloseReason, cause error) error {
+	switch reason {
+	case FrontendClosedReadError:
+		if cause != nil {
+			return fmt.Errorf("%w: %w", ErrFrontendReadFailed, cause)
+		}
+		return ErrFrontendReadFailed
+	case FrontendClosedProtocolError:
+		if cause != nil {
+			return fmt.Errorf("%w: %w", ErrFrontendProtocolFailure, cause)
+		}
+		return ErrFrontendProtocolFailure
+	default: // FrontendClosedEOF ve taninmayan degerler
+		return ErrFrontendClosed
+	}
+}
+
+// beginFrontendShutdown, kapanma gozetmeninin frontend-kapanma-istegi
+// TETIKLEYICISI icin dogrusallastirma noktasidir (bkz. gorev 5) -
+// beginWatcherShutdown'in parent-ctx tetikleyicisiyle TAM SIMETRIK bir
+// eslenigidir, AYNI ackGate kritik bolgesini kullanir. shutdownCause CAS'i
+// BASARILI olursa (yani frontend kapanmasi GERCEKTEN once dogrusallastiysa)
+// r.frontendCloseErr'i de kaydeder - boylece Run bu degeri primaryErr
+// olarak kullanabilir. CAS BASARISIZ olursa (baska bir neden zaten
+// kaydedilmisse) frontendCloseErr KASITLI OLARAK yazilmaz - bu, "ONCE
+// dogrusallasan neden kazanir" ilkesini korur (bkz. gorev 5, "Deterministic
+// error precedence"). State/ResponseSequencer'a ASLA dokunmaz, istemciye
+// bayt yazmaz.
+func (r *ExtendedRuntime) beginFrontendShutdown(req frontendShutdownRequest) {
+	r.ackGate.Lock()
+	if r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseFrontendClosed)) {
+		r.frontendCloseErr = frontendCloseFixedError(req.reason, req.cause)
 	}
 	r.ackGateClosed = true
 	r.ackGate.Unlock()
@@ -662,21 +764,37 @@ func (r *ExtendedRuntime) Run(ctx context.Context) error {
 
 	// Kapanma gozetmeni: runCtx sona erdiginde (parent ctx iptali/
 	// deadline'i YA DA Run'in kendisinin asagida cagiracagi cancelRun()
-	// nedeniyle) HER IKI baglantiyi da kapatir. parent ctx'in GERCEKTEN
-	// sona erip ermedigini (yalnizca Run'in kendi ic cancelRun()
-	// cagrisindan degil) ayirt etmek icin runCtx.Err() DEGIL, DOGRUDAN
-	// ctx.Err() kontrol edilir - boylece "kim once bitirdi" sorusu
-	// hatasiz cevaplanir (bkz. shutdownCause). beginWatcherShutdown,
-	// parent nedeni kaydetmeyi VE basarili-ack kabulunu kapatmayi TEK
-	// bir ackGate kritik bolgesinde atomik yapar (bkz. gorev 2) -
-	// boylece event loop, parent nedeni kaydedilmeden once ama
-	// baglantilar kapanmadan sonraki bir anda yanlislikla basarili bir
-	// ack gonderemez.
+	// nedeniyle) YA DA bagimsiz bir frontend-kapanma istegi (bkz.
+	// NotifyFrontendClosed, gorev 5) geldiginde HER IKI baglantiyi da
+	// kapatir. Bu TEK SEFERLIK select, ikisinden HANGISI ONCE hazir
+	// olursa o dali isler:
+	//
+	//   - runCtx.Done(): parent ctx'in GERCEKTEN sona erip ermedigini
+	//     (yalnizca Run'in kendi ic cancelRun() cagrisindan degil) ayirt
+	//     etmek icin runCtx.Err() DEGIL, DOGRUDAN ctx.Err() kontrol
+	//     edilir - boylece "kim once bitirdi" sorusu hatasiz cevaplanir
+	//     (bkz. shutdownCause). beginWatcherShutdown, parent nedeni
+	//     kaydetmeyi VE basarili-ack kabulunu kapatmayi TEK bir ackGate
+	//     kritik bolgesinde atomik yapar (bkz. gorev 2).
+	//   - frontendShutdownCh: event loop backend.Write/client.Write
+	//     icinde bloklu OLSA BILE isleyebilecek, TAMAMEN bagimsiz bir
+	//     kapanma tetikleyicisidir (bkz. gorev 5). beginFrontendShutdown
+	//     AYNI ackGate dogrusallastirmasini kullanir VE runCtx'i de
+	//     KENDISI iptal eder (cancelRun()) - boylece backend-okuyucu
+	//     goroutine'i ve (varsa) event-loop'un kendi ctx.Done() dali da
+	//     GECIKMEDEN serbest kalir; Run'in kendi post-loop cancelRun()
+	//     cagrisini beklemek, event loop TAM DA bu yuzden bloklu kalmis
+	//     olabilecegi icin bir kilitlenmeye (deadlock) yol acardi.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-runCtx.Done()
-		r.beginWatcherShutdown(ctx.Err() != nil)
+		select {
+		case <-runCtx.Done():
+			r.beginWatcherShutdown(ctx.Err() != nil)
+		case req := <-r.frontendShutdownCh:
+			r.beginFrontendShutdown(req)
+			cancelRun()
+		}
 		r.closeOnce.Do(func() {
 			_ = r.backend.Close()
 			_ = r.client.Close()
@@ -710,18 +828,32 @@ func (r *ExtendedRuntime) Run(ctx context.Context) error {
 
 	wg.Wait() // backend-okuyucu VE kapanma gozetmeni Run donmeden once katilmis olmalidir
 
-	r.lifecycle.Store(int32(lifecycleStopped))
-	close(r.stopped)
-
 	primaryErr := loopErr
-	if shutdownCause(r.shutdownCause.Load()) == shutdownCauseParentCtx {
+	switch shutdownCause(r.shutdownCause.Load()) {
+	case shutdownCauseParentCtx:
 		// Parent ctx'in sona ermesi kapanmayi BASLATTI - loop()'un donus
 		// degeri (varsa) yalnizca bu ZORLA kapatmanin bir semptomu
 		// olabilir (ör. bloklu bir Write'in kesilmesinden kaynaklanan
 		// ErrClientWriteFailed) - bu yuzden gercek nedeni (context.Canceled
 		// ya da context.DeadlineExceeded) rapor ederiz.
 		primaryErr = ctx.Err()
+	case shutdownCauseFrontendClosed:
+		// Frontend kapanmasi kapanmayi BASLATTI - loop()'un donus degeri
+		// (varsa) yalnizca baglantilarin bu yuzden kapatilmasinin bir
+		// semptomu olabilir (ör. ErrBackendWriteFailed/ErrClientWriteFailed) -
+		// bu yuzden gercek nedeni (bkz. beginFrontendShutdown'in kaydettigi
+		// sabit, guvenli hata) rapor ederiz.
+		primaryErr = r.frontendCloseErr
 	}
+
+	// finalErr, close(stopped)'DAN ONCE yazilir - NotifyFrontendClosed
+	// (ve <-stopped'i gozlemleyen benzer cagiranlar) Go bellek modelinin
+	// close(kanal) -> alma happens-before garantisiyle bunu guvenle
+	// okuyabilir (bkz. gorev 5).
+	r.finalErr = primaryErr
+
+	r.lifecycle.Store(int32(lifecycleStopped))
+	close(r.stopped)
 
 	return primaryErr
 }
@@ -879,23 +1011,37 @@ func (r *ExtendedRuntime) ForwardTerminate(ctx context.Context, frame []byte) er
 // NotifyFrontendClosed, frontend ureticisinin (ör.
 // internal/firewall.ExtendedFrontend/Gate.RunExtended) kendi client-okuma
 // dongusunun SONA ERDIGINI - ve dolayisiyla runtime'in ARTIK hicbir yeni
-// frontend olayi beklememesi gerektigini - bildirir (bkz. gorev 7).
+// frontend olayi beklememesi gerektigini - bildirir (bkz. gorev 7, gorev 5).
 // reason, sona erme nedenini (temiz EOF/okuma hatasi/decoder-cerceveleme
 // hatasi) belirtir; cause yalnizca EOF-DISI nedenlerde anlamlidir ve
 // baglanti/aktarim duzeyinde GUVENLI bir hata olmalidir (SQL/isim/deger
 // ICERMEMELIDIR - mevcut ErrClientWriteFailed/ErrBackendReadFailed
-// sarmalama kuralindaki AYNI sozlesme).
+// sarmalama kuralindaki AYNI sozlesme; ExtendedFrontend artik kendi
+// decoder/parser hatalarini buraya cig sekilde ILETMEZ, bkz. gorev 6).
 //
-// Bu olay ISLENDIGI anda event-loop'u KALICI olarak sonlandirir (bkz.
-// ErrFrontendClosed/ErrFrontendReadFailed/ErrFrontendProtocolFailure) -
-// runtime boylece asla sonsuza kadar "bir sonraki frontend olayini"
-// beklemez. Kapanma nedensellik kurallari (bkz. gorev 1) burada da
-// gecerlidir: bu olay LOOP icinde islendigi anda kendi ic nedenini
-// (markInternalShutdown) kaydeder.
+// KRITIK: bu cagri frontendEvents kanalindan/event-loop'tan GECMEZ (bkz.
+// gorev 5) - event loop backend.Write/client.Write icinde bloklu OLSA
+// BILE, bu bildirim kapanma gozetmeni tarafindan BAGIMSIZ olarak islenir
+// ve HER IKI baglantiyi da hemen kapatir. Bu, "no frontend close request
+// is silently dropped or treated as best effort" gereksinimini karsilar:
+// cagiran, runtime KESIN olarak durana kadar bloklanir ve Run'in
+// DONDURECEGI (ya da zaten dondurdugu) AYNI birincil hatayi alir - asla
+// bir "en iyi çaba" (best-effort) sinyali degildir.
+//
+// Run henuz hic baslamadiysa (ErrNotRunning) ANINDA doner - aksi halde
+// runtime'in tamamen durmasini (Run donene kadar) bekler. Birden fazla
+// cagri guvenlidir: yalnizca ILK cagri gercek bir kapanma istegi gonderir
+// (bkz. frontendShutdownOnce), sonraki cagrilar da AYNI kesin sonucu
+// bekleyip dondurur.
 func (r *ExtendedRuntime) NotifyFrontendClosed(ctx context.Context, reason FrontendCloseReason, cause error) error {
-	ack := make(chan frontendAck, 1)
-	_, err := r.submit(ctx, frontendEvent{kind: frontendEventClosed, closeReason: reason, closeCause: cause, ack: ack})
-	return err
+	if lifecycleState(r.lifecycle.Load()) == lifecycleCreated {
+		return ErrNotRunning
+	}
+	r.frontendShutdownOnce.Do(func() {
+		r.frontendShutdownCh <- frontendShutdownRequest{reason: reason, cause: cause}
+	})
+	<-r.stopped
+	return r.finalErr
 }
 
 // submit, hem RegisterFrontendOperation hem SubmitSyntheticError
@@ -1115,8 +1261,6 @@ func (r *ExtendedRuntime) handleFrontendEvent(ev frontendEvent) error {
 		return r.handleFrontendFlush(ev)
 	case frontendEventTerminate:
 		return r.handleFrontendTerminate(ev)
-	case frontendEventClosed:
-		return r.handleFrontendClosed(ev)
 	default:
 		return nil
 	}
@@ -1272,34 +1416,6 @@ func (r *ExtendedRuntime) handleFrontendTerminate(ev frontendEvent) error {
 		return err
 	}
 	return ErrFrontendTerminateRequested
-}
-
-// handleFrontendClosed, NotifyFrontendClosed'in tam davranis sozlesmesini
-// uygular (bkz. gorev 7): reason'a gore sabit, guvenli bir birincil hata
-// secer, cagirana bunu ack'ler VE ayni hatayi dondurerek event-loop'u
-// KALICI olarak sonlandirir.
-func (r *ExtendedRuntime) handleFrontendClosed(ev frontendEvent) error {
-	var result error
-	switch ev.closeReason {
-	case FrontendClosedEOF:
-		result = ErrFrontendClosed
-	case FrontendClosedReadError:
-		if ev.closeCause != nil {
-			result = fmt.Errorf("%w: %w", ErrFrontendReadFailed, ev.closeCause)
-		} else {
-			result = ErrFrontendReadFailed
-		}
-	case FrontendClosedProtocolError:
-		if ev.closeCause != nil {
-			result = fmt.Errorf("%w: %w", ErrFrontendProtocolFailure, ev.closeCause)
-		} else {
-			result = ErrFrontendProtocolFailure
-		}
-	default:
-		result = ErrFrontendClosed
-	}
-	ev.ack <- frontendAck{err: result}
-	return result
 }
 
 // createStateOperation, req.Kind'a gore DOGRU State.Create* metodunu

@@ -61,9 +61,9 @@ type Transformer struct {
 	hooks   Hooks
 	err     error
 
-	// Mevcut sonuç kümesinin (result set) durumu.
-	fields     []protocol.RowField
-	maskColIdx []int // fields icindeki, maskelenecek sutunlarin indeksleri
+	// Mevcut sonuç kümesinin (result set) durumu - I/O icermeyen paylasilan
+	// cekirdek (bkz. row_mask.go, MaskDataRow) tarafindan kullanilan plan.
+	plan RowMaskPlan
 }
 
 // NewTransformer, verilen Config ve Masker ile bir Transformer oluşturur.
@@ -151,15 +151,15 @@ func (t *Transformer) handleRowDescription(m protocol.Message) {
 		return
 	}
 
-	t.fields = rd.Fields
-	t.maskColIdx = t.maskColIdx[:0]
+	plan := RowMaskPlan{ColumnCount: len(rd.Fields)}
 	if t.cfg.Enabled {
 		for i, f := range rd.Fields {
 			if t.cfg.ShouldMask(f.Name) {
-				t.maskColIdx = append(t.maskColIdx, i)
+				plan.Targets = append(plan.Targets, MaskTarget{Index: i, ColumnName: f.Name, FormatCode: f.FormatCode})
 			}
 		}
 	}
+	t.plan = plan
 
 	// RowDescription'in kendisi (sutun meta verisi) hic degistirilmez;
 	// yalnizca DataRow hucreleri maskelenir.
@@ -167,78 +167,16 @@ func (t *Transformer) handleRowDescription(m protocol.Message) {
 }
 
 func (t *Transformer) handleDataRow(m protocol.Message) {
-	if len(m.Raw) < 5 {
-		t.failClosed(fmt.Errorf("DataRow govdesi cok kisa"))
-		return
-	}
-
-	if len(t.maskColIdx) == 0 {
-		// Bu sonuc kumesinde maskelenecek hicbir sutun yok (ya da hic
-		// RowDescription gorulmedi); hucreleri ayristirmaya bile gerek yok.
-		t.forwardRaw(m)
-		return
-	}
-
-	row, err := protocol.ParseDataRow(m.Raw[5:])
+	out, _, err := MaskDataRow(t.ctx, t.masker, t.plan, m.Raw, t.hooks)
 	if err != nil {
-		t.failClosed(fmt.Errorf("DataRow ayristirilamadi: %w", err))
+		t.failClosed(fmt.Errorf("DataRow islenemedi: %w", err))
 		return
 	}
-	if len(row.Cells) != len(t.fields) {
-		t.failClosed(fmt.Errorf("DataRow alan sayisi RowDescription ile uyusmuyor: %d != %d", len(row.Cells), len(t.fields)))
-		return
-	}
-
-	changed := false
-	for _, idx := range t.maskColIdx {
-		cell := row.Cells[idx]
-		if cell.Null {
-			// NULL degerler icin eklenti hic cagrilmaz.
-			continue
-		}
-
-		field := t.fields[idx]
-		if field.FormatCode != 0 {
-			// V1: yalnizca metin format kodu (0) destekleniyor. Binary
-			// veriyi metin gibi maskelemeye calismak veriyi sessizce
-			// bozabilir; bunun yerine acikca reddediyoruz.
-			t.failClosed(fmt.Errorf("maskelenecek sutun %q ikili (binary) formatta, V1 bunu desteklemiyor", field.Name))
-			return
-		}
-
-		start := time.Now()
-		maskedValue, valueChanged, _, maskErr := t.masker.Mask(t.ctx, field.Name, maskKindEmail, string(cell.Value))
-		duration := time.Since(start)
-		if t.hooks.OnMaskAttempt != nil {
-			t.hooks.OnMaskAttempt(field.Name, valueChanged, maskErr, duration)
-		}
-		if maskErr != nil {
-			t.failClosed(fmt.Errorf("sutun %q maskelenemedi: %w", field.Name, maskErr))
-			return
-		}
-		if !valueChanged {
-			continue
-		}
-
-		newRow, cellErr := row.WithCell(idx, protocol.DataCell{Value: []byte(maskedValue)})
-		if cellErr != nil {
-			t.failClosed(fmt.Errorf("hucre guncellenemedi: %w", cellErr))
-			return
-		}
-		row = newRow
-		changed = true
-	}
-
-	if !changed {
-		t.forwardRaw(m)
-		return
-	}
-	t.forwardBytes(row.Build())
+	t.forwardBytes(out)
 }
 
 func (t *Transformer) clearResultSet() {
-	t.fields = nil
-	t.maskColIdx = t.maskColIdx[:0]
+	t.plan = RowMaskPlan{}
 }
 
 func (t *Transformer) forwardRaw(m protocol.Message) {

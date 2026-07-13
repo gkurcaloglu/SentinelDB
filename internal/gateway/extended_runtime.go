@@ -9,12 +9,14 @@
 // açıkça belgeler. ExtendedRuntime ise tanımı gereği goroutine'ler,
 // kanallar ve gerçek net.Conn G/Ç'si kullanır; bunu doğrudan
 // internal/protocol içine koymak o paketin kurulu "no I/O" sözleşmesini
-// bozar. internal/firewall ve internal/masking, internal/protocol'e
-// bağımlıdır (tersi değil) - bu paket de aynı bağımlılık yönünü izler:
-// yalnızca internal/protocol'e bağımlıdır, ne firewall ne masking
-// paketine dokunur. "gateway" adı, bu bileşenin nihai olarak
-// cmd/gateway'in bağlantı işleme akışına bağlanacağı ileriki bir
-// aşamayı öngörür; bu AŞAMADA ise hiçbir canlı çağrı noktası yoktur
+// bozar. internal/firewall, internal/protocol'e bağımlıdır (tersi değil);
+// bu paket de AYNI yönü izler ve firewall'a hiç dokunmaz. internal/masking'e
+// olan bağımlılık ise BİLİNÇLİ ve TEK YÖNLÜDÜR (bkz. opt-in Extended Query
+// yanıt maskelemesi, NewExtendedRuntimeWithMasking, internal/masking/extended.go) -
+// internal/masking hiçbir zaman internal/gateway'e bağımlı değildir, bu
+// yüzden döngüsel bir bağımlılık oluşmaz. "gateway" adı, bu bileşenin
+// nihai olarak cmd/gateway'in bağlantı işleme akışına bağlanacağı ileriki
+// bir aşamayı öngörür; bu AŞAMADA ise hiçbir canlı çağrı noktası yoktur
 // (bkz. paket testleri dışında hiçbir yerden import edilmez).
 package gateway
 
@@ -27,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/gkurcaloglu/sentineldb/internal/masking"
 	"github.com/gkurcaloglu/sentineldb/internal/protocol"
 )
 
@@ -169,6 +172,40 @@ var (
 	// desteklenmeyen steady-state mesaji) bildirdiginde kullanilir - bu
 	// HER ZAMAN fail-closed'dir.
 	ErrFrontendProtocolFailure = errors.New("extendedruntime: frontend decoder/cerceveleme hatasi")
+
+	// --- Extended maskeleme (bkz. gorev 9-13, opt-in) ---------------------
+
+	// ErrNilMasker, NewExtendedRuntimeWithMasking'e maskingConfig.Enabled
+	// true iken nil bir masking.Masker verildiginde donulur.
+	ErrNilMasker = errors.New("extendedruntime: maskeleme etkinken nil Masker saglanamaz")
+	// ErrExtendedMaskingPreflightRejected, bir Execute icin maskeleme
+	// on-kontrolu (preflight) - HICBIR State/sequencer mutasyonu
+	// uygulanmadan - basarisiz oldugunda donulen SABIT, KURTARILABILIR
+	// (recoverable) ret kategorisidir (bilinmeyen sonuc sekli, ikili
+	// maskeleme hedefi, tutarsiz/gecersiz format meta verisi, ya da
+	// sekil kapasitesi asimi). Cagiran (bkz. internal/firewall.ExtendedFrontend)
+	// bunu digerleri gibi yerel bir ret (rejectLocally + discard-until-Sync)
+	// olarak islemelidir - runtime'i SONLANDIRMAZ.
+	ErrExtendedMaskingPreflightRejected = errors.New("extendedruntime: Execute maskeleme on-kontrolunden gecemedi")
+	// ErrExtendedMaskingFailed, GERCEK bir backend yaniti (Describe sekli
+	// gozlemi ya da DataRow donusumu) islenirken kurtarilamaz bir hataya
+	// (bozuk RowDescription/DataRow, taahhut edilmis plan eksik, ikili
+	// hedef sutun, Masker hatasi, sekil kapasitesi asimi) rastlandiginda
+	// donulen SABIT birincil hatadir - runtime'i KALICI olarak fail-closed
+	// sonlandirir. Bu, ResponseSequencer'dan GECMEZ (yerel bir sentetik ret
+	// DEGILDIR) - zaten client'a girmis/girmekte olan gercek bir backend
+	// yanitinin guvenlik hatasidir. Hicbir SQL/isim/deger/ham cerceve
+	// icermez.
+	ErrExtendedMaskingFailed = errors.New("extendedruntime: yanit maskelenirken kurtarilamaz bir hata olustu, baglanti guvenlik icin kapatildi")
+)
+
+// Extended maskeleme hatasi FATAL ErrorResponse'u icin SABIT, guvenli
+// SQLSTATE/reason (bkz. gorev 13 - "The FATAL frame must be built from
+// constants only"). masking.Transformer'in kendi failClosed'inin
+// kullandigi "58030" (veri koruma/isleme hatasi) kategorisiyle tutarlidir.
+const (
+	sqlStateExtendedMaskingFailed = "58030"
+	reasonExtendedMaskingFailed   = "SentinelDB: yanit maskelenirken bir hata olustu, baglanti guvenlik icin kapatildi"
 )
 
 // RuntimeLimits, ExtendedRuntime'in olay kanallari icin pozitif, sinirli
@@ -506,6 +543,28 @@ type ExtendedRuntime struct {
 	onLoopReturned           func()
 	onBeforeAckLinearization func()
 	onWatcherShutdownBegun   func()
+
+	// --- Extended maskeleme (opt-in, bkz. NewExtendedRuntimeWithMasking) --
+	//
+	// masker/maskTracker/maskHooks, YALNIZCA event-loop goroutine'i
+	// tarafindan okunur/cagirilir - hicbir baska goroutine erismez ve
+	// hicbir public accessor bunlari disariya sizdirmaz. maskTracker nil
+	// ise (varsayilan - bkz. NewExtendedRuntime) maskeleme TAMAMEN devre
+	// disidir ve asagidaki tum masking-farkindaligi kod yollari no-op'tur;
+	// bu, onceki (maskeleme-oncesi) davranisla BIREBIR aynidir.
+	masker      masking.Masker
+	maskTracker *masking.ExtendedTracker
+	maskHooks   masking.Hooks
+
+	// runCtx, Run() icinde TAM OLARAK BIR KEZ, loop() cagrilmadan HEMEN
+	// ONCE, AYNI (Run'in kendi) goroutine'i icinde yazilir - loop() da
+	// DOGRUDAN (ayri bir goroutine olmadan) AYNI goroutine icinde
+	// cagrildigindan (bkz. Run doc yorumu), yazan ve okuyan HER ZAMAN AYNI
+	// goroutine'dir; ek senkronizasyona gerek yoktur. Yalnizca Masker
+	// cagrilarina (bkz. masking.MaskDataRow) baglanti/kapatma iptalini
+	// (parent ctx iptali VE frontend kapanmasi/runtime sonlandirmasi
+	// DAHIL, ikisi de runCtx'i iptal eder) tasimak icin kullanilir.
+	runCtx context.Context
 }
 
 // NewExtendedRuntime, verilen State uzerinde calisan yeni bir
@@ -554,6 +613,52 @@ func NewExtendedRuntime(
 		started:            make(chan struct{}),
 		stopped:            make(chan struct{}),
 	}, nil
+}
+
+// NewExtendedRuntimeWithMasking, NewExtendedRuntime ile TAMAMEN AYNI
+// kurulumu yapar, ANCAK ek olarak opt-in Extended Query yanit
+// maskelemesini (bkz. internal/masking.ExtendedTracker) etkinlestirir.
+//
+// maskingConfig.Enabled false ise masker HIC KULLANILMAZ/SAKLANMAZ (nil
+// olabilir - "masking disabled may use nil Masker safely") ve donen
+// ExtendedRuntime, NewExtendedRuntime ile OLUSTURULMUS biriyle DAVRANISSAL
+// olarak BIREBIR aynidir (maskTracker nil kalir, hicbir masking-farkindaligi
+// kod yolu tetiklenmez). maskingConfig.Enabled true ise masker NIL OLAMAZ
+// (ErrNilMasker).
+//
+// cmd/gateway bu asamada HENUZ bu constructor'i cagirmaz - Gate.RunExtended
+// icin canli bir cagri noktasi YOKTUR (bkz. paket basi doc yorumu); bu,
+// yalnizca opt-in ExtendedRuntime yolunu dogrudan cagiran testler/gelecekteki
+// entegrasyon icindir.
+func NewExtendedRuntimeWithMasking(
+	state *protocol.State,
+	backend BackendTransport,
+	client io.WriteCloser,
+	sequencerLimits protocol.SequencerLimits,
+	runtimeLimits RuntimeLimits,
+	maskingConfig masking.Config,
+	masker masking.Masker,
+	maskingLimits masking.ExtendedLimits,
+	maskingHooks masking.Hooks,
+) (*ExtendedRuntime, error) {
+	if maskingConfig.Enabled && masker == nil {
+		return nil, ErrNilMasker
+	}
+	r, err := NewExtendedRuntime(state, backend, client, sequencerLimits, runtimeLimits)
+	if err != nil {
+		return nil, err
+	}
+	if !maskingConfig.Enabled {
+		return r, nil
+	}
+	tracker, err := masking.NewExtendedTracker(maskingConfig, maskingLimits)
+	if err != nil {
+		return nil, err
+	}
+	r.masker = masker
+	r.maskTracker = tracker
+	r.maskHooks = maskingHooks
+	return r, nil
 }
 
 // shutdownCause, hangi tetikleyicinin baglanti kapatmayi/sonlandirmayi
@@ -753,6 +858,10 @@ func (r *ExtendedRuntime) Run(ctx context.Context) error {
 	close(r.started)
 
 	runCtx, cancelRun := context.WithCancel(ctx)
+	// bkz. runCtx alaninin doc yorumu: bu, Run'in kendi goroutine'i
+	// icinde, loop() cagrilmadan (AYNI goroutine icinde, dogrudan)
+	// ONCE yazilir - baska hicbir goroutine erismeden once.
+	r.runCtx = runCtx
 
 	var wg sync.WaitGroup
 
@@ -1240,6 +1349,12 @@ func (r *ExtendedRuntime) loop(ctx context.Context) error {
 			r.markParentShutdown()
 			return ctx.Err()
 		}
+		// bkz. gorev 15: her olay basari ile islendikten sonra, State'in
+		// ARTIK tanimadigi (kapatilmis/basarisiz/degistirilmis) statement/
+		// portal generation'lara ait tum maskeleme sekli/plan meta
+		// verisini temizler. maskTracker nil ise (maskeleme devre disi)
+		// no-op'tur.
+		r.reconcileMaskingLifecycle()
 		if r.terminalRequested {
 			r.markInternalShutdown()
 			return ErrTerminationRequested
@@ -1323,6 +1438,44 @@ func (r *ExtendedRuntime) handleFrontendRegisterAndForward(ev frontendEvent) err
 		return nil
 	}
 
+	// --- Extended maskeleme on-kontrolu (preflight, bkz. gorev 9) --------
+	//
+	// YALNIZCA OpExecute icin VE maskeleme etkinken (maskTracker != nil)
+	// uygulanir. Sira KESINLIKLE su sekildedir: preflight -> State.
+	// CreateExecute -> sequencer kaydi -> effective plan commit -> upstream
+	// yazma -> basari ack'i. Preflight, HICBIR State/sequencer mutasyonu
+	// uygulanmadan calisir - reddi (varsa) her zaman kurtarilabilir bir
+	// yerel rettir (bkz. ErrExtendedMaskingPreflightRejected), asla
+	// runtime'i sonlandirmaz.
+	var (
+		maskPlan      masking.RowMaskPlan
+		maskPortalGen protocol.GenerationID
+		applyMaskPlan bool
+	)
+	if r.maskTracker != nil && ev.req.Kind == protocol.OpExecute {
+		if portal, ok := r.state.ResolvePortal(ev.req.PortalName); ok {
+			// Portal COZUMLENDI: gercek Execute preflight'i uygula. Portal
+			// cozumlenemezse (bilinmeyen ad) preflight KASITLI OLARAK
+			// atlanir - createStateOperation asagida ZATEN AYNI durumu
+			// (ErrUnknownPortal, hicbir mutasyon uygulanmadan) reddedecektir;
+			// maskeleme bunun uzerine YENI bir kategori eklemez.
+			plan, planErr := r.maskTracker.ResolveExecutePlan(portal.ID, portal.StatementID, portal.ResultFormats)
+			if planErr != nil {
+				wrapped := fmt.Errorf("%w: %w", ErrExtendedMaskingPreflightRejected, planErr)
+				ev.ack <- frontendAck{err: wrapped}
+				return nil
+			}
+			if r.maskTracker.WouldExceedPortalPlanCapacity(portal.ID) {
+				wrapped := fmt.Errorf("%w: %w", ErrExtendedMaskingPreflightRejected, masking.ErrExtendedCapacityExceeded)
+				ev.ack <- frontendAck{err: wrapped}
+				return nil
+			}
+			maskPlan = plan
+			maskPortalGen = portal.ID
+			applyMaskPlan = true
+		}
+	}
+
 	op, createErr := r.createStateOperation(ev.req)
 	if createErr != nil {
 		// State kendi sozlesmesi geregi HICBIR mutasyon uygulamadi -
@@ -1339,6 +1492,22 @@ func (r *ExtendedRuntime) handleFrontendRegisterAndForward(ev frontendEvent) err
 		return divergedErr
 	}
 
+	if applyMaskPlan {
+		// Preflight sirasinda WouldExceedPortalPlanCapacity ZATEN
+		// dogrulandigi ve bu noktaya kadar (tek-goroutine, senkron cagri
+		// zinciri icinde) baska HICBIR sey maskTracker'in kapasitesini
+		// degistiremeyecegi icin bu cagri PRATIKTE asla basarisiz olmaz -
+		// yine de savunma amacli ele alinir: basarisiz olursa State/
+		// sequencer ZATEN mutasyona ugramistir, bu bir UYUSMAZLIKTIR (aynen
+		// AddForwardedOperation basarisizligi gibi) ve runtime KALICI
+		// olarak sonlanir.
+		if commitErr := r.maskTracker.CommitExecutePlan(maskPortalGen, maskPlan); commitErr != nil {
+			divergedErr := fmt.Errorf("%w: %w", ErrFrontendRegistrationDiverged, commitErr)
+			ev.ack <- frontendAck{err: divergedErr}
+			return divergedErr
+		}
+	}
+
 	if procErr := r.processActions(actions); procErr != nil {
 		// actions, AddForwardedOperation'in basarili durumunda HER ZAMAN
 		// nil'dir (bkz. o metodun dokumantasyonu) - bu cagri yalnizca
@@ -1348,8 +1517,9 @@ func (r *ExtendedRuntime) handleFrontendRegisterAndForward(ev frontendEvent) err
 		return procErr
 	}
 
-	// Kayit-once-iletim degismezi: State + sequencer kaydi ARTIK
-	// tamamlandi - orijinal cerceve ANCAK SIMDI upstream'e yazilir.
+	// Kayit-once-iletim degismezi: State + sequencer kaydi (+ varsa
+	// maskeleme plani taahhudu) ARTIK tamamlandi - orijinal cerceve ANCAK
+	// SIMDI upstream'e yazilir.
 	if err := writeAll(r.backend, ev.frame); err != nil {
 		wrapped := fmt.Errorf("%w: %w", ErrBackendWriteFailed, err)
 		ev.ack <- frontendAck{err: wrapped}
@@ -1483,7 +1653,15 @@ func (r *ExtendedRuntime) processActions(actions []protocol.OutputAction) error 
 	for _, a := range actions {
 		switch a.Kind {
 		case protocol.ActionEmitBackendFrame, protocol.ActionEmitSyntheticFrame:
-			if err := writeAll(r.client, a.Bytes); err != nil {
+			out := a.Bytes
+			if r.maskTracker != nil && a.Kind == protocol.ActionEmitBackendFrame {
+				masked, maskErr := r.applyMasking(a)
+				if maskErr != nil {
+					return r.emitMaskingFailureFatal(maskErr)
+				}
+				out = masked
+			}
+			if err := writeAll(r.client, out); err != nil {
 				return fmt.Errorf("%w: %w", ErrClientWriteFailed, err)
 			}
 		case protocol.ActionTerminateConnection:
@@ -1492,6 +1670,129 @@ func (r *ExtendedRuntime) processActions(actions []protocol.OutputAction) error 
 		}
 	}
 	return nil
+}
+
+// --- Extended maskeleme: backend yaniti gozlemi/donusumu (bkz. gorev 11-13) -
+//
+// Asagidaki yardimcilar YALNIZCA processActions (dolayisiyla YALNIZCA
+// event-loop goroutine'i) tarafindan cagirilir. r.maskTracker nil ise
+// processActions bunlari hic cagirmaz (bkz. yukarida).
+
+// applyMasking, TEK bir ActionEmitBackendFrame icin maskeleme-farkindaligi
+// donusumunu uygular: statement/portal Describe RowDescription/NoData
+// yanitlari GOZLEMLENIR (sekil onbellege alinir) ama HER ZAMAN degismeden
+// iletilir; Execute'a ait DataRow'lar taahhut edilmis effective plana gore
+// MASKELENIR; digerleri (ParseComplete/BindComplete/CommandComplete/
+// ReadyForQuery/async mesajlar/vb.) DOKUNULMADAN gecer.
+func (r *ExtendedRuntime) applyMasking(a protocol.OutputAction) ([]byte, error) {
+	switch {
+	case (a.MessageType == protocol.MsgRowDescription || a.MessageType == protocol.MsgNoData) &&
+		(a.OperationKind == protocol.OpDescribeStatement || a.OperationKind == protocol.OpDescribePortal):
+		if err := r.observeDescribeAction(a); err != nil {
+			return nil, err
+		}
+		return a.Bytes, nil
+	case a.MessageType == protocol.MsgDataRow && a.OperationKind == protocol.OpExecute:
+		return r.transformDataRowAction(a)
+	default:
+		return a.Bytes, nil
+	}
+}
+
+// observeDescribeAction, gercek bir statement/portal Describe yanitindan
+// (RowDescription ya da NoData) sekil meta verisini gozlemleyip
+// ExtendedTracker'a kaydeder. a.Bytes HER ZAMAN tag(1)+uzunluk(4)+govde
+// bicimindedir (bkz. ActionEmitBackendFrame.Bytes dokumantasyonu) - govde
+// a.Bytes[5:]'tir.
+func (r *ExtendedRuntime) observeDescribeAction(a protocol.OutputAction) error {
+	body := a.Bytes[5:]
+	switch a.OperationKind {
+	case protocol.OpDescribeStatement:
+		if a.MessageType == protocol.MsgNoData {
+			return r.maskTracker.ObserveStatementDescribeNoData(a.TargetGeneration)
+		}
+		return r.maskTracker.ObserveStatementDescribeRowDescription(a.TargetGeneration, body)
+	case protocol.OpDescribePortal:
+		if a.MessageType == protocol.MsgNoData {
+			return r.maskTracker.ObservePortalDescribeNoData(a.TargetGeneration)
+		}
+		return r.maskTracker.ObservePortalDescribeRowDescription(a.TargetGeneration, body, r.portalResultFormatsForMasking(a.TargetGeneration))
+	}
+	return nil
+}
+
+// portalResultFormatsForMasking, a.TargetGeneration'a karsilik gelen
+// portalin Bind'ta ISTENEN sonuc format kodlarini State'ten okur (salt-
+// okunur). Portal artik State'te bulunamazsa (beklenmedik/savunma amacli)
+// nil doner - ExpandResultFormats bunu "tumu metin beklenir" olarak ele
+// alir, bu da gercek bir ikili uyumsuzlugu GUVENLI sekilde (fail-closed)
+// yakalar.
+func (r *ExtendedRuntime) portalResultFormatsForMasking(gen protocol.GenerationID) []int16 {
+	p, ok := r.state.Portal(gen)
+	if !ok {
+		return nil
+	}
+	return p.ResultFormats
+}
+
+// transformDataRowAction, a.TargetGeneration (portal generation) icin
+// taahhut edilmis effective plani bulup gercek, I/O icermeyen maskeleme
+// cekirdegini (bkz. masking.MaskDataRow) cagirir. Taahhut edilmis bir plan
+// yoksa (bkz. gorev 12: "fail closed if masking is enabled and no plan
+// exists") ya da cekirdek hata dondururse, orijinal (maskelenmemis) baytlar
+// ASLA dondurulmez.
+func (r *ExtendedRuntime) transformDataRowAction(a protocol.OutputAction) ([]byte, error) {
+	plan, ok := r.maskTracker.LookupExecutePlan(a.TargetGeneration)
+	if !ok {
+		return nil, fmt.Errorf("extendedruntime: DataRow icin taahhut edilmis maskeleme plani yok")
+	}
+	ctx := r.runCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out, _, err := masking.MaskDataRow(ctx, r.masker, plan, a.Bytes, r.maskHooks)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// emitMaskingFailureFatal, gercek bir backend yaniti islenirken olusan bir
+// maskeleme hatasindan sonra client'a TEK, TAM, SABIT bir FATAL
+// ErrorResponse yazar ve maskeleme hatasini (cause SARILMIS olarak)
+// Run'in birincil hatasi olarak dondurur (bkz. gorev 13). FATAL yazimi
+// BASARISIZ olsa BILE donen birincil hata HER ZAMAN maskeleme hatasidir -
+// ikincil bir client-yazma hatasiyla ASLA degistirilmez/ustune yazilmaz.
+// Bu, ResponseSequencer'dan GECMEZ (yerel bir sentetik ret DEGILDIR).
+func (r *ExtendedRuntime) emitMaskingFailureFatal(cause error) error {
+	primary := fmt.Errorf("%w: %w", ErrExtendedMaskingFailed, cause)
+	frame := protocol.BuildErrorResponse("FATAL", sqlStateExtendedMaskingFailed, reasonExtendedMaskingFailed)
+	_ = writeAll(r.client, frame)
+	return primary
+}
+
+// reconcileMaskingLifecycle, ExtendedTracker'daki (bkz. gorev 15) statement/
+// portal sekli/plan girdilerini, State'in ARTIK taniMADIGI (silinmis ya da
+// LifecycleFailed) generation'lar icin temizler. Isim yerine YALNIZCA
+// generation kimligine dayanir; State ile ExtendedTracker arasindaki tek
+// mutabakat (reconciliation) noktasidir - her olay basari ile islendikten
+// sonra (bkz. loop) cagrilir.
+func (r *ExtendedRuntime) reconcileMaskingLifecycle() {
+	if r.maskTracker == nil {
+		return
+	}
+	for _, gen := range r.maskTracker.StatementGenerations() {
+		g, ok := r.state.Statement(gen)
+		if !ok || g.State == protocol.LifecycleFailed {
+			r.maskTracker.RetireStatement(gen)
+		}
+	}
+	for _, gen := range r.maskTracker.PortalGenerations() {
+		g, ok := r.state.Portal(gen)
+		if !ok || g.State == protocol.LifecycleFailed {
+			r.maskTracker.RetirePortal(gen)
+		}
+	}
 }
 
 // writeAll, p'nin TUMUNUN yazildigindan emin olana kadar tekrar tekrar

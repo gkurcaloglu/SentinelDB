@@ -38,19 +38,24 @@ where it applies. **Still not approved for implementation.**
 response sequencer), `internal/gateway.ExtendedRuntime` (event-driven
 runtime, including upstream forwarding via
 `RegisterAndForwardFrontendOperation`/`ForwardFlush`/`ForwardTerminate`),
-and an opt-in `firewall.Gate.RunExtended`/`firewall.ExtendedFrontend`
+an opt-in `firewall.Gate.RunExtended`/`firewall.ExtendedFrontend`
 frontend bridge (Parse-time policy evaluation, local rejection,
-discard-until-`Sync`) now exist and are unit/integration-tested — see
-`docs/postgresql-protocol.md`'s "Opt-in Extended Query frontend bridge"
-section for the precise, current behavior. None of this is wired into
-`cmd/gateway`. As of this document, the LIVE gateway (`cmd/gateway`,
-`firewall.Gate.Run`) continues to reject every Extended Query Protocol
-message (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`) with a
-`FATAL` `ErrorResponse` and closes the connection
+discard-until-`Sync`), and (stage 7) opt-in Extended Query **response
+masking** inside `ExtendedRuntime` (`internal/masking.ExtendedTracker`,
+`gateway.NewExtendedRuntimeWithMasking`) now exist and are
+unit/integration-tested — see `docs/postgresql-protocol.md`'s "Opt-in
+Extended Query frontend bridge" and "Opt-in Extended Query response
+masking" sections for the precise, current behavior. None of this is
+wired into `cmd/gateway`. As of this document, the LIVE gateway
+(`cmd/gateway`, `firewall.Gate.Run`) continues to reject every Extended
+Query Protocol message (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/
+`Flush`/`Sync`) with a `FATAL` `ErrorResponse` and closes the connection
 (`internal/firewall/gate.go`'s `rejectExtendedProtocol`,
-`ErrUnsupportedProtocol`). Mixed Simple/Extended Query support and
-response masking across the Extended Query flow remain unimplemented.
-Nothing in this document's design proposal changes live behavior today.
+`ErrUnsupportedProtocol`); the live `masking.Transformer` (Simple Query
+path) is unchanged and has no awareness of `ExtendedTracker`. Mixed
+Simple/Extended Query routing, startup/authentication handoff, and TLS/
+COPY support across the Extended Query flow remain unimplemented. Nothing
+in this document's design proposal changes live behavior today.
 
 ## Context
 
@@ -2727,11 +2732,25 @@ tests, and must not bundle unrelated refactors — consistent with
    statements/portals, using the registries from stages 2-3, with the
    full unknown/blocked-reference fail-closed handling from
    [Failure and fail-closed invariants](#failure-and-fail-closed-invariants).
-7. **Response masking integration.** Extend `masking.Transformer` to track
-   per-portal shape/format metadata (§ [Proposed connection state](#proposed-connection-state))
-   and apply the safe masking rule from
-   [Response masking implications](#response-masking-implications),
-   including the binary-format-target and unknown-shape fail-closed cases.
+7. **Response masking integration (standalone, implemented).** Rather
+   than extending `masking.Transformer` directly (its I/O-owning,
+   connection-global-shape design does not fit `ExtendedRuntime`'s
+   single-event-loop/per-generation ownership model), the actual
+   implementation split the work into two layers, both in
+   `internal/masking`: an I/O-free `MaskDataRow`/`RowMaskPlan` core
+   (`row_mask.go`, reused by the live `Transformer` unchanged in
+   behavior) and a connection-local `ExtendedTracker`
+   (`extended.go`) tracking per-statement/per-portal shape and
+   effective mask plans by `GenerationID`, called only by
+   `ExtendedRuntime`'s event loop. `protocol.CorrelationResult`/
+   `OutputAction` gained a `TargetGeneration` field so the runtime can
+   identify which portal/statement generation a Describe/DataRow action
+   belongs to without ever carrying a name. Execute masking preflight,
+   Bind result-format expansion, binary-target/unknown-shape fail-closed
+   rejection, and generation-keyed lifecycle cleanup all match the rule
+   from [Response masking implications](#response-masking-implications)
+   above. Opt-in only, via `gateway.NewExtendedRuntimeWithMasking`; no
+   `cmd/gateway` call site.
 8. **Real-driver E2E tests.** Add Docker-Compose-based E2E coverage (in
    the spirit of the existing `scripts/e2e-demo.ps1`) exercising at least
    one real driver's default Extended Query behavior (e.g. `pgx` or

@@ -90,6 +90,17 @@ type CorrelationResult struct {
 	OperationKind OperationKind
 	CycleID       CycleID
 
+	// TargetGeneration, OperationID'nin ISLEM OLUSTURULDUGUNDA (State
+	// mutasyonundan ONCE) yakalanan degismez PendingOperation.TargetGeneration
+	// alaninin bir kopyasidir - hangi statement/portal generation'ina ait
+	// oldugunu ISIM ICERMEDEN bildirir (bkz. dosya basi "YALNIZCA sinirli,
+	// guvenli metadata"). Async/baglanti-seviyesi mesajlar icin her zaman
+	// NoGeneration'dir. Bu alan, ileriki bir yanit maskeleme katmaninin
+	// (bkz. internal/masking) bir DataRow/RowDescription'in hangi portal/
+	// statement generation'ina ait oldugunu, isim yerine sayisal kimlikle
+	// belirleyebilmesi icin eklenmistir.
+	TargetGeneration GenerationID
+
 	// CompletedCycleID, yalnizca CycleCompleted true oldugunda anlamlidir.
 	CompletedCycleID CycleID
 
@@ -319,6 +330,7 @@ func (c *BackendCorrelator) handleSimpleTerminal(m Message, kind OperationKind, 
 	return CorrelationResult{
 		MessageType: m.Type, OperationCompleted: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+		TargetGeneration: head.TargetGeneration,
 	}, nil
 }
 
@@ -336,6 +348,7 @@ func (c *BackendCorrelator) handleCloseComplete(m Message) (CorrelationResult, e
 	return CorrelationResult{
 		MessageType: m.Type, OperationCompleted: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+		TargetGeneration: head.TargetGeneration,
 	}, nil
 }
 
@@ -357,6 +370,7 @@ func (c *BackendCorrelator) handleParameterDescription(m Message) (CorrelationRe
 	return CorrelationResult{
 		MessageType: m.Type, Intermediate: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+		TargetGeneration: head.TargetGeneration,
 	}, nil
 }
 
@@ -394,6 +408,7 @@ func (c *BackendCorrelator) handleDescribeResult(m Message, hasRowDescription bo
 	return CorrelationResult{
 		MessageType: m.Type, OperationCompleted: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+		TargetGeneration: head.TargetGeneration,
 	}, nil
 }
 
@@ -410,6 +425,7 @@ func (c *BackendCorrelator) handleDataRow(m Message) (CorrelationResult, error) 
 	return CorrelationResult{
 		MessageType: m.Type, Intermediate: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+		TargetGeneration: head.TargetGeneration,
 	}, nil
 }
 
@@ -440,6 +456,7 @@ func (c *BackendCorrelator) handleExecuteTerminal(m Message, requireTag bool) (C
 	return CorrelationResult{
 		MessageType: m.Type, OperationCompleted: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+		TargetGeneration: head.TargetGeneration,
 	}, nil
 }
 
@@ -486,6 +503,7 @@ func (c *BackendCorrelator) handleErrorResponse(m Message) (CorrelationResult, e
 		return CorrelationResult{
 			MessageType: m.Type, IsErrorResponse: true, Intermediate: true,
 			OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
+			TargetGeneration: head.TargetGeneration,
 		}, nil
 	}
 
@@ -505,7 +523,8 @@ func (c *BackendCorrelator) handleErrorResponse(m Message) (CorrelationResult, e
 	return CorrelationResult{
 		MessageType: m.Type, IsErrorResponse: true, OperationCompleted: true,
 		OperationID: failed.ID, OperationKind: failed.Kind, CycleID: failed.Cycle,
-		FailedOperation: sanitizeOperation(failed), AbandonedOperations: sanitizeOperations(abandoned),
+		TargetGeneration: failed.TargetGeneration,
+		FailedOperation:  sanitizeOperation(failed), AbandonedOperations: sanitizeOperations(abandoned),
 	}, nil
 }
 
@@ -532,6 +551,7 @@ func (c *BackendCorrelator) handleReadyForQuery(m Message) (CorrelationResult, e
 		MessageType: m.Type, OperationCompleted: true, CycleCompleted: true,
 		OperationID: head.ID, OperationKind: head.Kind, CycleID: head.Cycle,
 		CompletedCycleID: completedCycle,
+		TargetGeneration: head.TargetGeneration,
 	}, nil
 }
 

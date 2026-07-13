@@ -55,7 +55,12 @@ var (
 	ErrNotRunning = errors.New("extendedruntime: runtime henuz calismiyor (Run cagrilmadi)")
 	// ErrRuntimeStopped, runtime kalici olarak sonlandiktan (ya da
 	// sonlanma surecine girdikten) sonra herhangi bir submit ya da ikinci
-	// bir Run cagrisinda donulur.
+	// bir Run cagrisinda donulur. AYNI zamanda, ZATEN kabul edilmis ve
+	// tamamen islenmis (State/sequencer mutasyonu dahil) bir frontend
+	// olayinin basarili ack'i, kapanma gozetmeninin dogrusallastirma
+	// noktasini (bkz. beginWatcherShutdown, gorev 2) KAYBETTIGINDE de
+	// donulur - bu durumda cagirana ASLA basarili bir
+	// FrontendRegistration/nil sonuc verilmez.
 	ErrRuntimeStopped = errors.New("extendedruntime: runtime kalici olarak durduruldu")
 
 	// ErrTerminationRequested, Run'in birincil (primary) hatasi olarak,
@@ -310,24 +315,58 @@ type ExtendedRuntime struct {
 	// shutdownCause, kapanmayi hangi tetikleyicinin BASLATTIGINI (bkz.
 	// shutdownCause turu) kayit altina alan tek seferlik bir
 	// atomic.CompareAndSwap hedefidir - Run'in dondugu birincil hatanin
-	// nedensellik (causality) belirlenimi icin kullanilir.
+	// nedensellik (causality) belirlenimi icin kullanilir. ARTIK
+	// yalnizca Run donduğunde DEGIL, event-loop'un (loop) HER terminal
+	// donus noktasinda VE kapanma gozetmeninde, ilgili nedenin TAM
+	// OLARAK belirlendigi anda yazilir (bkz. markInternalShutdown/
+	// markParentShutdown, gorev 1).
 	shutdownCause atomic.Int32
 
-	// onFrontendEventEnqueued/onFrontendEventAccepted, YALNIZCA PAKET
+	// ackGate, basarili bir frontend ack'inin (bkz. sendFrontendSuccess)
+	// kapanma gozetmeninin "basari kabulunu kalici olarak kapatma"
+	// gecisine (bkz. beginWatcherShutdown) karsi TEK dogrusallastirma
+	// (linearization) noktasidir - gorev 2. Bir mutex + duz bir bool
+	// kullanilir (kanal DEGIL): hem watcher'in hem event-loop'un
+	// birbirini asla bloklamadan, tek bir atomik gecis noktasinda
+	// karar vermesini saglar.
+	ackGate sync.Mutex
+	// ackGateClosed, YALNIZCA ackGate altinda okunur/yazilir.
+	// beginWatcherShutdown tarafindan true'ya cevrildikten SONRA
+	// sendFrontendSuccess bir daha ASLA basarili bir ack gonderemez -
+	// yalnizca sabit ErrRuntimeStopped donebilir.
+	ackGateClosed bool
+
+	// onFrontendEventEnqueued/onFrontendEventAccepted/onLoopReturned/
+	// onBeforeAckLinearization/onWatcherShutdownBegun, YALNIZCA PAKET
 	// TESTLERI tarafindan ayarlanan isteğe bagli kancalardir (hooks).
 	// Uretimde HER ZAMAN nil'dir ve hicbir etkisi yoktur - yalnizca
-	// "kabul edilmis ama henuz islenmemis olay" senaryolarini uykuya
-	// (sleep) basvurmadan deterministik olarak test edebilmek icindir:
+	// zamanlamaya (sleep) basvurmadan deterministik nedensellik/
+	// dogrusallastirma testleri yazabilmek icindir:
 	//   - onFrontendEventEnqueued, submit() icinde bir olay kanala
 	//     basari ile YERLESTIRILDIGI aninda (cagiran goroutine'de, ack
 	//     beklemeden ONCE) cagrilir.
 	//   - onFrontendEventAccepted, event-loop bir olayi kanaldan
 	//     ALDIGI aninda (islemeye baslamadan ONCE) cagrilir.
-	// Her iki alan da yalnizca Run baslamadan ONCE ayarlanmalidir (test
-	// kodunda) - bu, Go bellek modelinin goroutine-olusturma
-	// happens-before garantisiyle veri yarisini onler.
-	onFrontendEventEnqueued func()
-	onFrontendEventAccepted func()
+	//   - onLoopReturned, r.loop() Run icinde DONDUKTEN HEMEN SONRA,
+	//     kapanma temizligine (cancelRun/wg.Wait) devam etmeden ONCE
+	//     cagrilir - ic nedensellik (gorev 1) testleri icindir.
+	//   - onBeforeAckLinearization, sendFrontendSuccess ackGate'i
+	//     kilitlemeden HEMEN ONCE cagrilir - basarili-ack
+	//     dogrusallastirma (gorev 2) testleri icindir.
+	//   - onWatcherShutdownBegun, beginWatcherShutdown ackGate'i
+	//     BIRAKTIKTAN hemen sonra cagrilir - testlerin watcher'in
+	//     gecisini GERCEKTEN tamamladigini uykuya basvurmadan
+	//     bilebilmesi icindir.
+	// Bu alanlarin yalnizca Run baslamadan ONCE ayarlanmasi (ya da -
+	// mevcut kod tabaninda oldugu gibi - kendi olayinin kanal gonderimi
+	// ONCESINDE, ayni cagiran goroutine icinde AYARLANMASI) gerekir; bu,
+	// Go bellek modelinin kanal/goroutine-olusturma happens-before
+	// garantileriyle veri yarisini onler.
+	onFrontendEventEnqueued  func()
+	onFrontendEventAccepted  func()
+	onLoopReturned           func()
+	onBeforeAckLinearization func()
+	onWatcherShutdownBegun   func()
 }
 
 // NewExtendedRuntime, verilen State uzerinde calisan yeni bir
@@ -404,6 +443,79 @@ const (
 	shutdownCauseInternal
 )
 
+// markInternalShutdown, kapanmayi BASLATAN nedenin event-loop'un KENDI ic
+// nedeni (sequencer sonlandirma istegi, backend protokol/okuma hatasi,
+// gercek bir istemci yazma hatasi, bekleyen is yokken temiz EOF, vb.)
+// oldugunu kayit altina alir. Yalnizca event-loop goroutine'i (r.loop)
+// icinden, ilgili terminal donus noktasinin TAM OLARAK aninda - Run'a
+// kontrolu geri vermeden ONCE - cagrilir (bkz. gorev 1). Tek seferlik bir
+// CompareAndSwap oldugundan, daha once baska bir neden (ozellikle
+// shutdownCauseParentCtx) zaten kaydedilmisse bu cagri sessizce no-op'tur;
+// boylece GERCEKTEN daha once gerceklesen ic hata, SONRA gelen bir parent
+// ctx iptalinin CAS'i tarafindan asla ustune yazilamaz.
+func (r *ExtendedRuntime) markInternalShutdown() {
+	r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseInternal))
+}
+
+// markParentShutdown, kapanmayi BASLATAN nedenin ust (parent) ctx'in
+// iptal/deadline'i oldugunu kayit altina alir. Hem event-loop'un kendi
+// ctx.Done() dalindan (bkz. loop) hem kapanma gozetmeninden (bkz.
+// beginWatcherShutdown) cagrilabilir - hangisi ONCE kosarsa CAS'i o
+// kazanir, digeri no-op olur; ikisi de AYNI nedeni kaydettigi icin sonuc
+// farketmez.
+func (r *ExtendedRuntime) markParentShutdown() {
+	r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseParentCtx))
+}
+
+// beginWatcherShutdown, kapanma gozetmeninin basarili-ack kabulune karsi
+// TEK dogrusallastirma (linearization) noktasidir (bkz. gorev 2). ackGate
+// altinda, ATOMIK olarak (a) parent nedenini (varsa) kayit altina alir VE
+// (b) event-loop'un bir daha ASLA basarili bir ack gonderemeyecegi
+// sekilde ackGateClosed'i true yapar. Bu ikisinin AYNI kilit altinda
+// yapilmasi ZORUNLUDUR: aksi halde event-loop, parent nedeni HENUZ
+// kaydedilmeden ama ackGateClosed HENUZ true olmadan once basarili bir
+// ack gonderebilirdi - onlenmek istenen tam olarak bu yaris durumudur.
+// Baglanti kapatma cagrilarindan ONCE (r.closeOnce.Do) cagrilir; State/
+// ResponseSequencer'a ASLA dokunmaz, istemciye bayt yazmaz.
+func (r *ExtendedRuntime) beginWatcherShutdown(parentCanceled bool) {
+	r.ackGate.Lock()
+	if parentCanceled {
+		r.markParentShutdown()
+	}
+	r.ackGateClosed = true
+	r.ackGate.Unlock()
+	if r.onWatcherShutdownBegun != nil {
+		r.onWatcherShutdownBegun()
+	}
+}
+
+// sendFrontendSuccess, bir frontend olayinin (RegisterFrontendOperation ya
+// da SubmitSyntheticError) BASARILI sonucunu ev.ack'e gondermenin TEK
+// gecis noktasidir (bkz. gorev 2). ackGate altinda: kapanma HENUZ
+// baslamadiysa basari kabul edilip gonderilir - bu, basarinin sonraki
+// herhangi bir iptalden ONCE dogrusallastigi anlamina gelir. Kapanma
+// ZATEN basladiysa (ackGateClosed==true), basari YERINE sabit bir
+// ErrRuntimeStopped gonderilir/dondurulur - cagiran hicbir zaman
+// "iletim guvenli" sinyalini kapanma BASLADIKTAN SONRA almaz. ev.ack
+// kapasite-1 tamponlu bir kanal oldugundan (yalnizca event-loop
+// gonderir, cagiran yalnizca alir) gonderim asla bloklamaz - bu yuzden
+// kilit tutulurken gonderim yapmak guvenlidir ve gozetmenin ackGate'i
+// almasini asla geciktirmez.
+func (r *ExtendedRuntime) sendFrontendSuccess(ack chan<- frontendAck, success frontendAck) error {
+	if r.onBeforeAckLinearization != nil {
+		r.onBeforeAckLinearization()
+	}
+	r.ackGate.Lock()
+	if r.ackGateClosed {
+		r.ackGate.Unlock()
+		ack <- frontendAck{err: ErrRuntimeStopped}
+		return ErrRuntimeStopped
+	}
+	ack <- success
+	r.ackGate.Unlock()
+	return nil
+}
+
 // Run, olay dongusunu baslatir ve ictegi cagirir (blocking). TAM OLARAK
 // BIR KEZ cagrilabilir - ikinci bir cagri aninda ErrAlreadyRunning
 // dondurur. Run donduğunde: backend-okuyucu ve kapanma gozetmeni
@@ -449,14 +561,17 @@ func (r *ExtendedRuntime) Run(ctx context.Context) error {
 	// sona erip ermedigini (yalnizca Run'in kendi ic cancelRun()
 	// cagrisindan degil) ayirt etmek icin runCtx.Err() DEGIL, DOGRUDAN
 	// ctx.Err() kontrol edilir - boylece "kim once bitirdi" sorusu
-	// hatasiz cevaplanir (bkz. shutdownCause).
+	// hatasiz cevaplanir (bkz. shutdownCause). beginWatcherShutdown,
+	// parent nedeni kaydetmeyi VE basarili-ack kabulunu kapatmayi TEK
+	// bir ackGate kritik bolgesinde atomik yapar (bkz. gorev 2) -
+	// boylece event loop, parent nedeni kaydedilmeden once ama
+	// baglantilar kapanmadan sonraki bir anda yanlislikla basarili bir
+	// ack gonderemez.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		<-runCtx.Done()
-		if ctx.Err() != nil {
-			r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseParentCtx))
-		}
+		r.beginWatcherShutdown(ctx.Err() != nil)
 		r.closeOnce.Do(func() {
 			_ = r.backend.Close()
 			_ = r.client.Close()
@@ -470,12 +585,20 @@ func (r *ExtendedRuntime) Run(ctx context.Context) error {
 	// bir Write'tan ancak gozetmen baglantiyi kapattiktan SONRA doner.
 	loopErr := r.loop(runCtx)
 
-	// loop() KENDI nedeniyle dondu (sequencer sonlandirmasi, backend
-	// protokol hatasi, gercek yazma hatasi, ya da parent ctx zaten
-	// iptal edilmisken bos dongude ctx.Err() ile). Gozetmen HENUZ
-	// shutdownCause'u parentCtx olarak isaretlemediyse (yani asil neden
-	// GERCEKTEN loop()'un kendisiyse), bunu "internal" olarak kaydet.
-	r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseInternal))
+	if r.onLoopReturned != nil {
+		r.onLoopReturned()
+	}
+
+	// loop()'un KENDISI, her terminal donus noktasinda (bkz.
+	// markInternalShutdown/markParentShutdown cagrilari icinde loop())
+	// ilgili nedeni ARTIK ONCEDEN kaydetmis olmalidir - bu yuzden
+	// asagidaki CAS, olagan calismada shutdownCause'u DEGISTIRMEZ
+	// (ULASILAMAZ/unreachable); yalnizca, teorik olarak loop()'un
+	// KENDI icinde nedenini kaydetmeden dondugu beklenmedik bir yol
+	// olursa diye birakilan bir savunma (defensive) yedegidir - gercek
+	// nedensellik belirlenimi ARTIK bu satira degil, loop()'un ic
+	// isaretlemesine dayanir (bkz. gorev 1).
+	r.markInternalShutdown()
 
 	r.lifecycle.Store(int32(lifecycleStopping))
 	cancelRun() // gozetmenin de kesin olarak calisip baglantilari kapatmasini/cikmasini saglar (parent ctx HENUZ iptal edilmediyse)
@@ -716,20 +839,36 @@ func (r *ExtendedRuntime) loop(ctx context.Context) error {
 				r.onFrontendEventAccepted()
 			}
 			if err := r.handleFrontendEvent(ev); err != nil {
+				// Bkz. gorev 1: bu ic nedeni, Run'a kontrol geri
+				// donmeden ONCE, tam da belirlendigi anda kaydeder -
+				// SONRA gelebilecek bir parent ctx iptali bu nedenin
+				// yerini asla alamaz.
+				r.markInternalShutdown()
 				return err
 			}
 		case ev := <-r.backendEvents:
 			stop, err := r.handleBackendEvent(ev)
 			if err != nil {
+				r.markInternalShutdown()
 				return err
 			}
 			if stop {
+				r.markInternalShutdown()
 				return nil
 			}
 		case <-ctx.Done():
+			// Bu dal yalnizca GERCEK bir parent ctx iptali/deadline'i
+			// ile tetiklenebilir - Run'in kendi cancelRun() cagrisi
+			// loop() dondukten SONRA yapilir (bkz. Run), dolayisiyla
+			// loop() hala calisirken bu select dalinin secilmesinin
+			// TEK nedeni parent ctx'in gercekten sona ermis olmasidir.
+			// Gozetmen HENUZ calismamis olsa bile neden burada hemen
+			// kaydedilir.
+			r.markParentShutdown()
 			return ctx.Err()
 		}
 		if r.terminalRequested {
+			r.markInternalShutdown()
 			return ErrTerminationRequested
 		}
 	}
@@ -774,8 +913,10 @@ func (r *ExtendedRuntime) handleFrontendRegister(ev frontendEvent) error {
 		return procErr
 	}
 
-	ev.ack <- frontendAck{reg: FrontendRegistration{Operation: sanitizeOperation(op)}}
-	return nil
+	// Bkz. gorev 2: basari, kapanmanin (henuz baslamadiysa)
+	// dogrusallastirma noktasidir - sendFrontendSuccess, kapanma ZATEN
+	// basladiysa basari YERINE sabit ErrRuntimeStopped'i gonderir/dondurur.
+	return r.sendFrontendSuccess(ev.ack, frontendAck{reg: FrontendRegistration{Operation: sanitizeOperation(op)}})
 }
 
 func (r *ExtendedRuntime) handleFrontendSynthetic(ev frontendEvent) error {
@@ -788,8 +929,7 @@ func (r *ExtendedRuntime) handleFrontendSynthetic(ev frontendEvent) error {
 		ev.ack <- frontendAck{err: procErr}
 		return procErr
 	}
-	ev.ack <- frontendAck{err: nil}
-	return nil
+	return r.sendFrontendSuccess(ev.ack, frontendAck{})
 }
 
 // createStateOperation, req.Kind'a gore DOGRU State.Create* metodunu

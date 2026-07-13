@@ -2635,3 +2635,535 @@ func TestExtendedRuntime_PreCanceledContext_SubmitSyntheticError_NeverEnqueued(t
 	cancel()
 	waitDone(t, done)
 }
+
+// ==========================================================================
+// Shutdown linearization: internal-versus-parent causality at the exact
+// event-loop terminal point, and successful-acknowledgement linearization
+// against shutdown (final concurrency review follow-up).
+// ==========================================================================
+
+// TestExtendedRuntime_ShutdownLinearization_InternalWriteFailureBeforeLaterParentCancellation
+// reproduces the exact race described in the review: an independent
+// client.Write failure determines loop()'s internal terminal outcome
+// FIRST; a later parent-context cancellation must never be allowed to win
+// the shutdownCause race and mask it. onLoopReturned pauses Run() AFTER
+// loop() has already returned (and therefore already recorded
+// shutdownCauseInternal internally, bkz. markInternalShutdown) but BEFORE
+// Run proceeds to any further cleanup - the parent ctx is only canceled
+// once that pause is observed.
+func TestExtendedRuntime_ShutdownLinearization_InternalWriteFailureBeforeLaterParentCancellation(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	injected := errors.New("test: injected write failure for causality ordering")
+	client.writeErrOnce = injected
+	rt := newTestRuntime(t, backendR, client)
+
+	loopReturned := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onLoopReturned = func() {
+		close(loopReturned)
+		<-resume
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	submitDone := make(chan error, 1)
+	go func() {
+		submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+	}()
+
+	select {
+	case <-loopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for loop() to return")
+	}
+
+	// The internal cause was ALREADY recorded inside loop() before it
+	// returned - a parent cancellation arriving only now must not be able
+	// to win the causality race.
+	cancel()
+	close(resume)
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrClientWriteFailed) {
+		t.Fatalf("expected ErrClientWriteFailed to remain primary, got %v", runErr)
+	}
+	if errors.Is(runErr, context.Canceled) {
+		t.Fatalf("did not expect context.Canceled to override the earlier internal cause, got %v", runErr)
+	}
+
+	if err := <-submitDone; !errors.Is(err, ErrClientWriteFailed) {
+		t.Fatalf("expected the submitter to observe ErrClientWriteFailed, got %v", err)
+	}
+}
+
+// TestExtendedRuntime_ShutdownLinearization_InternalBackendReadFailureBeforeLaterParentCancellation
+// covers the same ordering for a backend-side internal failure (bkz.
+// gorev 1, "cover every event-loop exit category" - backend non-EOF read
+// failure).
+func TestExtendedRuntime_ShutdownLinearization_InternalBackendReadFailureBeforeLaterParentCancellation(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	loopReturned := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onLoopReturned = func() {
+		close(loopReturned)
+		<-resume
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	injected := errors.New("test: injected backend read failure for causality ordering")
+	backendW.CloseWithError(injected)
+
+	select {
+	case <-loopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for loop() to return")
+	}
+
+	cancel()
+	close(resume)
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrBackendReadFailed) {
+		t.Fatalf("expected ErrBackendReadFailed to remain primary, got %v", runErr)
+	}
+	if errors.Is(runErr, context.Canceled) {
+		t.Fatalf("did not expect context.Canceled to override the earlier internal cause, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_ShutdownLinearization_InternalCausalityRepeated(t *testing.T) {
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		func() {
+			backendR, backendW := io.Pipe()
+			defer backendW.Close()
+			client := newTrackingWriter()
+			injected := errors.New("test: injected write failure for causality ordering")
+			client.writeErrOnce = injected
+			rt := newTestRuntime(t, backendR, client)
+
+			loopReturned := make(chan struct{})
+			resume := make(chan struct{})
+			rt.onLoopReturned = func() {
+				close(loopReturned)
+				<-resume
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := runInBackground(t, rt, ctx)
+
+			submitDone := make(chan error, 1)
+			go func() {
+				submitDone <- rt.SubmitSyntheticError(context.Background(), protocol.CycleID(1), minimalErrorFrame())
+			}()
+
+			select {
+			case <-loopReturned:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: timed out waiting for loop() to return", i)
+			}
+
+			cancel()
+			close(resume)
+
+			runErr := waitDone(t, done)
+			if !errors.Is(runErr, ErrClientWriteFailed) {
+				t.Fatalf("iteration %d: expected ErrClientWriteFailed, got %v", i, runErr)
+			}
+			if err := <-submitDone; !errors.Is(err, ErrClientWriteFailed) {
+				t.Fatalf("iteration %d: expected ErrClientWriteFailed from the submitter, got %v", i, err)
+			}
+		}()
+	}
+}
+
+// TestExtendedRuntime_ShutdownLinearization_AcceptedRegistrationDuringParentCancellation_NeverSucceeds
+// drives the exact race from the review's second finding: the event loop
+// has ALREADY selected a frontend registration and mutated State/
+// ResponseSequencer, but parent-runtime cancellation linearizes at the
+// shutdown watcher's gate BEFORE the event loop reaches its own
+// success-acknowledgement linearization point. The caller must receive a
+// definitive non-nil result and must NEVER be told a successful
+// FrontendRegistration occurred (which would incorrectly signal that
+// forwarding the original frame to the backend is safe).
+func TestExtendedRuntime_ShutdownLinearization_AcceptedRegistrationDuringParentCancellation_NeverSucceeds(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onBeforeAckLinearization = func() {
+		close(paused)
+		<-resume
+	}
+	watcherDone := make(chan struct{})
+	rt.onWatcherShutdownBegun = func() { close(watcherDone) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	type result struct {
+		reg FrontendRegistration
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		reg, err := rt.RegisterFrontendOperation(context.Background(), syncReq())
+		resultCh <- result{reg, err}
+	}()
+
+	select {
+	case <-paused:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to reach the ack linearization point")
+	}
+
+	cancel()
+
+	select {
+	case <-watcherDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the shutdown watcher to linearize parent shutdown")
+	}
+
+	close(resume)
+
+	var res result
+	select {
+	case res = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registration did not return a definitive result")
+	}
+	if res.err == nil {
+		t.Fatal("expected a non-nil result once parent shutdown linearized first")
+	}
+	if !errors.Is(res.err, ErrRuntimeStopped) {
+		t.Fatalf("expected ErrRuntimeStopped, got %v", res.err)
+	}
+	if res.reg.Operation.ID != protocol.NoPendingOperation {
+		t.Fatalf("caller must never be told forwarding is safe, got %+v", res.reg)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", runErr)
+	}
+	if !client.Closed() {
+		t.Fatal("expected the client connection closed")
+	}
+	if _, err := backendW.Write([]byte{0}); err == nil {
+		t.Fatal("expected the backend connection closed")
+	}
+}
+
+// TestExtendedRuntime_ShutdownLinearization_AcceptedSyntheticDuringParentCancellation_NeverSucceeds
+// is the SubmitSyntheticError equivalent of the test above.
+func TestExtendedRuntime_ShutdownLinearization_AcceptedSyntheticDuringParentCancellation_NeverSucceeds(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	op := mustRegister(t, context.Background(), rt, parseReq("s1", "SELECT 1", nil))
+
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onBeforeAckLinearization = func() {
+		close(paused)
+		<-resume
+	}
+	watcherDone := make(chan struct{})
+	rt.onWatcherShutdownBegun = func() { close(watcherDone) }
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.SubmitSyntheticError(context.Background(), op.Cycle, minimalErrorFrame())
+	}()
+
+	select {
+	case <-paused:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to reach the ack linearization point")
+	}
+
+	cancel()
+
+	select {
+	case <-watcherDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the shutdown watcher to linearize parent shutdown")
+	}
+
+	close(resume)
+
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("synthetic submission did not return a definitive result")
+	}
+	if err == nil {
+		t.Fatal("expected a non-nil result once parent shutdown linearized first")
+	}
+	if !errors.Is(err, ErrRuntimeStopped) {
+		t.Fatalf("expected ErrRuntimeStopped, got %v", err)
+	}
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", runErr)
+	}
+}
+
+// TestExtendedRuntime_ShutdownLinearization_RegistrationSuccessBeforeCancellation_Preserved
+// covers the opposite ordering: the successful acknowledgement
+// linearizes BEFORE any cancellation is even requested - the later
+// cancellation is genuinely later and must not retract the already-
+// recorded success.
+func TestExtendedRuntime_ShutdownLinearization_RegistrationSuccessBeforeCancellation_Preserved(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onBeforeAckLinearization = func() {
+		close(paused)
+		<-resume
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	type result struct {
+		reg FrontendRegistration
+		err error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		reg, err := rt.RegisterFrontendOperation(context.Background(), syncReq())
+		resultCh <- result{reg, err}
+	}()
+
+	select {
+	case <-paused:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to reach the ack linearization point")
+	}
+
+	// Deliberately do NOT cancel yet - let the success acknowledgement
+	// linearize first.
+	close(resume)
+
+	var res result
+	select {
+	case res = <-resultCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registration did not return a result")
+	}
+	if res.err != nil {
+		t.Fatalf("expected success since the ack linearized before any cancellation, got %v", res.err)
+	}
+	if res.reg.Operation.ID == protocol.NoPendingOperation {
+		t.Fatal("expected a usable operation snapshot on success")
+	}
+
+	cancel()
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled from the later cancellation, got %v", runErr)
+	}
+}
+
+// TestExtendedRuntime_ShutdownLinearization_SyntheticSuccessBeforeCancellation_Preserved
+// is the SubmitSyntheticError equivalent of the test above.
+func TestExtendedRuntime_ShutdownLinearization_SyntheticSuccessBeforeCancellation_Preserved(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendW.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	op := mustRegister(t, context.Background(), rt, parseReq("s1", "SELECT 1", nil))
+
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	rt.onBeforeAckLinearization = func() {
+		close(paused)
+		<-resume
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- rt.SubmitSyntheticError(context.Background(), op.Cycle, minimalErrorFrame())
+	}()
+
+	select {
+	case <-paused:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the event loop to reach the ack linearization point")
+	}
+
+	close(resume)
+
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("synthetic submission did not return a result")
+	}
+	if err != nil {
+		t.Fatalf("expected success since the ack linearized before any cancellation, got %v", err)
+	}
+
+	cancel()
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled from the later cancellation, got %v", runErr)
+	}
+}
+
+func TestExtendedRuntime_ShutdownLinearization_ParentCancellationBeforeAck_Repeated(t *testing.T) {
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		func() {
+			backendR, backendW := io.Pipe()
+			defer backendW.Close()
+			client := newTrackingWriter()
+			rt := newTestRuntime(t, backendR, client)
+
+			paused := make(chan struct{})
+			resume := make(chan struct{})
+			rt.onBeforeAckLinearization = func() {
+				close(paused)
+				<-resume
+			}
+			watcherDone := make(chan struct{})
+			rt.onWatcherShutdownBegun = func() { close(watcherDone) }
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := runInBackground(t, rt, ctx)
+
+			type result struct {
+				reg FrontendRegistration
+				err error
+			}
+			resultCh := make(chan result, 1)
+			go func() {
+				reg, err := rt.RegisterFrontendOperation(context.Background(), syncReq())
+				resultCh <- result{reg, err}
+			}()
+
+			select {
+			case <-paused:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: timed out waiting for ack linearization point", i)
+			}
+
+			cancel()
+
+			select {
+			case <-watcherDone:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: timed out waiting for watcher shutdown", i)
+			}
+
+			close(resume)
+
+			var res result
+			select {
+			case res = <-resultCh:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: registration did not return a result", i)
+			}
+			if res.err == nil || !errors.Is(res.err, ErrRuntimeStopped) {
+				t.Fatalf("iteration %d: expected ErrRuntimeStopped, got %v", i, res.err)
+			}
+			if res.reg.Operation.ID != protocol.NoPendingOperation {
+				t.Fatalf("iteration %d: caller must never be told forwarding is safe, got %+v", i, res.reg)
+			}
+
+			runErr := waitDone(t, done)
+			if !errors.Is(runErr, context.Canceled) {
+				t.Fatalf("iteration %d: expected context.Canceled, got %v", i, runErr)
+			}
+		}()
+	}
+}
+
+func TestExtendedRuntime_ShutdownLinearization_SuccessBeforeCancellation_Repeated(t *testing.T) {
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		func() {
+			backendR, backendW := io.Pipe()
+			defer backendW.Close()
+			client := newTrackingWriter()
+			rt := newTestRuntime(t, backendR, client)
+
+			paused := make(chan struct{})
+			resume := make(chan struct{})
+			rt.onBeforeAckLinearization = func() {
+				close(paused)
+				<-resume
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := runInBackground(t, rt, ctx)
+
+			type result struct {
+				reg FrontendRegistration
+				err error
+			}
+			resultCh := make(chan result, 1)
+			go func() {
+				reg, err := rt.RegisterFrontendOperation(context.Background(), syncReq())
+				resultCh <- result{reg, err}
+			}()
+
+			select {
+			case <-paused:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: timed out waiting for ack linearization point", i)
+			}
+
+			close(resume)
+
+			var res result
+			select {
+			case res = <-resultCh:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: registration did not return a result", i)
+			}
+			if res.err != nil {
+				t.Fatalf("iteration %d: expected success, got %v", i, res.err)
+			}
+			if res.reg.Operation.ID == protocol.NoPendingOperation {
+				t.Fatalf("iteration %d: expected a usable operation snapshot on success", i)
+			}
+
+			cancel()
+			runErr := waitDone(t, done)
+			if !errors.Is(runErr, context.Canceled) {
+				t.Fatalf("iteration %d: expected context.Canceled, got %v", i, runErr)
+			}
+		}()
+	}
+}

@@ -19,6 +19,7 @@ type Config struct {
 	Wasm     WasmConfig     `yaml:"wasm"`
 	Logging  LoggingConfig  `yaml:"logging"`
 	Masking  MaskingConfig  `yaml:"masking"`
+	Protocol ProtocolConfig `yaml:"protocol"`
 }
 
 // FirewallConfig, firewall politikasını besleyen ayarlardır. BlockedPhrases
@@ -61,6 +62,20 @@ type MaskingConfig struct {
 	// (ör. "email"). Yalnızca configured (bu listede olan) sütunlar
 	// incelenir; diğer sütunların değerleri hiç okunmaz/tahmin edilmez.
 	Columns []string `yaml:"columns"`
+}
+
+// ProtocolConfig, hangi PostgreSQL wire protokolü yolunun canlı gateway'de
+// kullanılacağını seçer. Varsayılan (sıfır değer) HER ZAMAN mevcut Simple
+// Query yoludur (bkz. cmd/gateway/main.go, runSimpleConnection) - bu bayrak
+// açıkça true yapılmadığı sürece davranış önceki sürümle birebir aynıdır.
+type ProtocolConfig struct {
+	// ExtendedQueryEnabled, true ise bir bağlantı açık metin startup/
+	// authentication'ı tamamladıktan (bkz. internal/gateway.RunStartupHandoff)
+	// SONRA, Simple Query YERİNE Extended-Query-yalnızca steady-state yoluna
+	// (bkz. internal/gateway.ExtendedRuntime, firewall.ExtendedFrontend)
+	// devredilir. Bu bağlantıda karışık Simple/Extended Query yönlendirmesi
+	// YOKTUR - bkz. docs/design/0001-extended-query.md. Varsayılan: false.
+	ExtendedQueryEnabled bool `yaml:"extended_query_enabled"`
 }
 
 // validate, masking.enabled=true iken en az bir boş olmayan sütun adı

@@ -33,29 +33,48 @@ destroys its own unnamed objects at the same early point, and waiting for
 Query messages without waiting for it. Each correction is marked inline
 where it applies. **Still not approved for implementation.**
 
-**No LIVE implementation exists yet; several standalone stages do.**
-`internal/protocol` (parsing, connection-state model, correlation,
-response sequencer), `internal/gateway.ExtendedRuntime` (event-driven
-runtime, including upstream forwarding via
+**Stage 8 update: an opt-in LIVE implementation now exists in
+`cmd/gateway`.** `internal/protocol` (parsing, connection-state model,
+correlation, response sequencer), `internal/gateway.ExtendedRuntime`
+(event-driven runtime, including upstream forwarding via
 `RegisterAndForwardFrontendOperation`/`ForwardFlush`/`ForwardTerminate`),
-an opt-in `firewall.Gate.RunExtended`/`firewall.ExtendedFrontend`
-frontend bridge (Parse-time policy evaluation, local rejection,
-discard-until-`Sync`), and (stage 7) opt-in Extended Query **response
-masking** inside `ExtendedRuntime` (`internal/masking.ExtendedTracker`,
-`gateway.NewExtendedRuntimeWithMasking`) now exist and are
-unit/integration-tested — see `docs/postgresql-protocol.md`'s "Opt-in
-Extended Query frontend bridge" and "Opt-in Extended Query response
-masking" sections for the precise, current behavior. None of this is
-wired into `cmd/gateway`. As of this document, the LIVE gateway
-(`cmd/gateway`, `firewall.Gate.Run`) continues to reject every Extended
-Query Protocol message (`Parse`/`Bind`/`Describe`/`Execute`/`Close`/
-`Flush`/`Sync`) with a `FATAL` `ErrorResponse` and closes the connection
+`firewall.Gate.RunExtended`/`firewall.ExtendedFrontend` (Parse-time policy
+evaluation, local rejection, discard-until-`Sync`), and opt-in Extended
+Query **response masking** inside `ExtendedRuntime`
+(`internal/masking.ExtendedTracker`,
+`gateway.NewExtendedRuntimeWithMasking`) are now wired into the live
+connection path by `cmd/gateway/main.go`'s `runExtendedConnection`, gated
+behind a new, explicit, **default-false** configuration flag,
+`protocol.extended_query_enabled` (`config.yaml`,
+`internal/config.ProtocolConfig`). A new
+`internal/gateway.RunStartupHandoff` owns the plaintext startup/
+authentication phase for opt-in connections (SSLRequest/GSSENCRequest
+rejection, CancelRequest, the full authentication sub-protocol, relay of
+backend startup messages up to and including the first real
+`ReadyForQuery`) before handing exclusive transport ownership to
+`ExtendedRuntime`/`ExtendedFrontend` — see `docs/postgresql-protocol.md`'s
+"Opt-in Extended Query frontend bridge", "Opt-in Extended Query response
+masking", and "Opt-in Extended Query gateway wiring" sections for the
+precise, current, live behavior.
+
+**When the flag is false (the default), nothing changes.**
+`runSimpleConnection` is the same `firewall.Gate.Run`/
+`masking.Transformer.Run` path as before this stage, byte-for-byte and
+log-for-log identical to the pre-stage-8 `handleConn`: every Extended
+Query Protocol frontend message
+(`Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync`) is still
+rejected with a `FATAL` `ErrorResponse` and the connection is closed
 (`internal/firewall/gate.go`'s `rejectExtendedProtocol`,
-`ErrUnsupportedProtocol`); the live `masking.Transformer` (Simple Query
-path) is unchanged and has no awareness of `ExtendedTracker`. Mixed
-Simple/Extended Query routing, startup/authentication handoff, and TLS/
-COPY support across the Extended Query flow remain unimplemented. Nothing
-in this document's design proposal changes live behavior today.
+`ErrUnsupportedProtocol`).
+
+**What remains unimplemented even with the flag enabled:** mixed Simple/
+Extended Query routing on one connection (an opt-in connection is
+Extended-only for its entire lifetime — Simple Query's `'Q'` is rejected
+by `ExtendedFrontend` exactly like every other unsupported message), TLS,
+`COPY`, and a real driver compatibility test stage (planned as separate,
+later work). See `docs/design/0001-extended-query-review-checklist.md`
+and this document's [Non-goals](#non-goals) for the full list still
+outstanding.
 
 ## Context
 

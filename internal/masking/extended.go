@@ -294,7 +294,12 @@ func (tr *ExtendedTracker) ResolveExecutePlan(portalGen, statementGen protocol.G
 		return RowMaskPlan{}, ErrExtendedShapeUnknown
 	}
 	if shape.NoData {
-		return RowMaskPlan{}, nil
+		// Bilinen-NoData ayrimi KORUNUR: bu, "hicbir maskeleme yukumlulugu
+		// yok, oldugu gibi ilet" seklinde bos bir planla ASLA
+		// KARISTIRILMAZ - bkz. RowMaskPlan.KnownNoData. Bu Execute icin
+		// bir DataRow gorulmesi protokol acisindan IMKANSIZDIR; MaskDataRow
+		// bunu fail-closed reddeder.
+		return RowMaskPlan{KnownNoData: true}, nil
 	}
 
 	expanded, err := ExpandResultFormats(resultFormats, shape.ColumnCount)
@@ -330,17 +335,25 @@ func (tr *ExtendedTracker) CommitExecutePlan(portalGen protocol.GenerationID, pl
 	if _, exists := tr.portalPlans[portalGen]; !exists && len(tr.portalPlans) >= tr.limits.MaxPortalShapes {
 		return ErrExtendedCapacityExceeded
 	}
-	tr.portalPlans[portalGen] = plan
+	// Bagimsiz bir derin kopya saklanir - cagiranin ELINDE TUTTUGU plan
+	// degeri (ozellikle Targets dilimi) daha sonra mutasyona ugrasa BILE
+	// tracker'in ic durumu ASLA etkilenmez (bkz. gorev 4).
+	tr.portalPlans[portalGen] = cloneRowMaskPlan(plan)
 	return nil
 }
 
 // LookupExecutePlan, bir portal generation icin daha once taahhut edilmis
 // effective plani dondurur. ok false ise (bkz. eksik plan) cagiran fail-
 // closed davranmalidir - hicbir DataRow, taahhut edilmis bir plan olmadan
-// maskelenmemelidir.
+// maskelenmemelidir. Donen deger, tracker'in ic saklama alanindan bagimsiz
+// bir derin kopyadir - cagiranin donen Targets dilimini mutasyona ugratmasi
+// tracker'in ic durumunu HICBIR ZAMAN etkilemez (bkz. gorev 4).
 func (tr *ExtendedTracker) LookupExecutePlan(portalGen protocol.GenerationID) (RowMaskPlan, bool) {
 	plan, ok := tr.portalPlans[portalGen]
-	return plan, ok
+	if !ok {
+		return RowMaskPlan{}, false
+	}
+	return cloneRowMaskPlan(plan), true
 }
 
 // WouldExceedPortalPlanCapacity, portalGen icin (henuz mevcut degilse) YENI

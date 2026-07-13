@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,8 +12,12 @@ import (
 	"github.com/gkurcaloglu/sentineldb/internal/protocol"
 )
 
-func TestMaskDataRow_NoTargets_ReturnsIndependentCopyUnparsed(t *testing.T) {
-	frame := encodeDataRow([]protocol.DataCell{{Value: []byte("anything, not even valid framing matters here")}})
+func TestMaskDataRow_NoTargets_ValidFrame_ReturnsIndependentCopy(t *testing.T) {
+	// No targets means no masking OBLIGATION, but the frame is still a
+	// well-formed DataRow (encodeDataRow always produces valid framing) -
+	// it is structurally validated like any other frame before the
+	// no-target fast path returns it unchanged.
+	frame := encodeDataRow([]protocol.DataCell{{Value: []byte("anything, the VALUE content is irrelevant here")}})
 	masker := emailLikeMasker()
 
 	out, changed, err := MaskDataRow(context.Background(), masker, RowMaskPlan{}, frame, Hooks{})
@@ -32,6 +37,73 @@ func TestMaskDataRow_NoTargets_ReturnsIndependentCopyUnparsed(t *testing.T) {
 	}
 	if len(masker.calls) != 0 {
 		t.Fatalf("expected no Mask calls, got %+v", masker.calls)
+	}
+}
+
+func TestMaskDataRow_NoTargets_MalformedFrame_Rejected(t *testing.T) {
+	// The no-target fast path must NOT bypass structural validation - a
+	// malformed frame is rejected even when plan.Targets is empty.
+	malformed := []byte{'D', 0, 0, 0, 100} // claims length 100, body absent
+	_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, malformed, Hooks{})
+	if !errors.Is(err, ErrInvalidDataRowFrame) {
+		t.Fatalf("expected ErrInvalidDataRowFrame, got %v", err)
+	}
+}
+
+func TestMaskDataRow_WrongMessageTag_Rejected(t *testing.T) {
+	frame := encodeDataRow([]protocol.DataCell{{Value: []byte("x")}})
+	frame[0] = 'T' // RowDescription tag, not DataRow
+	_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, frame, Hooks{})
+	if !errors.Is(err, ErrInvalidDataRowFrame) {
+		t.Fatalf("expected ErrInvalidDataRowFrame for a wrong tag, got %v", err)
+	}
+}
+
+func TestMaskDataRow_MissingLength_Rejected(t *testing.T) {
+	_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, []byte{'D', 0, 0}, Hooks{})
+	if !errors.Is(err, ErrInvalidDataRowFrame) {
+		t.Fatalf("expected ErrInvalidDataRowFrame, got %v", err)
+	}
+}
+
+func TestMaskDataRow_DeclaredLengthBelowFour_Rejected(t *testing.T) {
+	frame := []byte{'D', 0, 0, 0, 3} // length field must be >= 4 (itself included)
+	_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, frame, Hooks{})
+	if !errors.Is(err, ErrInvalidDataRowFrame) {
+		t.Fatalf("expected ErrInvalidDataRowFrame, got %v", err)
+	}
+}
+
+func TestMaskDataRow_ShorterBodyThanDeclared_Rejected(t *testing.T) {
+	full := encodeDataRow([]protocol.DataCell{{Value: []byte("hello")}})
+	truncated := full[:len(full)-3] // declared length still claims the full size
+	_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, truncated, Hooks{})
+	if !errors.Is(err, ErrInvalidDataRowFrame) {
+		t.Fatalf("expected ErrInvalidDataRowFrame for a truncated body, got %v", err)
+	}
+}
+
+func TestMaskDataRow_TrailingBytes_Rejected(t *testing.T) {
+	full := encodeDataRow([]protocol.DataCell{{Value: []byte("hello")}})
+	withTrailer := append(append([]byte{}, full...), 0xAA, 0xBB, 0xCC)
+	_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, withTrailer, Hooks{})
+	if !errors.Is(err, ErrInvalidDataRowFrame) {
+		t.Fatalf("expected ErrInvalidDataRowFrame for trailing bytes, got %v", err)
+	}
+}
+
+func TestMaskDataRow_ValidFramePlusSecondFrame_Rejected(t *testing.T) {
+	one := encodeDataRow([]protocol.DataCell{{Value: []byte("a")}})
+	two := encodeDataRow([]protocol.DataCell{{Value: []byte("b")}})
+	both := append(append([]byte{}, one...), two...)
+	// MaskDataRow accepts exactly ONE complete frame - a second frame
+	// appended after a valid first one must be rejected, not silently
+	// processed as if it were trailing garbage on the first frame's own
+	// declared length (which it is NOT: the declared length only covers
+	// the first frame).
+	_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, both, Hooks{})
+	if !errors.Is(err, ErrInvalidDataRowFrame) {
+		t.Fatalf("expected ErrInvalidDataRowFrame when a second frame follows, got %v", err)
 	}
 }
 
@@ -268,6 +340,117 @@ func TestMaskDataRow_ErrorsNeverContainCellValues(t *testing.T) {
 	}
 }
 
+// TestMaskDataRow_MaliciousMaskerError_NeverDisclosed proves that an
+// adversarial or careless Masker whose returned error embeds the complete
+// input cell value and other sensitive markers can NEVER leak them through
+// MaskDataRow's returned error - only the fixed ErrMaskerInvocationFailed
+// category crosses that boundary. The hook is still permitted to observe
+// the original error by design (existing contract), so it is checked
+// separately and MUST still receive the marker-bearing error unchanged.
+func TestMaskDataRow_MaliciousMaskerError_NeverDisclosed(t *testing.T) {
+	const cellValue = "SECRET_CELL_VALUE_MARKER"
+	const sqlMarker = "SECRET_SQL_MARKER SELECT * FROM users"
+	const nameMarker = "SECRET_COLUMN_NAME_MARKER"
+
+	frame := encodeDataRow([]protocol.DataCell{{Value: []byte(cellValue)}})
+	malicious := &fakeMasker{maskFunc: func(column, value string) (string, bool, error) {
+		return "", false, fmt.Errorf("plugin failed on value %q, sql=%q, name=%q", value, sqlMarker, nameMarker)
+	}}
+	plan := RowMaskPlan{ColumnCount: 1, Targets: []MaskTarget{{Index: 0, ColumnName: "email"}}}
+
+	var hookErr error
+	_, _, err := MaskDataRow(context.Background(), malicious, plan, frame, Hooks{
+		OnMaskAttempt: func(column string, changed bool, err error, d time.Duration) { hookErr = err },
+	})
+
+	if !errors.Is(err, ErrMaskerInvocationFailed) {
+		t.Fatalf("expected ErrMaskerInvocationFailed, got %v", err)
+	}
+	for _, marker := range []string{cellValue, sqlMarker, nameMarker} {
+		if strings.Contains(err.Error(), marker) {
+			t.Fatalf("expected the returned error not to contain marker %q, got: %v", marker, err)
+		}
+		if strings.Contains(fmt.Sprintf("%v", err), marker) || strings.Contains(fmt.Sprintf("%+v", err), marker) || strings.Contains(fmt.Sprintf("%#v", err), marker) {
+			t.Fatalf("expected no %%v/%%+v/%%#v formatting of the returned error to contain marker %q", marker)
+		}
+	}
+
+	// The hook, by existing design, MAY still observe the original error.
+	if hookErr == nil {
+		t.Fatal("expected the hook to receive the original Masker error")
+	}
+	if !strings.Contains(hookErr.Error(), cellValue) {
+		t.Fatal("expected the hook's error to be the ORIGINAL, unredacted Masker error (existing contract)")
+	}
+}
+
+func TestMaskDataRow_ErrorCategories_SupportErrorsIs(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"malformed frame", func() error {
+			_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), RowMaskPlan{}, []byte{'D', 0, 0}, Hooks{})
+			return err
+		}},
+		{"shape mismatch", func() error {
+			frame := encodeDataRow([]protocol.DataCell{{Value: []byte("a")}, {Value: []byte("b")}})
+			plan := RowMaskPlan{ColumnCount: 1, Targets: []MaskTarget{{Index: 0, ColumnName: "email"}}}
+			_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), plan, frame, Hooks{})
+			return err
+		}},
+		{"binary target", func() error {
+			frame := encodeDataRow([]protocol.DataCell{{Value: []byte("a@example.com")}})
+			plan := RowMaskPlan{ColumnCount: 1, Targets: []MaskTarget{{Index: 0, ColumnName: "email", FormatCode: 1}}}
+			_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), plan, frame, Hooks{})
+			return err
+		}},
+		{"invalid plan (out-of-range index)", func() error {
+			frame := encodeDataRow([]protocol.DataCell{{Value: []byte("a")}})
+			plan := RowMaskPlan{ColumnCount: 1, Targets: []MaskTarget{{Index: 5, ColumnName: "email"}}}
+			_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), plan, frame, Hooks{})
+			return err
+		}},
+		{"masker invocation failed", func() error {
+			frame := encodeDataRow([]protocol.DataCell{{Value: []byte("a@example.com")}})
+			plan := RowMaskPlan{ColumnCount: 1, Targets: []MaskTarget{{Index: 0, ColumnName: "email"}}}
+			masker := &fakeMasker{maskFunc: func(column, value string) (string, bool, error) { return "", false, errors.New("x") }}
+			_, _, err := MaskDataRow(context.Background(), masker, plan, frame, Hooks{})
+			return err
+		}},
+		{"unexpected DataRow for NoData", func() error {
+			frame := encodeDataRow([]protocol.DataCell{{Value: []byte("a")}})
+			plan := RowMaskPlan{KnownNoData: true}
+			_, _, err := MaskDataRow(context.Background(), emailLikeMasker(), plan, frame, Hooks{})
+			return err
+		}},
+	}
+	wantErrs := []error{
+		ErrInvalidDataRowFrame, ErrDataRowShapeMismatch, ErrRowMaskBinaryTarget,
+		ErrInvalidRowMaskPlan, ErrMaskerInvocationFailed, ErrUnexpectedDataRowForNoData,
+	}
+	for i, c := range cases {
+		err := c.run()
+		if !errors.Is(err, wantErrs[i]) {
+			t.Fatalf("%s: expected errors.Is match for %v, got %v", c.name, wantErrs[i], err)
+		}
+	}
+}
+
+func TestMaskDataRow_KnownNoData_RejectsAnyDataRow(t *testing.T) {
+	frame := encodeDataRow([]protocol.DataCell{{Value: []byte("unexpected")}})
+	plan := RowMaskPlan{KnownNoData: true}
+	masker := emailLikeMasker()
+
+	_, _, err := MaskDataRow(context.Background(), masker, plan, frame, Hooks{})
+	if !errors.Is(err, ErrUnexpectedDataRowForNoData) {
+		t.Fatalf("expected ErrUnexpectedDataRowForNoData, got %v", err)
+	}
+	if len(masker.calls) != 0 {
+		t.Fatal("expected the masker never called for a KnownNoData plan")
+	}
+}
+
 func TestMaskDataRow_HookReceivesColumnNameButNoValue(t *testing.T) {
 	const secretValue = "SECRET_ROWMASK_HOOK_MARKER"
 	frame := encodeDataRow([]protocol.DataCell{{Value: []byte(secretValue)}})
@@ -297,25 +480,70 @@ func TestMaskDataRow_HookReceivesColumnNameButNoValue(t *testing.T) {
 // out-of-bounds/impossible frame, regardless of malformed DataRow bodies,
 // arbitrary plans (including out-of-range indexes and binary format
 // codes), or NULL/non-NULL cell mixes.
+// FuzzMaskDataRow drives both DEEP masking-logic coverage (a well-formed
+// frame with a fuzzed body, per corruptionMode 0) and COMPLETE-FRAME
+// corruption (wrong tag, corrupted length field, trailing bytes/a second
+// frame, truncation, and fully arbitrary raw bytes) - proving
+// validateCompleteDataRowFrame's checks, not merely protocol.ParseDataRow's
+// own body parsing, are exercised.
 func FuzzMaskDataRow(f *testing.F) {
-	f.Add([]byte{0, 2, 0, 0, 0, 1, 'a', 0xFF, 0xFF, 0xFF, 0xFF}, 2, 0, "email", int16(0))
-	f.Add([]byte{0, 0}, 0, 0, "", int16(0))
-	f.Add([]byte{}, 1, 5, "x", int16(1))
+	f.Add([]byte{0, 2, 0, 0, 0, 1, 'a', 0xFF, 0xFF, 0xFF, 0xFF}, 2, 0, "email", int16(0), byte(0), []byte{})
+	f.Add([]byte{0, 0}, 0, 0, "", int16(0), byte(1), []byte{'D', 0, 0, 0, 4})
+	f.Add([]byte{}, 1, 5, "x", int16(1), byte(2), []byte{})
+	f.Add([]byte{0, 1, 0, 0, 0, 1, 'a'}, 1, 0, "email", int16(0), byte(3), []byte{})
+	f.Add([]byte{0, 1, 0, 0, 0, 1, 'a'}, 1, 0, "email", int16(0), byte(4), []byte{1, 2, 3})
+	f.Add([]byte{0, 1, 0, 0, 0, 1, 'a'}, 1, 0, "email", int16(0), byte(5), []byte{})
 
-	f.Fuzz(func(t *testing.T, body []byte, columnCount int, targetIndex int, columnName string, formatCode int16) {
+	f.Fuzz(func(t *testing.T, body []byte, columnCount int, targetIndex int, columnName string, formatCode int16, corruptionMode byte, rawFrame []byte) {
 		if columnCount < -8 || columnCount > 64 {
 			return
 		}
-		frame := make([]byte, 0, len(body)+5)
-		frame = append(frame, 'D')
+		if len(rawFrame) > 4096 || len(body) > 4096 {
+			return
+		}
+
+		wellFormed := make([]byte, 0, len(body)+5)
+		wellFormed = append(wellFormed, 'D')
 		lenBuf := make([]byte, 4)
 		total := uint32(len(body) + 4)
 		lenBuf[0] = byte(total >> 24)
 		lenBuf[1] = byte(total >> 16)
 		lenBuf[2] = byte(total >> 8)
 		lenBuf[3] = byte(total)
-		frame = append(frame, lenBuf...)
-		frame = append(frame, body...)
+		wellFormed = append(wellFormed, lenBuf...)
+		wellFormed = append(wellFormed, body...)
+
+		var frame []byte
+		switch corruptionMode % 6 {
+		case 0: // well-formed frame, arbitrary body content - deep coverage
+			frame = wellFormed
+		case 1: // completely arbitrary bytes
+			frame = rawFrame
+		case 2: // wrong message tag
+			frame = append([]byte{}, wellFormed...)
+			if len(frame) > 0 {
+				frame[0] = 'T'
+			}
+		case 3: // corrupted length field
+			frame = append([]byte{}, wellFormed...)
+			if len(frame) >= 5 {
+				frame[4] ^= 0xFF
+			}
+		case 4: // trailing bytes / a second frame appended
+			frame = append(append([]byte{}, wellFormed...), rawFrame...)
+		case 5: // truncated body
+			frame = append([]byte{}, wellFormed...)
+			if n := len(frame); n > 0 {
+				cut := int(formatCode) % (n + 1)
+				if cut < 0 {
+					cut = -cut
+				}
+				if cut > n {
+					cut = n
+				}
+				frame = frame[:n-cut]
+			}
+		}
 
 		plan := RowMaskPlan{ColumnCount: columnCount, Targets: []MaskTarget{{Index: targetIndex, ColumnName: columnName, FormatCode: formatCode}}}
 		masker := emailLikeMasker()
@@ -333,6 +561,11 @@ func FuzzMaskDataRow(f *testing.F) {
 		declared := uint32(out[1])<<24 | uint32(out[2])<<16 | uint32(out[3])<<8 | uint32(out[4])
 		if int(declared)+1 != len(out) {
 			t.Fatalf("output frame length field inconsistent with actual length: declared=%d actual=%d", declared, len(out))
+		}
+		// A successful output must itself pass the same complete-frame
+		// validation MaskDataRow applies to its input (self-consistency).
+		if _, verr := validateCompleteDataRowFrame(out); verr != nil {
+			t.Fatalf("MaskDataRow produced an output that fails its own frame validation: %v", verr)
 		}
 	})
 }

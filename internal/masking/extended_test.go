@@ -139,6 +139,49 @@ func TestExtendedTracker_StatementDescribe_NoData_CachesKnownNoData(t *testing.T
 	if len(plan.Targets) != 0 {
 		t.Fatalf("expected an empty plan for known-NoData, got %+v", plan)
 	}
+	if !plan.KnownNoData {
+		t.Fatal("expected the resolved plan to preserve KnownNoData=true, not an ordinary empty plan")
+	}
+}
+
+func TestExtendedTracker_PortalDescribe_NoData_ResolvesToKnownNoDataPlan(t *testing.T) {
+	tr := newTracker(t, true, []string{"email"})
+	gen := protocol.GenerationID(1)
+	if err := tr.ObservePortalDescribeNoData(gen); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	plan, err := tr.ResolveExecutePlan(gen, protocol.NoGeneration, nil)
+	if err != nil {
+		t.Fatalf("expected known-NoData to allow Execute, got error: %v", err)
+	}
+	if !plan.KnownNoData {
+		t.Fatal("expected the resolved portal plan to preserve KnownNoData=true")
+	}
+	if len(plan.Targets) != 0 {
+		t.Fatalf("expected no targets for a known-NoData plan, got %+v", plan.Targets)
+	}
+}
+
+func TestExtendedTracker_KnownRowShapeWithNoTargets_IsNotKnownNoData(t *testing.T) {
+	// A legitimate row-producing shape with zero configured masking
+	// targets must NOT be confused with KnownNoData - it still relays
+	// DataRows unchanged (bkz. row_mask.go), it just has no masking
+	// obligation.
+	tr := newTracker(t, true, []string{"nonexistent_column"})
+	gen := protocol.GenerationID(1)
+	if err := tr.ObserveStatementDescribeRowDescription(gen, rowDescBody(idAndEmailFields(0))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	plan, err := tr.ResolveExecutePlan(protocol.NoGeneration, gen, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if plan.KnownNoData {
+		t.Fatal("expected a known row shape (even with zero targets) NOT to be KnownNoData")
+	}
+	if len(plan.Targets) != 0 {
+		t.Fatalf("expected no targets, got %+v", plan.Targets)
+	}
 }
 
 func TestExtendedTracker_PortalDescribe_RowDescription_CachesActualFormats(t *testing.T) {
@@ -552,4 +595,104 @@ func FuzzExtendedTracker(f *testing.F) {
 			t.Fatal("expected portal shape/plan retired")
 		}
 	})
+}
+
+// --- Plan deep-copy isolation (bkz. gorev 4) -------------------------------
+
+func TestExtendedTracker_CommitExecutePlan_DeepCopiesInput(t *testing.T) {
+	tr := newTracker(t, true, []string{"email"})
+	portalGen := protocol.GenerationID(1)
+
+	original := RowMaskPlan{
+		ColumnCount: 3,
+		Targets: []MaskTarget{
+			{Index: 0, ColumnName: "email", FormatCode: 0},
+			{Index: 2, ColumnName: "secondary", FormatCode: 0},
+		},
+	}
+	if err := tr.CommitExecutePlan(portalGen, original); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Mutate the CALLER's original slice/values after commit.
+	original.Targets[0].Index = 99
+	original.Targets[0].ColumnName = "MUTATED"
+	original.Targets[0].FormatCode = 1
+	original.Targets[1].ColumnName = "ALSO_MUTATED"
+
+	got, ok := tr.LookupExecutePlan(portalGen)
+	if !ok {
+		t.Fatal("expected the plan to be found")
+	}
+	if got.Targets[0].Index != 0 || got.Targets[0].ColumnName != "email" || got.Targets[0].FormatCode != 0 {
+		t.Fatalf("expected stored plan unaffected by post-commit mutation of the caller's original, got %+v", got.Targets[0])
+	}
+	if got.Targets[1].ColumnName != "secondary" {
+		t.Fatalf("expected stored plan's second target unaffected, got %+v", got.Targets[1])
+	}
+}
+
+func TestExtendedTracker_LookupExecutePlan_ReturnsIndependentCopy(t *testing.T) {
+	tr := newTracker(t, true, []string{"email"})
+	portalGen := protocol.GenerationID(1)
+
+	if err := tr.CommitExecutePlan(portalGen, RowMaskPlan{
+		ColumnCount: 2,
+		Targets:     []MaskTarget{{Index: 1, ColumnName: "email", FormatCode: 0}},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	first, ok := tr.LookupExecutePlan(portalGen)
+	if !ok {
+		t.Fatal("expected the plan to be found")
+	}
+
+	// Mutate the LOOKED-UP plan's slice.
+	first.Targets[0].Index = 999
+	first.Targets[0].ColumnName = "MUTATED"
+	first.ColumnCount = 12345
+
+	second, ok := tr.LookupExecutePlan(portalGen)
+	if !ok {
+		t.Fatal("expected the plan to still be found")
+	}
+	if second.Targets[0].Index != 1 || second.Targets[0].ColumnName != "email" {
+		t.Fatalf("expected internal tracker state unaffected by mutation of a looked-up plan, got %+v", second.Targets[0])
+	}
+	if second.ColumnCount != 2 {
+		t.Fatalf("expected internal ColumnCount unaffected, got %d", second.ColumnCount)
+	}
+
+	// The two independently-obtained copies must not alias each other
+	// either.
+	if len(first.Targets) > 0 && len(second.Targets) > 0 {
+		first.Targets[0].ColumnName = "YET_AGAIN"
+		if second.Targets[0].ColumnName == "YET_AGAIN" {
+			t.Fatal("expected two separate LookupExecutePlan calls to return non-aliased slices")
+		}
+	}
+}
+
+func TestExtendedTracker_PlanMutation_DoesNotAffectCapacityAccounting(t *testing.T) {
+	tr, err := NewExtendedTracker(NewConfig(true, nil), ExtendedLimits{MaxStatementShapes: 10, MaxPortalShapes: 1, MaxFieldsPerShape: 10, MaxTotalShapeFields: 100})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	portalGen := protocol.GenerationID(1)
+	plan := RowMaskPlan{ColumnCount: 1, Targets: []MaskTarget{{Index: 0, ColumnName: "email"}}}
+	if err := tr.CommitExecutePlan(portalGen, plan); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got, _ := tr.LookupExecutePlan(portalGen)
+	got.Targets = append(got.Targets, MaskTarget{Index: 5, ColumnName: "injected"})
+
+	// A second, DIFFERENT portal must still be rejected by the SAME
+	// MaxPortalShapes=1 limit - proving the mutation of a looked-up plan's
+	// slice never altered the tracker's own accounting.
+	err = tr.CommitExecutePlan(protocol.GenerationID(2), RowMaskPlan{})
+	if !errors.Is(err, ErrExtendedCapacityExceeded) {
+		t.Fatalf("expected capacity still exhausted (mutation must not have leaked in), got %v", err)
+	}
 }

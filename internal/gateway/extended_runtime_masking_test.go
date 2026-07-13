@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +91,13 @@ type fakeMasker struct {
 	// honor context cancellation").
 	entered chan struct{}
 	block   bool
+	// waitBeforeReturn, if non-nil, is waited on AFTER ctx.Done() fires
+	// but BEFORE Mask actually returns ctx.Err() - used to deterministically
+	// prove "cause X linearized BEFORE the Masker returned" without a
+	// sleep: a test closes waitBeforeReturn only after observing (via
+	// ExtendedRuntime.onWatcherShutdownBegun) that the OTHER cause has
+	// already won the shutdown-cause race.
+	waitBeforeReturn chan struct{}
 }
 
 func (f *fakeMasker) Mask(ctx context.Context, column, kind, value string) (string, bool, string, error) {
@@ -112,6 +120,9 @@ func (f *fakeMasker) Mask(ctx context.Context, column, kind, value string) (stri
 			close(f.entered)
 		}
 		<-ctx.Done()
+		if f.waitBeforeReturn != nil {
+			<-f.waitBeforeReturn
+		}
 		return "", false, "", ctx.Err()
 	}
 
@@ -297,6 +308,107 @@ func TestExtendedRuntime_Masking_StatementDescribeNoData_AllowsExecute(t *testin
 
 func mustRegisterForwardErr(rt *ExtendedRuntime, ctx context.Context, req FrontendOperationRequest, frame []byte) (FrontendRegistration, error) {
 	return rt.RegisterAndForwardFrontendOperation(ctx, req, frame)
+}
+
+// TestExtendedRuntime_Masking_StatementNoData_UnexpectedDataRow_FailsTerminal
+// proves the defense-in-depth guarantee from gorev 3: even though the
+// correlator/sequencer layer alone cannot rule out a (protocol-impossible,
+// e.g. hostile-backend) DataRow arriving for a portal whose underlying
+// statement was Described as NoData, the masking layer's committed
+// KnownNoData plan rejects it fail-closed rather than silently relaying it
+// as an ordinary unmasked row.
+func TestExtendedRuntime_Masking_StatementNoData_UnexpectedDataRow_FailsTerminal(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	masker := emailLikeFakeMasker()
+	rt := newMaskingTestRuntime(t, newDuplexBackend(backendR), client, masking.NewConfig(true, []string{"email"}), masker)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	mustRegisterForward(t, ctx, rt, parseReq("s1", "UPDATE users SET x=1", nil), feParseFrame("s1", "UPDATE users SET x=1", nil))
+	backendW.Write(emptyFrame(protocol.MsgParseComplete))
+	waitForBytes(t, client, emptyFrame(protocol.MsgParseComplete))
+
+	mustRegisterForward(t, ctx, rt, describeStmtReq("s1"), feDescribeFrame(protocol.TargetStatement, "s1"))
+	backendW.Write(beParameterDescriptionFrame(nil))
+	backendW.Write(beNoDataFrame())
+	want := append(append([]byte{}, emptyFrame(protocol.MsgParseComplete)...), append(beParameterDescriptionFrame(nil), beNoDataFrame()...)...)
+	waitForBytes(t, client, want)
+
+	mustRegisterForward(t, ctx, rt, bindReq("p1", "s1", nil, nil, nil), feBindFrame("p1", "s1", nil, nil, nil))
+	backendW.Write(emptyFrame(protocol.MsgBindComplete))
+	want = append(want, emptyFrame(protocol.MsgBindComplete)...)
+	waitForBytes(t, client, want)
+
+	if _, err := mustRegisterForwardErr(rt, ctx, executeReq("p1"), feExecuteFrame("p1", 0)); err != nil {
+		t.Fatalf("expected known-NoData to allow Execute, got %v", err)
+	}
+
+	prefix := client.Snapshot()
+	dr := beDataRowFrame([]protocol.DataCell{{Value: []byte("SECRET_IMPOSSIBLE_ROW_MARKER")}})
+	backendW.Write(dr)
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrExtendedMaskingFailed) {
+		t.Fatalf("expected ErrExtendedMaskingFailed, got %v", runErr)
+	}
+	got := client.Snapshot()
+	if bytes.Contains(got, dr) {
+		t.Fatal("expected the unexpected DataRow never written to the client")
+	}
+	if !bytes.HasPrefix(got, prefix) || len(got) <= len(prefix) || protocol.MessageType(got[len(prefix)]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected exactly one FATAL ErrorResponse appended after the earlier valid frames, got %x", got[len(prefix):])
+	}
+}
+
+// TestExtendedRuntime_Masking_PortalNoData_UnexpectedDataRow_FailsTerminal
+// is the portal-level equivalent (portal Describe itself reports NoData,
+// not merely the underlying statement).
+func TestExtendedRuntime_Masking_PortalNoData_UnexpectedDataRow_FailsTerminal(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	masker := emailLikeFakeMasker()
+	rt := newMaskingTestRuntime(t, newDuplexBackend(backendR), client, masking.NewConfig(true, []string{"email"}), masker)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	mustRegisterForward(t, ctx, rt, parseReq("s1", "SELECT 1", nil), feParseFrame("s1", "SELECT 1", nil))
+	backendW.Write(emptyFrame(protocol.MsgParseComplete))
+	waitForBytes(t, client, emptyFrame(protocol.MsgParseComplete))
+
+	mustRegisterForward(t, ctx, rt, bindReq("p1", "s1", nil, nil, nil), feBindFrame("p1", "s1", nil, nil, nil))
+	backendW.Write(emptyFrame(protocol.MsgBindComplete))
+	want := append(append([]byte{}, emptyFrame(protocol.MsgParseComplete)...), emptyFrame(protocol.MsgBindComplete)...)
+	waitForBytes(t, client, want)
+
+	mustRegisterForward(t, ctx, rt, describePortalReq("p1"), feDescribeFrame(protocol.TargetPortal, "p1"))
+	backendW.Write(beNoDataFrame())
+	want = append(want, beNoDataFrame()...)
+	waitForBytes(t, client, want)
+
+	if _, err := mustRegisterForwardErr(rt, ctx, executeReq("p1"), feExecuteFrame("p1", 0)); err != nil {
+		t.Fatalf("expected known-NoData to allow Execute, got %v", err)
+	}
+
+	prefix := client.Snapshot()
+	dr := beDataRowFrame([]protocol.DataCell{{Value: []byte("SECRET_IMPOSSIBLE_ROW_MARKER")}})
+	backendW.Write(dr)
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrExtendedMaskingFailed) {
+		t.Fatalf("expected ErrExtendedMaskingFailed, got %v", runErr)
+	}
+	got := client.Snapshot()
+	if bytes.Contains(got, dr) {
+		t.Fatal("expected the unexpected DataRow never written to the client")
+	}
+	if !bytes.HasPrefix(got, prefix) || len(got) <= len(prefix) || protocol.MessageType(got[len(prefix)]) != protocol.MsgErrorResponse {
+		t.Fatalf("expected exactly one FATAL ErrorResponse appended after the earlier valid frames, got %x", got[len(prefix):])
+	}
 }
 
 func TestExtendedRuntime_Masking_PortalDescribeTakesPrecedenceOverStatement(t *testing.T) {
@@ -827,5 +939,232 @@ func TestExtendedRuntime_Masking_ParentCancellation_InterruptsBlockedMasker(t *t
 	}
 	if masker.lastCtx == nil || masker.lastCtx.Err() == nil {
 		t.Fatal("expected the context passed to Masker to be canceled")
+	}
+}
+
+// ==========================================================================
+// Masking-failure causality linearization (bkz. gorev 5)
+// ==========================================================================
+
+// armableBlockingWriter wraps a *trackingWriter: while unarmed it behaves
+// identically (writes captured normally); once Arm() is called, the NEXT
+// Write blocks until Close() is invoked (simulating a real connection being
+// torn down by the runtime's shutdown watcher unblocking a stalled Write) -
+// used to deterministically catch the event loop genuinely blocked inside
+// a FATAL write.
+type armableBlockingWriter struct {
+	*trackingWriter
+	armed        atomic.Bool
+	enteredWrite chan struct{}
+	unblock      chan struct{}
+	unblockOnce  sync.Once
+}
+
+func newArmableBlockingWriter() *armableBlockingWriter {
+	return &armableBlockingWriter{
+		trackingWriter: newTrackingWriter(),
+		enteredWrite:   make(chan struct{}, 1),
+		unblock:        make(chan struct{}),
+	}
+}
+
+func (w *armableBlockingWriter) Arm() { w.armed.Store(true) }
+
+func (w *armableBlockingWriter) Write(p []byte) (int, error) {
+	if w.armed.Load() {
+		select {
+		case w.enteredWrite <- struct{}{}:
+		default:
+		}
+		<-w.unblock
+		return 0, errors.New("test: write interrupted by connection close")
+	}
+	return w.trackingWriter.Write(p)
+}
+
+func (w *armableBlockingWriter) Close() error {
+	w.unblockOnce.Do(func() { close(w.unblock) })
+	return w.trackingWriter.Close()
+}
+
+// TestExtendedRuntime_Masking_Causality_MaskingFailureFirst_LaterParentCancelDoesNotReplaceIt
+// covers: genuine masking failure first, FATAL Write blocks, parent
+// cancellation later unblocks it - masking failure remains primary.
+func TestExtendedRuntime_Masking_Causality_MaskingFailureFirst_LaterParentCancelDoesNotReplaceIt(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendR.Close()
+	client := newArmableBlockingWriter()
+	masker := &fakeMasker{maskFunc: func(column, value string) (string, bool, error) {
+		return "", false, errors.New("plugin crashed")
+	}}
+	rt := newMaskingTestRuntime(t, newDuplexBackend(backendR), client, masking.NewConfig(true, []string{"email"}), masker)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	setupMaskingExecuteHead(t, ctx, rt, backendW, client.trackingWriter, "s1", "p1", []maskTestField{{"email", 0}})
+
+	client.Arm() // the NEXT write (the FATAL) will block until Close()
+	backendW.Write(beDataRowFrame([]protocol.DataCell{{Value: []byte("x@example.com")}}))
+
+	select {
+	case <-client.enteredWrite:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the FATAL write to begin")
+	}
+
+	// Parent cancellation races in WHILE the FATAL write is genuinely
+	// blocked - it must NOT win shutdown-cause linearization: the masking
+	// failure already claimed it before attempting the write.
+	cancel()
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrExtendedMaskingFailed) {
+		t.Fatalf("expected the masking failure to remain the primary cause, got %v", runErr)
+	}
+	if errors.Is(runErr, context.Canceled) {
+		t.Fatal("expected context.Canceled NOT to have replaced the masking failure as primary")
+	}
+}
+
+// TestExtendedRuntime_Masking_Causality_ParentCancelFirst_ContextCauseRemainsPrimary
+// covers: parent cancellation first, context-aware Masker returns because
+// of cancellation - context cause remains primary, and the masking FATAL
+// write is never even attempted. The Masker's return is deterministically
+// gated on onWatcherShutdownBegun (fired at the END of the watcher's
+// shutdown-cause claim) so the watcher's CAS is GUARANTEED to have already
+// won before the event loop ever reaches emitMaskingFailureFatal.
+func TestExtendedRuntime_Masking_Causality_ParentCancelFirst_ContextCauseRemainsPrimary(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	watcherClaimed := make(chan struct{})
+	masker := &fakeMasker{block: true, entered: make(chan struct{}), waitBeforeReturn: watcherClaimed}
+	rt := newMaskingTestRuntime(t, newDuplexBackend(backendR), client, masking.NewConfig(true, []string{"email"}), masker)
+	rt.onWatcherShutdownBegun = func() { close(watcherClaimed) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	setupMaskingExecuteHead(t, ctx, rt, backendW, client, "s1", "p1", []maskTestField{{"email", 0}})
+	backendW.Write(beDataRowFrame([]protocol.DataCell{{Value: []byte("x@example.com")}}))
+
+	select {
+	case <-masker.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the Masker to be invoked")
+	}
+
+	prefix := client.Snapshot()
+	cancel() // parent cancellation FIRST - the watcher claims shutdownCause
+	// BEFORE the (gated) Masker call is allowed to actually return.
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("expected context.Canceled to remain primary, got %v", runErr)
+	}
+	if errors.Is(runErr, ErrExtendedMaskingFailed) {
+		t.Fatal("expected the masking failure NOT to have become primary")
+	}
+	// No FATAL ErrorResponse must have been attempted at all.
+	got := client.Snapshot()
+	for off := len(prefix); off+5 <= len(got); {
+		if protocol.MessageType(got[off]) == protocol.MsgErrorResponse {
+			t.Fatalf("expected no FATAL ErrorResponse to be attempted, got %x", got[len(prefix):])
+		}
+		length := binary.BigEndian.Uint32(got[off+1 : off+5])
+		off += 1 + int(length)
+	}
+}
+
+// TestExtendedRuntime_Masking_Causality_FrontendCloseFirst_FrontendCauseRemainsPrimary
+// covers: frontend closure first, context-aware Masker exits - frontend-
+// close cause remains primary. Uses the SAME onWatcherShutdownBegun gate
+// (fired at the end of beginFrontendShutdown too).
+func TestExtendedRuntime_Masking_Causality_FrontendCloseFirst_FrontendCauseRemainsPrimary(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	watcherClaimed := make(chan struct{})
+	masker := &fakeMasker{block: true, entered: make(chan struct{}), waitBeforeReturn: watcherClaimed}
+	rt := newMaskingTestRuntime(t, newDuplexBackend(backendR), client, masking.NewConfig(true, []string{"email"}), masker)
+	rt.onWatcherShutdownBegun = func() { close(watcherClaimed) }
+
+	ctx := context.Background()
+	done := runInBackground(t, rt, ctx)
+
+	setupMaskingExecuteHead(t, ctx, rt, backendW, client, "s1", "p1", []maskTestField{{"email", 0}})
+	backendW.Write(beDataRowFrame([]protocol.DataCell{{Value: []byte("x@example.com")}}))
+
+	select {
+	case <-masker.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the Masker to be invoked")
+	}
+
+	go func() { _ = rt.NotifyFrontendClosed(context.Background(), FrontendClosedEOF, nil) }()
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrFrontendClosed) {
+		t.Fatalf("expected ErrFrontendClosed to remain primary, got %v", runErr)
+	}
+	if errors.Is(runErr, ErrExtendedMaskingFailed) {
+		t.Fatal("expected the masking failure NOT to have become primary")
+	}
+}
+
+// TestExtendedRuntime_Masking_Causality_FatalWriteFailureDoesNotReplaceMaskingCause
+// covers: FATAL write failure (an immediate error, not a block) must not
+// replace the masking failure as the primary cause.
+func TestExtendedRuntime_Masking_Causality_FatalWriteFailureDoesNotReplaceMaskingCause(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	masker := &fakeMasker{maskFunc: func(column, value string) (string, bool, error) {
+		return "", false, errors.New("plugin crashed")
+	}}
+	rt := newMaskingTestRuntime(t, newDuplexBackend(backendR), client, masking.NewConfig(true, []string{"email"}), masker)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	setupMaskingExecuteHead(t, ctx, rt, backendW, client, "s1", "p1", []maskTestField{{"email", 0}})
+
+	client.writeErrOnce = errors.New("test: simulated FATAL write failure")
+	backendW.Write(beDataRowFrame([]protocol.DataCell{{Value: []byte("x@example.com")}}))
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrExtendedMaskingFailed) {
+		t.Fatalf("expected the masking failure to remain primary even though its own FATAL write failed, got %v", runErr)
+	}
+}
+
+// TestExtendedRuntime_Masking_Causality_FatalOutputAttemptedAtMostOnce proves
+// exactly one write attempt is made for the FATAL frame - processActions
+// stops at the first masking failure, so no later action (and no repeated
+// FATAL attempt) can ever be processed.
+func TestExtendedRuntime_Masking_Causality_FatalOutputAttemptedAtMostOnce(t *testing.T) {
+	backendR, backendW := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	masker := &fakeMasker{maskFunc: func(column, value string) (string, bool, error) {
+		return "", false, errors.New("plugin crashed")
+	}}
+	rt := newMaskingTestRuntime(t, newDuplexBackend(backendR), client, masking.NewConfig(true, []string{"email"}), masker)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	setupMaskingExecuteHead(t, ctx, rt, backendW, client, "s1", "p1", []maskTestField{{"email", 0}})
+
+	writesBefore := client.WriteCount()
+	backendW.Write(beDataRowFrame([]protocol.DataCell{{Value: []byte("x@example.com")}}))
+
+	runErr := waitDone(t, done)
+	if !errors.Is(runErr, ErrExtendedMaskingFailed) {
+		t.Fatalf("expected ErrExtendedMaskingFailed, got %v", runErr)
+	}
+	if got := client.WriteCount() - writesBefore; got != 1 {
+		t.Fatalf("expected exactly 1 additional write (the FATAL frame), got %d", got)
 	}
 }

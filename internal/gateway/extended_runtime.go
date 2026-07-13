@@ -197,6 +197,12 @@ var (
 	// yanitinin guvenlik hatasidir. Hicbir SQL/isim/deger/ham cerceve
 	// icermez.
 	ErrExtendedMaskingFailed = errors.New("extendedruntime: yanit maskelenirken kurtarilamaz bir hata olustu, baglanti guvenlik icin kapatildi")
+	// ErrNoCommittedMaskPlan, bir Execute'a ait DataRow icin ExtendedTracker'da
+	// TAAHHUT EDILMIS bir effective maskeleme plani bulunamadiginda donulur
+	// (bkz. gorev 12: "fail closed if masking is enabled and no plan
+	// exists") - HER ZAMAN ErrExtendedMaskingFailed'e sarilarak kullanilir,
+	// hicbir SQL/isim/deger icermez.
+	ErrNoCommittedMaskPlan = errors.New("extendedruntime: DataRow icin taahhut edilmis maskeleme plani yok")
 )
 
 // Extended maskeleme hatasi FATAL ErrorResponse'u icin SABIT, guvenli
@@ -709,9 +715,12 @@ const (
 // CompareAndSwap oldugundan, daha once baska bir neden (ozellikle
 // shutdownCauseParentCtx) zaten kaydedilmisse bu cagri sessizce no-op'tur;
 // boylece GERCEKTEN daha once gerceklesen ic hata, SONRA gelen bir parent
-// ctx iptalinin CAS'i tarafindan asla ustune yazilamaz.
-func (r *ExtendedRuntime) markInternalShutdown() {
-	r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseInternal))
+// ctx iptalinin CAS'i tarafindan asla ustune yazilamaz. Donen bool, BU
+// cagrinin CAS'i KAZANIP KAZANMADIGINI bildirir - emitMaskingFailureFatal
+// (bkz. gorev 5) bunu, olasi bloklu bir FATAL yazimindan ONCE nedenselligi
+// dogrusallastirmak icin kullanir.
+func (r *ExtendedRuntime) markInternalShutdown() bool {
+	return r.shutdownCause.CompareAndSwap(int32(shutdownCauseNone), int32(shutdownCauseInternal))
 }
 
 // markParentShutdown, kapanmayi BASLATAN nedenin ust (parent) ctx'in
@@ -1744,7 +1753,7 @@ func (r *ExtendedRuntime) portalResultFormatsForMasking(gen protocol.GenerationI
 func (r *ExtendedRuntime) transformDataRowAction(a protocol.OutputAction) ([]byte, error) {
 	plan, ok := r.maskTracker.LookupExecutePlan(a.TargetGeneration)
 	if !ok {
-		return nil, fmt.Errorf("extendedruntime: DataRow icin taahhut edilmis maskeleme plani yok")
+		return nil, ErrNoCommittedMaskPlan
 	}
 	ctx := r.runCtx
 	if ctx == nil {
@@ -1758,14 +1767,43 @@ func (r *ExtendedRuntime) transformDataRowAction(a protocol.OutputAction) ([]byt
 }
 
 // emitMaskingFailureFatal, gercek bir backend yaniti islenirken olusan bir
-// maskeleme hatasindan sonra client'a TEK, TAM, SABIT bir FATAL
-// ErrorResponse yazar ve maskeleme hatasini (cause SARILMIS olarak)
-// Run'in birincil hatasi olarak dondurur (bkz. gorev 13). FATAL yazimi
-// BASARISIZ olsa BILE donen birincil hata HER ZAMAN maskeleme hatasidir -
-// ikincil bir client-yazma hatasiyla ASLA degistirilmez/ustune yazilmaz.
-// Bu, ResponseSequencer'dan GECMEZ (yerel bir sentetik ret DEGILDIR).
+// maskeleme hatasindan sonra client'a EN FAZLA BIR KEZ, TAM, SABIT bir
+// FATAL ErrorResponse yazmaya calisir ve maskeleme hatasini (cause SARILMIS
+// olarak) Run'in birincil hatasi olarak dondurur (bkz. gorev 13). Bu,
+// ResponseSequencer'dan GECMEZ (yerel bir sentetik ret DEGILDIR).
+//
+// Nedensellik dogrusallastirmasi (bkz. gorev 5): FATAL yazimi (Bloklu
+// olabilir - client baglantisi yavas/durmus olabilir) DENENMEDEN ONCE,
+// r.markInternalShutdown() cagrilir - bu, bu maskeleme hatasinin
+// shutdownCause'u KAZANIP KAZANMADIGINI (yani GERCEKTEN birincil neden
+// olup olmadigini) ATOMIK olarak belirler:
+//
+//   - CAS KAZANILIRSA: bu maskeleme hatasi GERCEKTEN ilk (birincil) nedendir
+//   - nedeni dogrusallastirdiktan HEMEN SONRA FATAL yazimi denenir. Bu
+//     noktadan sonra baslayan (ör. blokli yazim sirasinda araya giren) bir
+//     parent ctx iptali/frontend kapanmasi, shutdownCause ZATEN Internal
+//     oldugundan kendi CAS'ini KAYBEDER - ErrExtendedMaskingFailed asla
+//     ustune yazilmaz.
+//   - CAS KAYBEDILIRSE: baska bir neden (parent ctx iptali ya da frontend
+//     kapanmasi) BU cagridan ONCE ZATEN dogrusallasmis demektir - o ERKEN
+//     nedenin GERCEK birincil neden olarak KALMASI icin FATAL yazimi HIC
+//     DENENMEZ (baglanti zaten BASKA bir nedenle kapatma surecinde) ve
+//     alttaki writeAll cagrisi atlanir.
+//
+// Her iki durumda da donen primary, YALNIZCA bu cagrinin KENDI donus
+// degeridir - Run()'un kesin birincil hatayi hangi shutdownCause'un
+// KAZANDIGINA gore (bkz. Run, "primaryErr := loopErr; switch
+// shutdownCause...") COZMESI zaten mevcut, degismeyen mekanizmadir; bu
+// fonksiyon o mekanizmayi ATLAMAZ, yalnizca YARIS PENCERESINI kapatir.
 func (r *ExtendedRuntime) emitMaskingFailureFatal(cause error) error {
 	primary := fmt.Errorf("%w: %w", ErrExtendedMaskingFailed, cause)
+	if !r.markInternalShutdown() {
+		// Baska bir neden (parent ctx / frontend kapanmasi) BU maskeleme
+		// hatasindan ONCE zaten dogrusallasti - o erken nedenin birincil
+		// olarak KALMASI icin FATAL yazimini hic denemeden dogrudan
+		// donuyoruz (bkz. yukaridaki doc yorumu).
+		return primary
+	}
 	frame := protocol.BuildErrorResponse("FATAL", sqlStateExtendedMaskingFailed, reasonExtendedMaskingFailed)
 	_ = writeAll(r.client, frame)
 	return primary

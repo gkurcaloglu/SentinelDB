@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +52,14 @@ func startupParamBody(pairs ...string) []byte {
 func startupMessageFrame(major, minor int16, pairs ...string) []byte {
 	version := uint32(uint16(major))<<16 | uint32(uint16(minor))
 	return startupFrame(version, startupParamBody(pairs...))
+}
+
+// startupMessageFrameRaw builds a StartupMessage frame around a caller-
+// supplied RAW parameter body - used to construct deliberately malformed
+// parameter areas that startupParamBody's pairs-based API cannot express.
+func startupMessageFrameRaw(major, minor int16, rawParamBody []byte) []byte {
+	version := uint32(uint16(major))<<16 | uint32(uint16(minor))
+	return startupFrame(version, rawParamBody)
 }
 
 // --- Test helpers: normal (tag+length) frame builders for auth/startup ----
@@ -180,6 +190,30 @@ func writeFrame(t *testing.T, conn net.Conn, frame []byte) {
 	if _, err := conn.Write(frame); err != nil {
 		t.Fatalf("unexpected write error: %v", err)
 	}
+}
+
+func assertNoClientBytes(t *testing.T, h *handoffHarness) {
+	t.Helper()
+	h.clientTest.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	buf := make([]byte, 1)
+	if _, err := h.clientTest.Read(buf); err == nil {
+		t.Fatal("expected no bytes written to the client")
+	}
+}
+
+func assertNoBackendBytes(t *testing.T, h *handoffHarness) {
+	t.Helper()
+	h.backendTest.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	buf := make([]byte, 1)
+	if _, err := h.backendTest.Read(buf); err == nil {
+		t.Fatal("expected no bytes forwarded to the backend")
+	}
+}
+
+func assertNoBytesForwarded(t *testing.T, h *handoffHarness) {
+	t.Helper()
+	assertNoBackendBytes(t, h)
+	assertNoClientBytes(t, h)
 }
 
 // ==========================================================================
@@ -375,7 +409,7 @@ func TestStartupHandoff_SSLRequest_RepliesN_NeverReachesBackend(t *testing.T) {
 		t.Fatalf("expected 'N', got %q", got)
 	}
 
-	sm := startupMessageFrame(3, 0)
+	sm := startupMessageFrame(3, 0, "user", "alice")
 	writeFrame(t, h.clientTest, sm)
 	gotBackend := readExactly(t, h.backendTest, len(sm))
 	if !bytes.Equal(gotBackend, sm) {
@@ -401,7 +435,7 @@ func TestStartupHandoff_GSSENCRequest_RepliesN_NeverReachesBackend(t *testing.T)
 		t.Fatalf("expected 'N', got %q", got)
 	}
 
-	sm := startupMessageFrame(3, 0)
+	sm := startupMessageFrame(3, 0, "user", "alice")
 	writeFrame(t, h.clientTest, sm)
 	gotBackend := readExactly(t, h.backendTest, len(sm))
 	if !bytes.Equal(gotBackend, sm) {
@@ -427,7 +461,7 @@ func TestStartupHandoff_RepeatedSSLProbes_AllReceiveN(t *testing.T) {
 			t.Fatalf("probe %d: expected 'N', got %q", i, got)
 		}
 	}
-	sm := startupMessageFrame(3, 0)
+	sm := startupMessageFrame(3, 0, "user", "alice")
 	writeFrame(t, h.clientTest, sm)
 	readExactly(t, h.backendTest, len(sm))
 	writeFrame(t, h.backendTest, authOkFrame())
@@ -715,14 +749,17 @@ func TestStartupHandoff_UnsupportedAuthenticationCode_FailsClosed(t *testing.T) 
 
 	gf := authGSSFrame()
 	writeFrame(t, h.backendTest, gf)
-	// The frame is relayed (like every other Authentication* frame) BEFORE
-	// its code is validated - drain it so the handoff's writeAll doesn't
-	// block forever on this synchronous pipe.
-	readExactly(t, h.clientTest, len(gf))
 
 	o := h.waitOutcome()
 	if !errors.Is(o.err, ErrStartupUnsupportedAuth) {
 		t.Fatalf("expected ErrStartupUnsupportedAuth, got %v", o.err)
+	}
+	// Authentication frames are now validated BEFORE relay (bkz. gorev 3) -
+	// an unsupported code must never reach the client at all.
+	h.clientTest.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	buf := make([]byte, 1)
+	if _, err := h.clientTest.Read(buf); err == nil {
+		t.Fatal("expected no bytes relayed to the client for an unsupported authentication code")
 	}
 }
 
@@ -856,8 +893,30 @@ func TestStartupHandoff_NegotiateProtocolVersionRelay(t *testing.T) {
 	}
 }
 
-func TestStartupHandoff_FirstReadyForQueryRelay_AllStatuses(t *testing.T) {
-	for _, status := range []byte{protocol.TxStatusIdle, protocol.TxStatusInTransaction, protocol.TxStatusFailedTransaction} {
+// TestStartupHandoff_FirstReadyForQuery_OnlyIdleSucceeds replaces the
+// former "all three statuses are accepted" test (bkz. gorev 5): a freshly
+// constructed protocol.State/ExtendedRuntime always starts idle, so the
+// FIRST ReadyForQuery that completes a handoff can only ever legitimately
+// report 'I' - 'T'/'E' are impossible for a truly initial ReadyForQuery and
+// must fail closed, never be relayed to the client.
+func TestStartupHandoff_FirstReadyForQuery_OnlyIdleSucceeds(t *testing.T) {
+	t.Run("idle_succeeds", func(t *testing.T) {
+		h := newHandoffHarness(t)
+		defer h.cancel()
+		runToStartupMessage(t, h)
+		writeFrame(t, h.backendTest, authOkFrame())
+		readExactly(t, h.clientTest, len(authOkFrame()))
+
+		o := finishWithReadyForQuery(t, h, protocol.TxStatusIdle)
+		if o.err != nil {
+			t.Fatalf("unexpected error: %v", o.err)
+		}
+		if o.result.ReadyStatus != protocol.TxStatusIdle {
+			t.Fatalf("expected ReadyStatus=%q, got %q", protocol.TxStatusIdle, o.result.ReadyStatus)
+		}
+	})
+
+	for _, status := range []byte{protocol.TxStatusInTransaction, protocol.TxStatusFailedTransaction} {
 		status := status
 		t.Run(string(status), func(t *testing.T) {
 			h := newHandoffHarness(t)
@@ -866,12 +925,16 @@ func TestStartupHandoff_FirstReadyForQueryRelay_AllStatuses(t *testing.T) {
 			writeFrame(t, h.backendTest, authOkFrame())
 			readExactly(t, h.clientTest, len(authOkFrame()))
 
-			o := finishWithReadyForQuery(t, h, status)
-			if o.err != nil {
-				t.Fatalf("unexpected error: %v", o.err)
+			writeFrame(t, h.backendTest, rfqFrame(status))
+			o := h.waitOutcome()
+			if !errors.Is(o.err, ErrStartupProtocolFailure) {
+				t.Fatalf("expected ErrStartupProtocolFailure for a non-idle initial ReadyForQuery (status %q), got %v", status, o.err)
 			}
-			if o.result.ReadyStatus != status {
-				t.Fatalf("expected ReadyStatus=%q, got %q", status, o.result.ReadyStatus)
+			// Must never have been relayed to the client.
+			h.clientTest.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			buf := make([]byte, 1)
+			if _, err := h.clientTest.Read(buf); err == nil {
+				t.Fatalf("expected no bytes relayed to the client for a non-idle initial ReadyForQuery (status %q)", status)
 			}
 		})
 	}
@@ -986,7 +1049,7 @@ func TestStartupHandoff_ContextCancellation_BlockedBackendWrite(t *testing.T) {
 	// The StartupMessage write to the backend blocks because nothing ever
 	// reads it.
 	h := newHandoffHarness(t)
-	writeFrame(t, h.clientTest, startupMessageFrame(3, 0))
+	writeFrame(t, h.clientTest, startupMessageFrame(3, 0, "user", "alice"))
 	time.Sleep(20 * time.Millisecond)
 	h.cancel()
 
@@ -1039,4 +1102,894 @@ func TestStartupHandoff_DeterministicPrimaryCause_InternalBeforeParent(t *testin
 		t.Fatalf("expected the genuine protocol failure to remain primary, got %v", o.err)
 	}
 	h.cancel()
+}
+
+// ==========================================================================
+// Section 1: startup-style request validation (bkz. gorev 1) - arbitrary
+// unrecognized codes/malformed SSLRequest/GSSENCRequest/StartupMessage
+// frames must never be forwarded upstream.
+// ==========================================================================
+
+func TestStartupHandoff_UnsupportedMajorVersion_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	sm := startupMessageFrame(2, 0, "user", "alice") // major version 2 - not major==3
+	writeFrame(t, h.clientTest, sm)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for an unsupported major version, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_MalformedParameterPair_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	raw := []byte("user\x00alice") // value string never terminated
+	writeFrame(t, h.clientTest, startupMessageFrameRaw(3, 0, raw))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a malformed parameter pair, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_MissingFinalTerminator_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	raw := []byte("user\x00alice\x00") // valid pair, but no final terminating NUL
+	writeFrame(t, h.clientTest, startupMessageFrameRaw(3, 0, raw))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a missing final terminator, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_NameWithoutValue_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	raw := []byte("user\x00") // name terminated, but the body ends right there
+	writeFrame(t, h.clientTest, startupMessageFrameRaw(3, 0, raw))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a name without a value, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_TrailingBytesAfterTerminator_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	raw := append(startupParamBody("user", "alice"), []byte("EXTRA")...)
+	writeFrame(t, h.clientTest, startupMessageFrameRaw(3, 0, raw))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for trailing bytes after the terminator, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_MissingUserParameter_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	sm := startupMessageFrame(3, 0, "database", "postgres")
+	writeFrame(t, h.clientTest, sm)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a missing user parameter, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_EmptyUserValue_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	// "user" is structurally present but its value is empty - must not
+	// satisfy the "non-empty" requirement.
+	sm := startupMessageFrame(3, 0, "user", "")
+	writeFrame(t, h.clientTest, sm)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for an empty user value, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_SSLRequest_WrongLength_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	frame := startupFrame(sslRequestCode, []byte{0, 0, 0, 0}) // 4 extra trailing bytes
+	writeFrame(t, h.clientTest, frame)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a wrong-length SSLRequest, got %v", o.err)
+	}
+	assertNoClientBytes(t, h) // no 'N' reply for a malformed probe
+	assertNoBackendBytes(t, h)
+}
+
+func TestStartupHandoff_GSSENCRequest_WrongLength_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	frame := startupFrame(gssEncRequestCode, []byte{0, 0, 0, 0})
+	writeFrame(t, h.clientTest, frame)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a wrong-length GSSENCRequest, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+	assertNoBackendBytes(t, h)
+}
+
+func TestStartupHandoff_ArbitraryUnknownStartupCode_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	// Neither SSL/GSS/Cancel, nor major==3.
+	frame := startupFrame(0x12345678, []byte("whatever"))
+	writeFrame(t, h.clientTest, frame)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for an arbitrary unknown startup code, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+// ==========================================================================
+// Section 2: NegotiateProtocolVersion in both valid phases (bkz. gorev 2)
+// ==========================================================================
+
+func TestStartupHandoff_NegotiateProtocolVersion_FullSASLSequence(t *testing.T) {
+	// The mandatory sequence: StartupMessage -> NegotiateProtocolVersion ->
+	// AuthenticationSASL -> AuthenticationSASLContinue ->
+	// AuthenticationSASLFinal -> AuthenticationOk ->
+	// ParameterStatus/BackendKeyData -> ReadyForQuery.
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	npv := negotiateProtocolVersionFrame()
+	writeFrame(t, h.backendTest, npv)
+	got := readExactly(t, h.clientTest, len(npv))
+	if !bytes.Equal(got, npv) {
+		t.Fatalf("expected NegotiateProtocolVersion relayed before any Authentication message, got %x", got)
+	}
+
+	saslReq := authSASLFrame("SCRAM-SHA-256")
+	writeFrame(t, h.backendTest, saslReq)
+	readExactly(t, h.clientTest, len(saslReq))
+
+	initial := passwordMessageFrame([]byte("SCRAM-SHA-256\x00client-first"))
+	writeFrame(t, h.clientTest, initial)
+	readExactly(t, h.backendTest, len(initial))
+
+	cont := authSASLContinueFrame([]byte("server-first"))
+	writeFrame(t, h.backendTest, cont)
+	readExactly(t, h.clientTest, len(cont))
+
+	resp := passwordMessageFrame([]byte("client-final"))
+	writeFrame(t, h.clientTest, resp)
+	readExactly(t, h.backendTest, len(resp))
+
+	final := authSASLFinalFrame([]byte("server-final"))
+	writeFrame(t, h.backendTest, final)
+	readExactly(t, h.clientTest, len(final))
+
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	ps := paramStatusFrame("server_version", "16.0")
+	writeFrame(t, h.backendTest, ps)
+	readExactly(t, h.clientTest, len(ps))
+
+	bkd := backendKeyDataFrame(1234, 5678)
+	writeFrame(t, h.backendTest, bkd)
+	readExactly(t, h.clientTest, len(bkd))
+
+	o := finishWithReadyForQuery(t, h, protocol.TxStatusIdle)
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+}
+
+func TestStartupHandoff_MalformedNegotiateProtocolVersion_FailsClosed_BeforeAuth(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	// Declares 5 unsupported options but supplies none.
+	body := make([]byte, 8)
+	binary.BigEndian.PutUint32(body[4:8], 5)
+	npv := buildFrame(protocol.MessageType('v'), body)
+	writeFrame(t, h.backendTest, npv)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a malformed NegotiateProtocolVersion, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_MalformedNegotiateProtocolVersion_FailsClosed_AfterAuth(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	body := []byte{0, 0, 0, 0} // too short - missing the option-count field
+	npv := buildFrame(protocol.MessageType('v'), body)
+	writeFrame(t, h.backendTest, npv)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a malformed NegotiateProtocolVersion, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+// ==========================================================================
+// Section 3: authentication state machine (bkz. gorev 3) - impossible
+// sequences and malformed bodies must never be relayed.
+// ==========================================================================
+
+func TestStartupHandoff_SASLContinueBeforeSASL_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authSASLContinueFrame([]byte("x")))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for SASLContinue before SASL, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_SASLFinalBeforeSASL_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authSASLFinalFrame([]byte("x")))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for SASLFinal before SASL, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_SecondInitialMethod_AfterCleartext_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authCleartextFrame())
+	readExactly(t, h.clientTest, len(authCleartextFrame()))
+	pw := passwordMessageFrame([]byte("secret"))
+	writeFrame(t, h.clientTest, pw)
+	readExactly(t, h.backendTest, len(pw))
+
+	// A second "initial method" frame after one has already begun.
+	writeFrame(t, h.backendTest, authMD5Frame([4]byte{1, 2, 3, 4}))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a second initial method, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_CleartextAfterSASLExchange_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	saslReq := authSASLFrame("SCRAM-SHA-256")
+	writeFrame(t, h.backendTest, saslReq)
+	readExactly(t, h.clientTest, len(saslReq))
+	initial := passwordMessageFrame([]byte("SCRAM-SHA-256\x00x"))
+	writeFrame(t, h.clientTest, initial)
+	readExactly(t, h.backendTest, len(initial))
+
+	writeFrame(t, h.backendTest, authCleartextFrame())
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for Cleartext after a SASL exchange started, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_SASLAfterMD5Response_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	af := authMD5Frame([4]byte{9, 9, 9, 9})
+	writeFrame(t, h.backendTest, af)
+	readExactly(t, h.clientTest, len(af))
+	pw := passwordMessageFrame([]byte("md5response"))
+	writeFrame(t, h.clientTest, pw)
+	readExactly(t, h.backendTest, len(pw))
+
+	writeFrame(t, h.backendTest, authSASLFrame("SCRAM-SHA-256"))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for SASL after an MD5 response, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_RepeatedAuthenticationOk_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	// A second Authentication frame during the post-auth phase - never a
+	// valid message type there.
+	writeFrame(t, h.backendTest, authOkFrame())
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a repeated AuthenticationOk, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_AuthenticationOk_TrailingData_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authFrame(authOk, []byte{0xFF}))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for AuthenticationOk with trailing data, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_AuthenticationCleartext_TrailingData_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authFrame(authCleartextPassword, []byte{0xFF}))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for AuthenticationCleartextPassword with trailing data, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_AuthenticationMD5_WrongSaltLength_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authFrame(authMD5Password, []byte{1, 2, 3})) // only 3 salt bytes
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for AuthenticationMD5Password with a wrong-length salt, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_AuthenticationSASL_EmptyMechanismList_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authFrame(authSASL, nil)) // no mechanisms, no terminator at all
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for an empty SASL mechanism list, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_AuthenticationSASL_TrailingBytesAfterTerminator_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	body := append([]byte("SCRAM-SHA-256\x00\x00"), []byte("EXTRA")...)
+	writeFrame(t, h.backendTest, authFrame(authSASL, body))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for trailing bytes after a SASL mechanism list terminator, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_UnsupportedAuth_DoesNotReadPasswordMessage(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	writeFrame(t, h.backendTest, authGSSFrame())
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupUnsupportedAuth) {
+		t.Fatalf("expected ErrStartupUnsupportedAuth, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+// ==========================================================================
+// Section 4: backend startup message validation (bkz. gorev 4)
+// ==========================================================================
+
+func TestStartupHandoff_MalformedParameterStatus_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	// Only one NUL-terminated string instead of the required two.
+	body := append(cstr("server_version"), []byte("16.0")...) // second string never terminated
+	writeFrame(t, h.backendTest, buildFrame(protocol.MsgParameterStatus, body))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a malformed ParameterStatus, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_MalformedBackendKeyData_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	writeFrame(t, h.backendTest, buildFrame(protocol.MsgBackendKeyData, []byte{1, 2, 3})) // wrong length
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a malformed BackendKeyData, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_MalformedNoticeResponse_FailsClosed(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	writeFrame(t, h.backendTest, buildFrame(protocol.MsgNoticeResponse, []byte{0})) // zero fields
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a malformed NoticeResponse (zero fields), got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_MalformedErrorResponse_FailsClosed_DuringAuth(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+
+	// No field-code/terminator structure at all - just raw ASCII bytes.
+	writeFrame(t, h.backendTest, buildFrame(protocol.MsgErrorResponse, []byte("no terminator or field code")))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a malformed ErrorResponse, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+// ==========================================================================
+// Section 6: shutdown-causality linearization (bkz. gorev 6) - deterministic,
+// hook/barrier-based races, never sleep-based.
+// ==========================================================================
+
+func TestStartupHandoff_Causality_ProtocolFailureBeforeParentCancellation(t *testing.T) {
+	clientHandoffSide, clientTestSide := net.Pipe()
+	backendHandoffSide, backendTestSide := net.Pipe()
+	defer clientTestSide.Close()
+	defer backendTestSide.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hooks := &causeHooks{onClaimed: func(v int32) {
+		if v == causeInternal {
+			cancel()
+		}
+	}}
+	done := make(chan handoffOutcome, 1)
+	go func() {
+		res, err := runStartupHandoffInternal(ctx, clientHandoffSide, backendHandoffSide, DefaultStartupLimits(), hooks)
+		done <- handoffOutcome{res, err}
+	}()
+
+	// Malformed startup length - a genuine internal protocol failure, with
+	// cancellation triggered ONLY once the internal cause has already won
+	// the race (from inside the hook, synchronously on the work goroutine).
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, 3) // below minStartupFrameLen(8)
+	writeFrame(t, clientTestSide, lenBuf)
+
+	select {
+	case o := <-done:
+		if !errors.Is(o.err, ErrStartupProtocolFailure) {
+			t.Fatalf("expected the protocol failure to remain primary despite a racing cancellation, got %v", o.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
+func TestStartupHandoff_Causality_ClientWriteFailureBeforeParentCancellation(t *testing.T) {
+	clientHandoffSide, clientTestSide := net.Pipe()
+	backendHandoffSide, backendTestSide := net.Pipe()
+	defer backendTestSide.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hooks := &causeHooks{onClaimed: func(v int32) {
+		if v == causeInternal {
+			cancel()
+		}
+	}}
+	done := make(chan handoffOutcome, 1)
+	go func() {
+		res, err := runStartupHandoffInternal(ctx, clientHandoffSide, backendHandoffSide, DefaultStartupLimits(), hooks)
+		done <- handoffOutcome{res, err}
+	}()
+
+	// This call returns only once the handoff has fully read the
+	// SSLRequest - then we close the client test side so the handoff's
+	// reply write ('N') deterministically fails.
+	writeFrame(t, clientTestSide, sslRequestFrame())
+	clientTestSide.Close()
+
+	select {
+	case o := <-done:
+		if !errors.Is(o.err, ErrStartupClientWriteFailed) {
+			t.Fatalf("expected the client write failure to remain primary despite a racing cancellation, got %v", o.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
+func TestStartupHandoff_Causality_BackendWriteFailureBeforeParentCancellation(t *testing.T) {
+	clientHandoffSide, clientTestSide := net.Pipe()
+	backendHandoffSide, backendTestSide := net.Pipe()
+	defer clientTestSide.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hooks := &causeHooks{onClaimed: func(v int32) {
+		if v == causeInternal {
+			cancel()
+		}
+	}}
+	done := make(chan handoffOutcome, 1)
+	go func() {
+		res, err := runStartupHandoffInternal(ctx, clientHandoffSide, backendHandoffSide, DefaultStartupLimits(), hooks)
+		done <- handoffOutcome{res, err}
+	}()
+
+	// Close the backend side FIRST, so the handoff's forward-to-backend
+	// write of the StartupMessage deterministically fails.
+	backendTestSide.Close()
+	writeFrame(t, clientTestSide, startupMessageFrame(3, 0, "user", "alice"))
+
+	select {
+	case o := <-done:
+		if !errors.Is(o.err, ErrStartupBackendWriteFailed) {
+			t.Fatalf("expected the backend write failure to remain primary despite a racing cancellation, got %v", o.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
+func TestStartupHandoff_Causality_ParentCancellationBeforeCloseInducedError(t *testing.T) {
+	// The watcher claims causeParent (and only THEN closes both
+	// transports) BEFORE any close-induced read/write error can occur in
+	// the blocked work goroutine - this ordering is already deterministic
+	// by construction (claim, then close), no hook needed.
+	h := newHandoffHarness(t)
+	// Nothing written by the client - handoff is blocked in its very
+	// first client read.
+	h.cancel()
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", o.err)
+	}
+}
+
+func TestStartupHandoff_Causality_SuccessBeforeParentCancellation(t *testing.T) {
+	clientHandoffSide, clientTestSide := net.Pipe()
+	backendHandoffSide, backendTestSide := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hooks := &causeHooks{onClaimed: func(v int32) {
+		if v == causeSuccess {
+			cancel()
+		}
+	}}
+	done := make(chan handoffOutcome, 1)
+	go func() {
+		res, err := runStartupHandoffInternal(ctx, clientHandoffSide, backendHandoffSide, DefaultStartupLimits(), hooks)
+		done <- handoffOutcome{res, err}
+	}()
+
+	sm := startupMessageFrame(3, 0, "user", "alice")
+	writeFrame(t, clientTestSide, sm)
+	readExactly(t, backendTestSide, len(sm))
+	writeFrame(t, backendTestSide, authOkFrame())
+	readExactly(t, clientTestSide, len(authOkFrame()))
+	rfq := rfqFrame(protocol.TxStatusIdle)
+	writeFrame(t, backendTestSide, rfq)
+	readExactly(t, clientTestSide, len(rfq))
+	// The instant the handoff finishes writing the RFQ above, it calls
+	// cause.succeed() -> the hook fires -> cancel() runs SYNCHRONOUSLY, on
+	// the handoff's own goroutine, racing its still-in-flight return path.
+
+	var o handoffOutcome
+	select {
+	case o = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+	if o.err != nil {
+		t.Fatalf("expected success to be preserved despite a racing cancellation, got %v", o.err)
+	}
+	if o.result.ReadyStatus != protocol.TxStatusIdle {
+		t.Fatalf("unexpected result: %+v", o.result)
+	}
+	// Transports must remain open - the watcher's own causeParent claim
+	// must have LOST the race, so it must never have closed anything.
+	assertPipeStillOpen(t, clientTestSide)
+	assertPipeStillOpen(t, backendTestSide)
+	clientTestSide.Close()
+	backendTestSide.Close()
+}
+
+// assertPipeStillOpen proves conn has NOT been closed by its peer, without
+// assuming anyone is actively reading it (bkz. gorev 6 - a net.Pipe write
+// blocks forever waiting for a reader regardless of open/closed state, so a
+// plain Write cannot distinguish "open but unread" from "closed"; a closed
+// pipe fails IMMEDIATELY with io.ErrClosedPipe, while an open-but-unread
+// pipe blocks until the deadline and fails with a timeout error instead).
+func assertPipeStillOpen(t *testing.T, conn net.Conn) {
+	t.Helper()
+	conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+	_, err := conn.Write([]byte{0})
+	conn.SetWriteDeadline(time.Time{})
+	if err == nil {
+		return
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return
+	}
+	t.Fatalf("expected the transport to remain open, got %v", err)
+}
+
+func TestStartupHandoff_Causality_ParentCancellationJustBeforeSuccess(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	// Write the final ReadyForQuery from the backend side, but do NOT read
+	// it from the client side - net.Pipe's Write blocks until fully
+	// drained by the peer, so this call returns only once the HANDOFF has
+	// consumed it (io.ReadFull) - a channel-based signal, not a sleep. The
+	// handoff is then immediately about to (or already does) block trying
+	// to write the RFQ to the client, which nothing ever reads; cancel()
+	// races in against that pending write.
+	rfq := rfqFrame(protocol.TxStatusIdle)
+	writeDone := make(chan struct{})
+	go func() {
+		h.backendTest.Write(rfq)
+		close(writeDone)
+	}()
+	<-writeDone
+	h.cancel()
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, context.Canceled) {
+		t.Fatalf("expected context.Canceled (cancellation linearized before the pending write could succeed), got %v", o.err)
+	}
+	// The watcher's claim won this race, so it must have closed both
+	// transports.
+	if _, err := h.clientTest.Write([]byte{0}); err == nil {
+		t.Fatal("expected the client-side handoff connection to be closed")
+	}
+	if _, err := h.backendTest.Write([]byte{0}); err == nil {
+		t.Fatal("expected the backend-side handoff connection to be closed")
+	}
+}
+
+// ==========================================================================
+// Section 7: fixed, safe startup errors/logs (bkz. gorev 7) - Transport is
+// an interface; an injected/test implementation must never be able to leak
+// arbitrary error text into RunStartupHandoff's returned error.
+// ==========================================================================
+
+type errorInjectingTransport struct {
+	net.Conn
+	failRead  error
+	failWrite error
+}
+
+func (t *errorInjectingTransport) Read(p []byte) (int, error) {
+	if t.failRead != nil {
+		return 0, t.failRead
+	}
+	return t.Conn.Read(p)
+}
+
+func (t *errorInjectingTransport) Write(p []byte) (int, error) {
+	if t.failWrite != nil {
+		return 0, t.failWrite
+	}
+	return t.Conn.Write(p)
+}
+
+func assertMarkerAbsent(t *testing.T, err error, marker string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected a non-nil error")
+	}
+	for _, formatted := range []string{
+		fmt.Sprintf("%v", err),
+		fmt.Sprintf("%+v", err),
+		fmt.Sprintf("%#v", err),
+	} {
+		if strings.Contains(formatted, marker) {
+			t.Fatalf("marker leaked into formatted error: %s", formatted)
+		}
+	}
+}
+
+func TestStartupHandoff_TransportErrorMarker_ClientReadFailure_NeverLeaks(t *testing.T) {
+	marker := "MARKER_CLIENT_READ_9f3a"
+	clientHandoffSide, _ := net.Pipe()
+	backendHandoffSide, backendTestSide := net.Pipe()
+	defer backendTestSide.Close()
+	injectedClient := &errorInjectingTransport{Conn: clientHandoffSide, failRead: errors.New("boom: " + marker)}
+
+	_, err := RunStartupHandoff(context.Background(), injectedClient, backendHandoffSide, DefaultStartupLimits())
+	assertMarkerAbsent(t, err, marker)
+	if !errors.Is(err, ErrStartupClientReadFailed) {
+		t.Fatalf("expected ErrStartupClientReadFailed, got %v", err)
+	}
+}
+
+func TestStartupHandoff_TransportErrorMarker_ClientWriteFailure_NeverLeaks(t *testing.T) {
+	marker := "MARKER_CLIENT_WRITE_7c21"
+	clientHandoffSide, clientTestSide := net.Pipe()
+	backendHandoffSide, backendTestSide := net.Pipe()
+	defer clientTestSide.Close()
+	defer backendTestSide.Close()
+	injectedClient := &errorInjectingTransport{Conn: clientHandoffSide, failWrite: errors.New("boom: " + marker)}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := RunStartupHandoff(context.Background(), injectedClient, backendHandoffSide, DefaultStartupLimits())
+		done <- err
+	}()
+
+	writeFrame(t, clientTestSide, sslRequestFrame())
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+	assertMarkerAbsent(t, err, marker)
+	if !errors.Is(err, ErrStartupClientWriteFailed) {
+		t.Fatalf("expected ErrStartupClientWriteFailed, got %v", err)
+	}
+}
+
+func TestStartupHandoff_TransportErrorMarker_BackendReadFailure_NeverLeaks(t *testing.T) {
+	marker := "MARKER_BACKEND_READ_b810"
+	clientHandoffSide, clientTestSide := net.Pipe()
+	backendHandoffSide, backendTestSide := net.Pipe()
+	defer clientTestSide.Close()
+	defer backendTestSide.Close()
+	injectedBackend := &errorInjectingTransport{Conn: backendHandoffSide, failRead: errors.New("boom: " + marker)}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := RunStartupHandoff(context.Background(), clientHandoffSide, injectedBackend, DefaultStartupLimits())
+		done <- err
+	}()
+
+	sm := startupMessageFrame(3, 0, "user", "alice")
+	// The forward-to-backend write (failWrite is nil here, so it passes
+	// through to the real pipe) must be drained, or it blocks forever with
+	// no reader - only the SUBSEQUENT backend Read is instrumented to fail.
+	// Uses io.ReadFull directly (not the t.Fatal-calling readExactly
+	// helper, which must never run on a non-test goroutine).
+	go func() { io.ReadFull(backendTestSide, make([]byte, len(sm))) }()
+	writeFrame(t, clientTestSide, sm)
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+	assertMarkerAbsent(t, err, marker)
+	if !errors.Is(err, ErrStartupBackendReadFailed) {
+		t.Fatalf("expected ErrStartupBackendReadFailed, got %v", err)
+	}
+}
+
+func TestStartupHandoff_TransportErrorMarker_BackendWriteFailure_NeverLeaks(t *testing.T) {
+	marker := "MARKER_BACKEND_WRITE_44de"
+	clientHandoffSide, clientTestSide := net.Pipe()
+	backendHandoffSide, _ := net.Pipe()
+	defer clientTestSide.Close()
+	injectedBackend := &errorInjectingTransport{Conn: backendHandoffSide, failWrite: errors.New("boom: " + marker)}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := RunStartupHandoff(context.Background(), clientHandoffSide, injectedBackend, DefaultStartupLimits())
+		done <- err
+	}()
+
+	sm := startupMessageFrame(3, 0, "user", "alice")
+	writeFrame(t, clientTestSide, sm)
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out")
+	}
+	assertMarkerAbsent(t, err, marker)
+	if !errors.Is(err, ErrStartupBackendWriteFailed) {
+		t.Fatalf("expected ErrStartupBackendWriteFailed, got %v", err)
+	}
 }

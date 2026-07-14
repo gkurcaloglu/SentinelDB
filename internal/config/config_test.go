@@ -177,6 +177,120 @@ masking:
 	}
 }
 
+func TestLoad_ProtocolExtendedQueryDisabledByDefault(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Protocol.ExtendedQueryEnabled {
+		t.Fatal("expected Protocol.ExtendedQueryEnabled to default to false when the protocol section is absent")
+	}
+}
+
+func TestLoad_ProtocolExtendedQueryExplicitFalse(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+protocol:
+  extended_query_enabled: false
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Protocol.ExtendedQueryEnabled {
+		t.Fatal("expected Protocol.ExtendedQueryEnabled to be false when explicitly set to false")
+	}
+}
+
+func TestLoad_ProtocolExtendedQueryExplicitTrue(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+protocol:
+  extended_query_enabled: true
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.Protocol.ExtendedQueryEnabled {
+		t.Fatal("expected Protocol.ExtendedQueryEnabled to be true when explicitly enabled")
+	}
+}
+
+func TestLoad_ProtocolUnknownFieldIsRejected(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+protocol:
+  extended_query_enabled: true
+  unknown_protocol_field: "oops"
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for an unknown protocol config field")
+	}
+}
+
+func TestLoad_ProtocolWrongYAMLTypeIsRejected(t *testing.T) {
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+protocol:
+  extended_query_enabled: "not-a-bool"
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error for a non-boolean protocol.extended_query_enabled value")
+	}
+}
+
+func TestLoad_ProtocolEnabledDoesNotAffectMaskingValidation(t *testing.T) {
+	// masking.enabled=true with no columns must still be rejected exactly
+	// as before, regardless of protocol.extended_query_enabled.
+	path := writeTempConfig(t, `
+firewall:
+  blocked_phrases:
+    - "DROP TABLE"
+protocol:
+  extended_query_enabled: true
+masking:
+  enabled: true
+  columns: []
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected masking validation to remain unchanged when protocol.extended_query_enabled is true")
+	}
+}
+
+// TestLoad_RepoRootConfigYAMLIsValid loads the actual repository-root
+// config.yaml (the one cmd/gateway/main.go reads at startup) to prove it
+// still parses under strict KnownFields decoding and that its documented
+// default (protocol.extended_query_enabled: false) matches reality.
+func TestLoad_RepoRootConfigYAMLIsValid(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config.yaml"))
+	if err != nil {
+		t.Fatalf("unexpected error loading the repo-root config.yaml: %v", err)
+	}
+	if cfg.Protocol.ExtendedQueryEnabled {
+		t.Fatal("expected the repo-root config.yaml to document protocol.extended_query_enabled: false")
+	}
+}
+
 func TestLoad_MissingFileReturnsError(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err == nil {

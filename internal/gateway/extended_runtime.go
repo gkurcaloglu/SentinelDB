@@ -14,10 +14,13 @@
 // olan bağımlılık ise BİLİNÇLİ ve TEK YÖNLÜDÜR (bkz. opt-in Extended Query
 // yanıt maskelemesi, NewExtendedRuntimeWithMasking, internal/masking/extended.go) -
 // internal/masking hiçbir zaman internal/gateway'e bağımlı değildir, bu
-// yüzden döngüsel bir bağımlılık oluşmaz. "gateway" adı, bu bileşenin
-// nihai olarak cmd/gateway'in bağlantı işleme akışına bağlanacağı ileriki
-// bir aşamayı öngörür; bu AŞAMADA ise hiçbir canlı çağrı noktası yoktur
-// (bkz. paket testleri dışında hiçbir yerden import edilmez).
+// yüzden döngüsel bir bağımlılık oluşmaz. "gateway" adı bu bileşenin
+// cmd/gateway'in bağlantı işleme akışına bağlandığını yansıtır: opt-in
+// protocol.extended_query_enabled=true modunda cmd/gateway/main.go'nun
+// runExtendedConnection'ı, RunStartupHandoff başarıyla tamamlandıktan
+// SONRA tam olarak bir ExtendedRuntime (gerekirse NewExtendedRuntimeWithMasking
+// ile) oluşturur - varsayılan (false) modda hâlâ hiç kullanılmaz, mevcut
+// Simple Query yolu (runSimpleConnection) değişmeden kalır.
 package gateway
 
 import (
@@ -240,6 +243,19 @@ func (l RuntimeLimits) validate() error {
 	return nil
 }
 
+// DefaultRuntimeLimits, uretim amacli makul, pozitif varsayilan
+// RuntimeLimits dondurur (bkz. gorev 13 - cmd/gateway'in opt-in Extended
+// Query yolunda dagilmis "sihirli sayilar" yerine kullanilmasi icin).
+// MaxFrontendFrameBytes, internal/protocol'un kendi maxMessageLength
+// sinirtiyla (1 MiB) tutarlidir.
+func DefaultRuntimeLimits() RuntimeLimits {
+	return RuntimeLimits{
+		FrontendEventBuffer:   64,
+		BackendEventBuffer:    64,
+		MaxFrontendFrameBytes: 1 << 20,
+	}
+}
+
 // lifecycleState, ExtendedRuntime'in yasam dongusu asamalaridir.
 type lifecycleState int32
 
@@ -427,9 +443,10 @@ type backendEvent struct {
 // hicbir donen hata/olay SQL, Bind degeri, statement/portal adi ya da
 // sunucu hata metni ACIGA CIKARMAZ.
 //
-// Bu asamada HENUZ hicbir canli gateway/firewall/masking baglantisi
-// yoktur - ExtendedRuntime yalniz kendi testleri disinda hicbir yerden
-// kullanilmaz.
+// cmd/gateway/main.go'nun opt-in runExtendedConnection'i, basarili bir
+// startup/authentication devrinden (bkz. RunStartupHandoff) SONRA tam
+// olarak bir ExtendedRuntime olusturup Run'ini baslatir - varsayilan
+// (protocol.extended_query_enabled=false) modda bu TAMAMEN devre disidir.
 type ExtendedRuntime struct {
 	state *protocol.State
 	seq   *protocol.ResponseSequencer
@@ -632,10 +649,9 @@ func NewExtendedRuntime(
 // kod yolu tetiklenmez). maskingConfig.Enabled true ise masker NIL OLAMAZ
 // (ErrNilMasker).
 //
-// cmd/gateway bu asamada HENUZ bu constructor'i cagirmaz - Gate.RunExtended
-// icin canli bir cagri noktasi YOKTUR (bkz. paket basi doc yorumu); bu,
-// yalnizca opt-in ExtendedRuntime yolunu dogrudan cagiran testler/gelecekteki
-// entegrasyon icindir.
+// cmd/gateway/main.go'nun runExtendedConnection'i, maskCfg.Enabled true
+// oldugunda TAM OLARAK bu constructor'i cagirir (aksi halde duz
+// NewExtendedRuntime kullanilir) - bkz. paket basi doc yorumu.
 func NewExtendedRuntimeWithMasking(
 	state *protocol.State,
 	backend BackendTransport,
@@ -974,6 +990,38 @@ func (r *ExtendedRuntime) Run(ctx context.Context) error {
 	close(r.stopped)
 
 	return primaryErr
+}
+
+// WaitStarted, Run BASARIYLA baslayip olay dongusunu kabul etmeye hazir
+// hale gelene (r.started kapanana) kadar bloklanir - cagiranin (bkz.
+// cmd/gateway'in opt-in Extended Query yolu) Gate.RunExtended'i
+// baslatmadan ONCE runtime'in frontend olaylarini gercekten kabul
+// edebilecegini POLLING/SLEEP olmadan, deterministik bir sekilde
+// bilmesini saglar (bkz. gorev 12).
+//
+// Mevcut started/stopped kanallarindan baska hicbir State/mutable runtime
+// ic durumu ACIGA CIKARILMAZ. Runtime, kullanilabilir hale gelmeden ONCE
+// dururssa (ör. Run hic cagrilmadan baska bir olay stopped'i tetikleseydi -
+// pratikte erisilemez, ama savunma amacli) ya da ctx iptal edilirse
+// deterministik olarak doner; hicbir durumda sonsuza kadar bloklanmaz.
+func (r *ExtendedRuntime) WaitStarted(ctx context.Context) error {
+	// stopped ONCELIKLI kontrol edilir: started/stopped ikisi de kapanmis
+	// olabilecegi (runtime baslayip cok hizli durmus olabilecegi) bir
+	// select'te Go'nun rastgele dal secimine birakmak yerine, "zaten
+	// durdu" durumunu HER ZAMAN acikca rapor ederiz.
+	select {
+	case <-r.stopped:
+		return ErrRuntimeStopped
+	default:
+	}
+	select {
+	case <-r.started:
+		return nil
+	case <-r.stopped:
+		return ErrRuntimeStopped
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // RegisterFrontendOperation, req'te tanimlanan Extended Query islemini

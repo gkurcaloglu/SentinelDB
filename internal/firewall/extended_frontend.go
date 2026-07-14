@@ -21,13 +21,16 @@
 // ayrıştırması bu yüzden BURADA, her handleXxx fonksiyonunun kendisinde
 // gerçekleşir (bkz. frontendPayload, gorev 2).
 //
-// Bu yol KESİNLİKLE opt-in ve test-only'dir: cmd/gateway hiçbir zaman
-// Gate.RunExtended'i çağırmaz; canlı gateway akışı (Gate.Run) DEĞİŞMEDEN
-// kalır ve Extended Query'yi hâlâ fail-closed reddeder (bkz. gate.go,
-// isExtendedProtocolMessage/rejectExtendedProtocol). Startup/authentication
-// yönlendirmesi, masking.Transformer entegrasyonu, Extended Query DataRow
-// maskeleme, karma Simple/Extended Query desteği bu aşamanın KAPSAMI
-// DIŞINDADIR (bkz. docs/design/0001-extended-query.md).
+// Bu yol KESİNLİKLE opt-in'dir, config.yaml'ın protocol.extended_query_enabled
+// bayrağıyla (varsayılan: false) kontrol edilir. Bayrak false iken (varsayılan)
+// cmd/gateway hiçbir zaman Gate.RunExtended'i çağırmaz; canlı gateway akışı
+// (Gate.Run) DEĞİŞMEDEN kalır ve Extended Query'yi hâlâ fail-closed reddeder
+// (bkz. gate.go, isExtendedProtocolMessage/rejectExtendedProtocol). Bayrak
+// true iken cmd/gateway/main.go'nun runExtendedConnection'ı,
+// internal/gateway.RunStartupHandoff başarıyla tamamlandıktan SONRA
+// Gate.RunExtended'i çağırır - bu tek bağlantıda Simple Query artık KABUL
+// EDİLMEZ (karma Simple/Extended Query desteği hâlâ KAPSAM DIŞIDIR, bkz.
+// docs/design/0001-extended-query.md).
 package firewall
 
 import (

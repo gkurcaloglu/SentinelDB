@@ -31,3 +31,28 @@ masking:
   enabled: true
   columns:
     - email
+
+# protocol.extended_query_enabled: varsayilan olarak KAPALI (false) - bu
+# durumda gateway, mevcut Simple Query yolunu (firewall.Gate.Run +
+# masking.Transformer) DEGISMEDEN kullanmaya devam eder; Extended Query
+# Protokolu (Parse/Bind/Describe/Execute/Close/Flush/Sync) HER ZAMAN
+# oldugu gibi fail-closed reddedilir.
+#
+# true yapilirsa: bir baglanti, duz metin startup/authentication'i
+# tamamladiktan SONRA (bkz. internal/gateway.RunStartupHandoff) Simple
+# Query YERINE Extended-Query-YALNIZCA bir steady-state yoluna
+# (internal/gateway.ExtendedRuntime + firewall.ExtendedFrontend) devredilir:
+#   - Parse SQL metni yine Policy tarafindan degerlendirilir (Bind/Describe/
+#     Execute/Close/Flush/Sync degerlendirilmez);
+#   - masking.enabled=true ise DataRow hucreleri yine maskelenir (bilinmeyen
+#     sonuc sekli ya da ikili hedef sutun fail-closed reddedilir);
+#   - o baglantida Simple Query ('Q') artik KABUL EDILMEZ (fail-closed
+#     reddedilir) - AYNI baglantida Simple/Extended Query KARISIK
+#     KULLANILAMAZ;
+#   - COPY protokolu ve TLS/GSS sifreleme (SSLRequest/GSSENCRequest) bu
+#     modda da desteklenmez.
+# Bu, operator tarafindan acikca secilen, baglanti-genelinde bir moddur -
+# protokol modu arasinda otomatik/mesaj-bazli gecis YOKTUR (bkz.
+# docs/design/0001-extended-query.md).
+protocol:
+  extended_query_enabled: false

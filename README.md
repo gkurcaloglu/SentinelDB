@@ -62,7 +62,7 @@ flowchart LR
 
 ## V1 limitations (be aware of these before using this anywhere real)
 
-- **Simple Query Protocol only.** The Extended Query Protocol (Parse/Bind/Describe/Execute/Close/Flush/Sync) is explicitly **rejected**, not supported — clients/drivers that default to it (e.g. `pgx`, `psycopg`'s prepared-statement mode) must be configured to use simple-protocol execution, or they will get a `FATAL` error.
+- **Simple Query Protocol by default; Extended Query Protocol is opt-in.** With the default config (`protocol.extended_query_enabled: false`, or the `protocol:` section omitted), the Extended Query Protocol (Parse/Bind/Describe/Execute/Close/Flush/Sync) is explicitly **rejected** — clients/drivers that default to it (e.g. `pgx`, `psycopg`'s prepared-statement mode) must be configured to use simple-protocol execution, or they will get a `FATAL` error. Setting `protocol.extended_query_enabled: true` in `config.yaml` enables an opt-in Extended Query gateway path (policy evaluation on `Parse`, prepared-statement/portal tracking, opt-in response masking) — see [docs/postgresql-protocol.md](docs/postgresql-protocol.md#opt-in-extended-query-gateway-wiring). A connection is always exclusively Simple Query **or** Extended Query for its whole lifetime — mixed-protocol connections, TLS, and `COPY` remain unsupported either way.
 - **No TLS.** `SSLRequest`/`GSSENCRequest` are rejected (`'N'`) so traffic always stays plaintext and inspectable by the gateway. This means SentinelDB is a **plaintext development-mode tool as shipped** — do not expose it to an untrusted network without adding your own TLS termination in front of it.
 - **No COPY protocol support.** `COPY` streams are not parsed or masked; connections attempting COPY fail closed.
 - **UTF-8 is assumed.** Masking logic operates on `[]rune`; other encodings are not validated or supported.
@@ -74,9 +74,9 @@ flowchart LR
 
 | Protocol path | Status |
 |---|---|
-| Simple Query Protocol (`'Q'`) | ✅ Supported — the only evaluated/masked query path |
+| Simple Query Protocol (`'Q'`) | ✅ Supported — default query path; always evaluated/masked |
 | `SSLRequest` / `GSSENCRequest` | ❌ Rejected (`'N'`) — traffic always stays plaintext |
-| Extended Query Protocol (Parse/Bind/Describe/Execute/Close/Flush/Sync) | ❌ Rejected — `FATAL` error, connection closed |
+| Extended Query Protocol (Parse/Bind/Describe/Execute/Close/Flush/Sync) | ❌ Rejected by default — `FATAL` error, connection closed. ⚠️ Opt-in via `protocol.extended_query_enabled: true` (policy-evaluated, prepared-statement/portal-tracked, opt-in masked) — mixed Simple/Extended on one connection is still unsupported |
 | `RowDescription` / `DataRow` (text format) | ✅ Parsed, and masked for configured columns |
 | `DataRow` binary-format columns (`FormatCode != 0`) | ❌ Fail-closed if configured for masking |
 | `COPY` protocol | ❌ Fail-closed — not parsed or masked |
@@ -290,14 +290,18 @@ docker-compose.yml     postgres + sentineldb + prometheus + grafana + dashboard
   confirmed fixes, confirmed-safe behaviors, known V1 limitations, V2
   recommendations
 - [docs/design/0001-extended-query.md](docs/design/0001-extended-query.md) —
-  **draft design proposal, not implemented** — Extended Query Protocol
-  support: connection-state model, policy-evaluation and fail-closed
-  recovery design, masking implications, and a staged implementation plan.
-  See also the accompanying
+  the original design proposal for Extended Query Protocol support
+  (connection-state model, policy-evaluation and fail-closed recovery
+  design, masking implications, staged implementation plan). See also the
+  accompanying
   [review checklist](docs/design/0001-extended-query-review-checklist.md).
-  Extended Query remains **unsupported** today — see
-  [V1 limitations](#v1-limitations-be-aware-of-these-before-using-this-anywhere-real)
-  and the [protocol table](#supported--unsupported-protocol) above.
+  An opt-in implementation of this design is now wired into the live
+  gateway (`protocol.extended_query_enabled: true`) — see
+  [docs/postgresql-protocol.md](docs/postgresql-protocol.md#opt-in-extended-query-gateway-wiring),
+  [V1 limitations](#v1-limitations-be-aware-of-these-before-using-this-anywhere-real),
+  and the [protocol table](#supported--unsupported-protocol) above for
+  what's actually live today; mixed Simple/Extended routing, TLS, and
+  COPY remain unimplemented regardless of the flag.
 - [CHANGELOG.md](CHANGELOG.md) / [docs/release-notes-v0.1.0.md](docs/release-notes-v0.1.0.md) / [docs/release-notes-v0.1.1.md](docs/release-notes-v0.1.1.md)
   — what changed, release by release
 - [CONTRIBUTING.md](CONTRIBUTING.md) — local setup, testing, PR process
@@ -313,7 +317,7 @@ see [CONTRIBUTING.md — Scope discipline](CONTRIBUTING.md#scope-discipline).
 
 ## Security warning
 
-SentinelDB V1 is an **experimental prototype**. It has not undergone a third-party security review. It does not encrypt traffic, has a narrow (Simple Query Protocol-only) attack surface by rejecting everything else, and its masking is a literal exact-column-name rule, not data discovery. Do not point it at a production database or treat it as a substitute for database-level access controls, encryption at rest/in transit, or a compliance program.
+SentinelDB V1 is an **experimental prototype**. It has not undergone a third-party security review. It does not encrypt traffic, has a narrow attack surface by rejecting everything except Simple Query by default (Extended Query Protocol support exists only behind the explicit, default-off `protocol.extended_query_enabled` opt-in), and its masking is a literal exact-column-name rule, not data discovery. Do not point it at a production database or treat it as a substitute for database-level access controls, encryption at rest/in transit, or a compliance program.
 
 All demo host ports are bound to `127.0.0.1` only (see [Service and port table](#service-and-port-table)) precisely because the PostgreSQL traffic they carry is plaintext and the credentials are hard-coded demo values — do not rebind them to `0.0.0.0` or a LAN-facing interface.
 
@@ -323,7 +327,7 @@ full assets/trust-boundaries/known-bypass breakdown.
 
 ## Roadmap
 
-- Extended Query Protocol support (Parse/Bind/Describe/Execute) with correct error/resync semantics
+- Extended Query Protocol support (Parse/Bind/Describe/Execute) with correct error/resync semantics — opt-in implementation now available behind `protocol.extended_query_enabled`; mixed Simple/Extended routing on one connection, and a dedicated real-driver compatibility test stage, remain future work
 - TLS termination between client and gateway
 - Additional masking types beyond email (phone numbers, national IDs, free-text redaction)
 - COPY protocol support

@@ -505,6 +505,64 @@ func setupRuntimeExecuteHead(t *testing.T, ctx context.Context, rt *ExtendedRunt
 
 // --- Lifecycle -------------------------------------------------------------
 
+func TestDefaultRuntimeLimits_PassesConstructorValidation(t *testing.T) {
+	s := protocol.NewState()
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	if _, err := NewExtendedRuntime(s, toBackendTransport(backendR), newTrackingWriter(), protocol.DefaultSequencerLimits(), DefaultRuntimeLimits()); err != nil {
+		t.Fatalf("expected DefaultRuntimeLimits to pass construction, got %v", err)
+	}
+}
+
+func TestExtendedRuntime_WaitStarted_ReturnsAfterRunStarts(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runInBackground(t, rt, ctx)
+
+	if err := rt.WaitStarted(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cancel()
+	waitDone(t, done)
+}
+
+func TestExtendedRuntime_WaitStarted_BeforeRun_RespectsContextCancellation(t *testing.T) {
+	s := protocol.NewState()
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	rt, err := NewExtendedRuntime(s, toBackendTransport(backendR), newTrackingWriter(), protocol.DefaultSequencerLimits(), testRuntimeLimits())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := rt.WaitStarted(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestExtendedRuntime_WaitStarted_AfterStop_ReturnsRuntimeStopped(t *testing.T) {
+	backendR, _ := io.Pipe()
+	defer backendR.Close()
+	client := newTrackingWriter()
+	rt := newTestRuntime(t, backendR, client)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(t, rt, ctx)
+
+	cancel()
+	waitDone(t, done)
+
+	if err := rt.WaitStarted(context.Background()); !errors.Is(err, ErrRuntimeStopped) {
+		t.Fatalf("expected ErrRuntimeStopped, got %v", err)
+	}
+}
+
 func TestNewExtendedRuntime_Validation(t *testing.T) {
 	validLimits := testRuntimeLimits()
 	s := protocol.NewState()

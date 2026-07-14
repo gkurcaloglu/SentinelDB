@@ -119,10 +119,18 @@ SentinelDB V1's design assumes an attacker who:
   There is no allowlisting, no privilege-aware analysis, no
   understanding of what a statement actually does beyond substring
   matching.
-- **Extended Query Protocol.** Rejected outright rather than evaluated —
-  a client using it gets a hard error, not a silent bypass, but it also
-  means SentinelDB provides zero protection for any workload that
-  requires prepared statements.
+- **Extended Query Protocol, when `protocol.extended_query_enabled` is
+  left at its default (`false`).** Rejected outright rather than
+  evaluated — a client using it gets a hard error, not a silent bypass,
+  but it also means SentinelDB provides zero protection for any workload
+  that requires prepared statements. Setting the flag to `true` enables
+  an opt-in path with Parse-time policy evaluation and opt-in response
+  masking (see
+  [docs/postgresql-protocol.md's "Opt-in Extended Query gateway
+  wiring"](postgresql-protocol.md#opt-in-extended-query-gateway-wiring)),
+  but mixed Simple/Extended routing on one connection, TLS, and COPY
+  remain unprotected/unimplemented either way — enabling the flag does
+  not change any other item in this threat model.
 - **Authentication and authorization.** SentinelDB does not authenticate
   clients or enforce PostgreSQL role/permission semantics; it relies
   entirely on the real PostgreSQL server's own auth (forwarded

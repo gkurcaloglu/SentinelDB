@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/gkurcaloglu/sentineldb/internal/api"
 	"github.com/gkurcaloglu/sentineldb/internal/config"
 	"github.com/gkurcaloglu/sentineldb/internal/firewall"
+	"github.com/gkurcaloglu/sentineldb/internal/gateway"
 	"github.com/gkurcaloglu/sentineldb/internal/masking"
 	"github.com/gkurcaloglu/sentineldb/internal/metrics"
 	"github.com/gkurcaloglu/sentineldb/internal/protocol"
@@ -255,12 +257,18 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			handleConn(ctx, conn, policy, masker, maskCfg, m, conns)
+			handleConn(ctx, conn, cfg, policy, masker, maskCfg, m, conns)
 		}()
 	}
 }
 
-func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, masker masking.Masker, maskCfg masking.Config, m *metrics.Metrics, conns *activeConns) {
+// handleConn, backend'e baglanip her iki baglantiyi da activeConns'a
+// kaydeden PAYLASILAN on hazirligi yapar, ardindan cfg.Protocol.
+// ExtendedQueryEnabled'a gore TAM OLARAK iki yoldan birine (runSimpleConnection
+// - varsayilan/degismemis mevcut davranis - ya da opt-in
+// runExtendedConnection) dagitir. Ayni baglantida bu ikisi arasinda hicbir
+// karisik yonlendirme/gecis YOKTUR - bkz. docs/design/0001-extended-query.md.
+func handleConn(ctx context.Context, client net.Conn, cfg *config.Config, policy firewall.Policy, masker masking.Masker, maskCfg masking.Config, m *metrics.Metrics, conns *activeConns) {
 	defer client.Close()
 
 	connID := connCounter.Add(1)
@@ -278,6 +286,21 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, ma
 	conns.add(connID, client, target)
 	defer conns.remove(connID)
 
+	if cfg.Protocol.ExtendedQueryEnabled {
+		runExtendedConnection(ctx, client, target, connID, policy, masker, maskCfg, m)
+		return
+	}
+	runSimpleConnection(ctx, client, target, connID, policy, masker, maskCfg, m)
+}
+
+// runSimpleConnection, mevcut (varsayilan) Simple Query yolunun TAM OLARAK
+// AYNI davranisidir - yalnizca handleConn'dan bagimsiz, testable bir
+// fonksiyona cikarilmistir. Hicbir mantik degistirilmedi: ayni Gate/
+// masking.Transformer/SerializedWriter/TxState kurulumu, ayni iki yonlu
+// goroutine yapisi, ayni SSL/GSS reddi (bkz. firewall.Gate.handle), ayni
+// Simple Query politika/maskeleme davranisi, ayni yari-kapanma (half-close)
+// kurallari, ayni metrics/logging geri cagirimlari.
+func runSimpleConnection(ctx context.Context, client, target net.Conn, connID uint64, policy firewall.Policy, masker masking.Masker, maskCfg masking.Config, m *metrics.Metrics) {
 	// Butun client yazmalari (gercek backend yanitlarinin/maskelenmis
 	// DataRow'larin iletilmesi, SSL red baytı, sentetik firewall
 	// ErrorResponse/ReadyForQuery) TEK bir mutex korumali yazici uzerinden
@@ -385,6 +408,179 @@ func handleConn(ctx context.Context, client net.Conn, policy firewall.Policy, ma
 	}()
 
 	wg.Wait()
+}
+
+// runExtendedConnection, opt-in Extended Query yoludur (bkz.
+// protocol.extended_query_enabled: true). Tam yasam dongusu (bkz. gorev 19):
+//
+//  1. internal/gateway.RunStartupHandoff, client/target'i MUNHASIRAN
+//     sahiplenip duz metin startup/authentication'i tamamlar (SSLRequest/
+//     GSSENCRequest'e 'N', CancelRequest'i tek seferlik iletir, aksi halde
+//     ilk GERCEK ReadyForQuery'e kadar authentication'i relay eder);
+//  2. basarisizlikta ya da CancelRequest'te hicbir ExtendedRuntime
+//     olusturulmadan doner (her iki baglanti da handleConn'un kendi
+//     defer'lariyla kapanir);
+//  3. basarili, CancelRequest-olmayan handoff'tan SONRA: tek bir taze
+//     protocol.State, tek bir ExtendedRuntime (masking.enabled'a gore
+//     NewExtendedRuntimeWithMasking ya da NewExtendedRuntime) ve tek bir
+//     ExtendedFrontend olusturulur;
+//  4. ExtendedRuntime.Run baslatilir, WaitStarted ile olay dongusunun
+//     GERCEKTEN hazir oldugu POLLING olmadan dogrulanir;
+//  5. ANCAK BUNDAN SONRA Gate.RunExtended cagirilir (ayni client
+//     baglantisi uzerinde, TEK okuyucu/yazici artik ExtendedRuntime'dir);
+//  6. her iki taraf da (frontend okuyucusu, runtime) donene kadar
+//     sirayla beklenir.
+//
+// Bu baglantida Simple Query ('Q') YOKTUR - ExtendedFrontend bunu zaten
+// fail-closed reddeder (bkz. firewall.ExtendedFrontend). Masking.Transformer
+// bu yolda HIC olusturulmaz; TEK client yazicisi ExtendedRuntime'in olay
+// dongusudur (bkz. gorev 14).
+func runExtendedConnection(ctx context.Context, client, target net.Conn, connID uint64, policy firewall.Policy, masker masking.Masker, maskCfg masking.Config, m *metrics.Metrics) {
+	handoffResult, err := gateway.RunStartupHandoff(ctx, client, target, gateway.DefaultStartupLimits())
+	if err != nil {
+		logStartupOutcome(connID, err)
+		return
+	}
+	if handoffResult.CancelOnly {
+		logExtConn(connID, "CancelRequest tamamlandi, baglanti kapatiliyor")
+		return
+	}
+
+	state := protocol.NewState()
+	seqLimits := protocol.DefaultSequencerLimits()
+	runtimeLimits := gateway.DefaultRuntimeLimits()
+
+	var rt *gateway.ExtendedRuntime
+	if maskCfg.Enabled {
+		rt, err = gateway.NewExtendedRuntimeWithMasking(state, target, client, seqLimits, runtimeLimits,
+			maskCfg, masker, masking.DefaultExtendedLimits(), extendedMaskingHooks(connID, m))
+	} else {
+		rt, err = gateway.NewExtendedRuntime(state, target, client, seqLimits, runtimeLimits)
+	}
+	if err != nil {
+		log.Printf("[conn %d] Extended runtime olusturulamadi: %v", connID, err)
+		return
+	}
+
+	frontend, err := firewall.NewExtendedFrontend(rt, policy, extendedOnDecide(connID, m))
+	if err != nil {
+		log.Printf("[conn %d] Extended frontend olusturulamadi: %v", connID, err)
+		return
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- rt.Run(ctx) }()
+
+	if err := rt.WaitStarted(ctx); err != nil {
+		// Runtime hic kullanilabilir olamadan durdu/iptal edildi -
+		// Gate.RunExtended ASLA baslatilmaz (bkz. gorev 12). Run'in
+		// goroutine'ini kesinlikle katilmadan (join etmeden) donmuyoruz.
+		runErr := <-runDone
+		logExtendedRuntimeOutcome(connID, runErr, m)
+		return
+	}
+
+	gate := &firewall.Gate{}
+	frontendErr := gate.RunExtended(ctx, client, frontend)
+	logExtendedFrontendOutcome(connID, frontendErr)
+
+	runErr := <-runDone
+	logExtendedRuntimeOutcome(connID, runErr, m)
+}
+
+// extendedOnDecide, ExtendedFrontend'in Policy.Evaluate cagrisi SADECE
+// Parse mesajlari icin tetikledigi karar geri cagirimidir (bkz. gorev 15).
+// Gecirilen protocol.Message HICBIR ZAMAN Raw ya da Query alani tasimaz
+// (bkz. firewall.NewExtendedFrontend) - bu yuzden SQL/isim/deger burada
+// ZATEN loglanamaz; mevcut Simple Query logGateDecision ile AYNI güvenli
+// "engellendiyse neden logla" sözleşmesi izlenir.
+func extendedOnDecide(connID uint64, m *metrics.Metrics) func(protocol.Message, firewall.Verdict, string, time.Duration) {
+	return func(msg protocol.Message, v firewall.Verdict, reason string, duration time.Duration) {
+		if v == firewall.Block {
+			m.BlockedQueriesTotal.Inc()
+			log.Printf("[conn %d] C->S %s (Extended) ENGELLENDI verdict=%s sure=%s neden=%s", connID, msg.Name, v, duration.Round(time.Microsecond), reason)
+			return
+		}
+		log.Printf("[conn %d] C->S %s (Extended) verdict=%s sure=%s", connID, msg.Name, v, duration.Round(time.Microsecond))
+	}
+}
+
+// extendedMaskingHooks, ExtendedRuntime'in DataRow maskeleme kancalaridir
+// (bkz. gorev 16). OnMaskAttempt, Simple Query Transformer'la AYNI iki
+// metrigi besler (sure gozlemi + basarili degisim sayaci); Masker'in
+// dondurdugu HAM hata metni (guvenli ifsa garantisi olmadigindan) ASLA
+// loglanmaz - yalnizca sutun adi + sabit bir metin. Terminal (baglanti
+// sonlandirici) bir maskeleme hatasi icin sentineldb_masking_errors_total,
+// BURADA DEGIL, rt.Run()'un DONDURDUGU nihai hatadan (bkz.
+// logExtendedRuntimeOutcome) TAM OLARAK BIR KEZ artirilir - boylece
+// OnMaskAttempt ile runtime sonlanmasi arasinda cifte sayim olmaz (bkz.
+// mevcut Simple Query yolundaki AYNI ilke).
+func extendedMaskingHooks(connID uint64, m *metrics.Metrics) masking.Hooks {
+	return masking.Hooks{
+		OnMaskAttempt: func(column string, changed bool, maskErr error, duration time.Duration) {
+			m.MaskingPluginDuration.Observe(duration.Seconds())
+			if maskErr != nil {
+				log.Printf("[conn %d] Extended S->C sutun maskeleme hatasi (sutun=%q)", connID, column)
+				return
+			}
+			if changed {
+				m.MaskedCellsTotal.Inc()
+			}
+		},
+	}
+}
+
+// logExtConn, Extended Query yolu icin genel, guvenli (deger icermeyen) bir
+// durum log satiridir.
+func logExtConn(connID uint64, msg string) {
+	log.Printf("[conn %d] Extended: %s", connID, msg)
+}
+
+// logStartupOutcome, RunStartupHandoff'un dondurdugu SABIT, guvenli hata
+// kategorisini (bkz. internal/gateway/startup_handoff.go) siniflandirip
+// loglar - hicbir startup parametresi/kullanici adi/sifre/SASL verisi/
+// backend ErrorResponse alani ASLA loglanmaz (bu garantiyi zaten
+// RunStartupHandoff'un kendisi saglar; burada yalnizca o SABIT hata
+// SINIFLANDIRILIR).
+func logStartupOutcome(connID uint64, err error) {
+	switch {
+	case errors.Is(err, gateway.ErrStartupClientEOF):
+		logExtConn(connID, "istemci startup/authentication sirasinda baglantiyi kapatti (EOF)")
+	case errors.Is(err, gateway.ErrStartupBackendErrorResponse):
+		logExtConn(connID, "backend authentication sirasinda bir ErrorResponse dondurdu (istemciye iletildi)")
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		logExtConn(connID, "global kapanma nedeniyle startup/authentication yarida kesildi")
+	default:
+		log.Printf("[conn %d] Extended: startup/authentication basarisiz: %v", connID, err)
+	}
+}
+
+// logExtendedFrontendOutcome, Gate.RunExtended'in dondurdugu SABIT, guvenli
+// hatayi loglar (bkz. internal/firewall/extended_frontend.go - tum donen
+// hatalar zaten sabit, deger icermeyen kategorilerdir).
+func logExtendedFrontendOutcome(connID uint64, err error) {
+	if err == nil {
+		return
+	}
+	log.Printf("[conn %d] Extended frontend sonlandi: %v", connID, err)
+}
+
+// logExtendedRuntimeOutcome, ExtendedRuntime.Run'in dondurdugu SABIT,
+// guvenli hatayi siniflandirip loglar VE - yalnizca burada, TAM OLARAK BIR
+// KEZ - terminal bir maskeleme hatasi icin sentineldb_masking_errors_total'i
+// artirir (bkz. extendedMaskingHooks'un doc yorumu).
+func logExtendedRuntimeOutcome(connID uint64, err error, m *metrics.Metrics) {
+	switch {
+	case err == nil:
+		logExtConn(connID, "baglanti normal sekilde sonlandi")
+	case errors.Is(err, gateway.ErrExtendedMaskingFailed):
+		m.MaskingErrorsTotal.Inc()
+		logExtConn(connID, "maskeleme hatasi nedeniyle baglanti fail-closed sonlandirildi")
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		logExtConn(connID, "global kapanma nedeniyle sonlandi")
+	default:
+		log.Printf("[conn %d] Extended runtime sonlandi: %v", connID, err)
+	}
 }
 
 // logMessage, genel (politika kararina bagli olmayan) mesaj loglamasidir.

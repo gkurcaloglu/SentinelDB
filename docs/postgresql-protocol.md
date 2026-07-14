@@ -23,7 +23,13 @@ Parsed by `internal/protocol.Decoder` (client decoder) and evaluated by
 | `FunctionCall` (`'F'`) | `F` | Recognized/named by the decoder but not policy-evaluated; forwarded unchanged like any other non-`Query` message. |
 | `CopyData`/`CopyDone`/`CopyFail` | `d`/`c`/`f` | Recognized by the decoder for naming/logging purposes; see [COPY limitation](#copy-limitation) — in practice unreachable because the response-side `CopyInResponse`/`CopyOutResponse`/`CopyBothResponse` that would start a COPY subprotocol is fail-closed. |
 
-## Rejected frontend messages: Extended Query Protocol
+## Rejected frontend messages: Extended Query Protocol (default)
+
+This section describes the **default** behavior
+(`protocol.extended_query_enabled: false` in `config.yaml`, which is also
+the value if the `protocol:` section is omitted entirely). For the
+opt-in Extended Query Protocol path, see "Opt-in Extended Query gateway
+wiring" below.
 
 `Parse` (`'P'`), `Bind` (`'B'`), `Execute` (`'E'`), `Describe` (`'D'`),
 `Close` (`'C'`), `Sync` (`'S'`), and `Flush` (`'H'`) are all explicitly
@@ -36,18 +42,21 @@ Parsed by `internal/protocol.Decoder` (client decoder) and evaluated by
 This is deliberate: these messages can carry arbitrary SQL (in `Parse`)
 or execute previously-parsed statements (`Bind`/`Execute`) without ever
 appearing as a `Query` message. Forwarding them unevaluated would let a
-client bypass the firewall policy entirely. Implementing the full
-protocol correctly — including the "skip to next `Sync`" resynchronization
-semantics required after an error mid-extended-protocol, connection-scoped
-prepared-statement/portal tracking, and masking across the Extended Query
-flow — is out of scope for V1; see
+client bypass the firewall policy entirely. An opt-in implementation now
+exists (Parse-time policy evaluation, connection-scoped prepared-
+statement/portal tracking, "skip to next `Sync`" resynchronization, and
+masking across the Extended Query flow) — see "Opt-in Extended Query
+gateway wiring" below and
 [docs/design/0001-extended-query.md](design/0001-extended-query.md) for
-the full design and the [README roadmap](../README.md#roadmap).
+the full design. Mixed Simple/Extended Query routing on one connection,
+TLS, and `COPY` remain unimplemented even with the flag enabled.
 
-**Practical impact:** clients/drivers that default to prepared-statement
-execution (e.g. `pgx`, `psycopg`'s prepared-statement mode) must be
-configured to use simple-protocol execution, or every query will fail
-with the error above.
+**Practical impact when the flag is left at its default (`false`):**
+clients/drivers that default to prepared-statement execution (e.g.
+`pgx`, `psycopg`'s prepared-statement mode) must either be configured to
+use simple-protocol execution, or the gateway must be configured with
+`protocol.extended_query_enabled: true`, or every query will fail with
+the error above.
 
 ### Typed parsing (no behavior change)
 
@@ -98,7 +107,7 @@ than a naive reading of the wire format:**
   negative or zero, as `FETCH_ALL`. `ExecuteMessage.MaxRows` preserves
   the wire value exactly as sent.
 
-### Connection-local state model (no runtime wiring)
+### Connection-local state model
 
 `internal/protocol/extended_state.go` adds a standalone, connection-local
 state model (`protocol.State`) that tracks prepared-statement and portal
@@ -108,21 +117,19 @@ the design document's "Object generations" and "Explicit pipeline-cycle
 identities" sections linked above.
 
 **This is a pure data structure, not a running component.** It performs no
-I/O, starts no goroutines, does no logging, and is **not constructed or
-called anywhere in `cmd/gateway`, `firewall.Gate`, or
-`masking.Transformer`**. It exists purely so the connection-state
-machinery a later stage needs (pending-operation correlation, `Parse`
-policy evaluation, local rejection/`Sync` recovery — see the design
-document's "Implementation decomposition") can be built and tested in
-isolation, without touching anything that affects a live connection today.
+I/O, starts no goroutines, and does no logging. `cmd/gateway/main.go`'s
+`runExtendedConnection` constructs one fresh `protocol.State` per
+connection when `protocol.extended_query_enabled: true` and hands it to
+`ExtendedRuntime`, which becomes its sole owner; `firewall.Gate.Run`/
+`masking.Transformer` (the default, unchanged Simple Query path) never
+construct or touch it.
 
-**Extended Query is still rejected fail-closed at runtime, exactly as
-before.** Nothing described in this section changes `firewall.Gate`'s
+**Extended Query is rejected fail-closed on the default path, exactly as
+before.** Nothing described in this section changes `firewall.Gate.Run`'s
 behavior: `isExtendedProtocolMessage` still rejects every `Parse`/`Bind`/
 `Describe`/`Execute`/`Close`/`Flush`/`Sync` message before any policy
-decision, unconditionally. Building `protocol.State` does not change
-anything described elsewhere in this document — it remains a groundwork
-data structure for a future stage, not a currently supported feature.
+decision, unconditionally, whenever `protocol.extended_query_enabled` is
+`false` (the default).
 
 **`Close` may capture a still-pending target.** `CreateCloseStatement`/
 `CreateClosePortal` resolve their target the same committed-or-pending way
@@ -140,7 +147,7 @@ out of the internally owned map/queue entry — including slice fields
 returned value can never corrupt `State`'s internal data; the only way to
 change `State` is through its own methods.
 
-### Backend-response correlator (no runtime wiring)
+### Backend-response correlator
 
 `internal/protocol/extended_correlation.go` adds a standalone
 `protocol.BackendCorrelator` that accepts decoded backend `protocol.Message`
@@ -215,14 +222,15 @@ pending operation or `Describe` substate — but the field/string/PID
 *values* themselves are never read into a Go string, returned, or stored;
 only their framing (NUL-terminator positions) is inspected.
 
-**None of this is wired into runtime networking or client output.**
-`BackendCorrelator` is not constructed or called anywhere in
-`cmd/gateway`, `firewall.Gate`, or `masking.Transformer`. Extended Query
-is still rejected fail-closed at runtime, exactly as described above —
-this component exists purely so the correlation logic a later stage needs
-can be built and tested in isolation.
+**Used internally by `ExtendedRuntime` on the opt-in path only.**
+`BackendCorrelator` is constructed and driven by `ExtendedRuntime`'s
+event loop, which `cmd/gateway/main.go`'s `runExtendedConnection`
+constructs only when `protocol.extended_query_enabled: true`. The default
+Simple Query path (`firewall.Gate.Run`/`masking.Transformer`) never
+constructs or calls it, and continues to reject Extended Query fail-closed
+exactly as described above.
 
-### Response sequencer (no runtime wiring)
+### Response sequencer
 
 `internal/protocol/extended_sequence.go` adds a standalone
 `protocol.ResponseSequencer` that combines three inputs into a single,
@@ -319,14 +327,15 @@ case above — retaining incomplete abandonment-tracking state and
 continuing as if the sequencer were still fully correct is never an
 option.
 
-**None of this is wired into runtime networking or client output.**
-`ResponseSequencer` is not constructed or called anywhere in
-`cmd/gateway`, `firewall.Gate`, or `masking.Transformer`. Extended Query
-is still rejected fail-closed at runtime, exactly as described above —
-this component exists purely so the response-ordering logic a later stage
-needs can be built and tested in isolation.
+**Used internally by `ExtendedRuntime` on the opt-in path only.**
+`ResponseSequencer` is constructed and driven by `ExtendedRuntime`, which
+`cmd/gateway/main.go`'s `runExtendedConnection` constructs only when
+`protocol.extended_query_enabled: true`. The default Simple Query path
+(`firewall.Gate.Run`/`masking.Transformer`) never constructs or calls it,
+and continues to reject Extended Query fail-closed exactly as described
+above.
 
-### Standalone event-driven runtime loop (no runtime wiring)
+### Standalone event-driven runtime loop
 
 `internal/gateway/extended_runtime.go` adds a standalone,
 connection-local `gateway.ExtendedRuntime` that combines frontend
@@ -446,15 +455,18 @@ watcher closed the connection to unblock it). If an internal condition
 initiated shutdown first, that error remains primary — causality is never
 determined by inspecting an OS error string.
 
-**This is still not part of the LIVE gateway.** `cmd/gateway` never
-constructs or calls `ExtendedRuntime`, and `firewall.Gate.Run` — the live,
-production entry point — still rejects Extended Query fail-closed exactly
-as described above. `ExtendedRuntime` now has exactly one call site: the
-opt-in, test-only `firewall.Gate.RunExtended`/`firewall.ExtendedFrontend`
-bridge described in the next section. That path is itself not wired into
-`cmd/gateway`.
+**Stage 8: this is now part of the LIVE gateway, opt-in.**
+`cmd/gateway/main.go`'s `runExtendedConnection` constructs and calls
+`ExtendedRuntime` (via `NewExtendedRuntimeWithMasking` when
+`masking.enabled` is true, otherwise `NewExtendedRuntime`) whenever
+`protocol.extended_query_enabled: true` is set in `config.yaml`. When the
+flag is false (the default), `firewall.Gate.Run` — via
+`runSimpleConnection` — remains the live entry point and still rejects
+Extended Query fail-closed exactly as described above, byte-for-byte
+identical to the pre-stage-8 behavior. See "Opt-in Extended Query gateway
+wiring" below for the live connection lifecycle.
 
-### Opt-in Extended Query frontend bridge (still not part of the live gateway)
+### Opt-in Extended Query frontend bridge
 
 `internal/firewall/extended_frontend.go` adds a second, opt-in entry point,
 `Gate.RunExtended(ctx, client, frontend)`, alongside the existing
@@ -464,16 +476,16 @@ discard-until-`Sync` for a single connection. `Gate.Run` itself is
 **completely unchanged** — same signature, same behavior, same
 fail-closed Extended Query rejection; `RunExtended` is a parallel method
 that only runs when a caller explicitly constructs an `ExtendedFrontend`
-and calls it. `cmd/gateway` does not do this.
+and calls it. `cmd/gateway/main.go`'s `runExtendedConnection` does this
+when `protocol.extended_query_enabled: true`.
 
 **Steady-state only.** `RunExtended` reads with
 `protocol.NewSteadyStateFrontendFrameDecoder`, which — unlike
 `protocol.NewClientDecoder` — skips the startup/authentication phase
-entirely and starts directly in normal (tag+length) framing mode.
-Startup/authentication handoff into this path remains unimplemented; a
-caller is responsible for having already completed authentication on
-`client` through the existing (unchanged) flow before ever calling
-`RunExtended`.
+entirely and starts directly in normal (tag+length) framing mode. The
+startup/authentication phase is handled separately, before
+`RunExtended` is ever called, by `internal/gateway.RunStartupHandoff` —
+see "Opt-in Extended Query gateway wiring" below.
 
 **Framing and typed body parsing are now two separate steps (hardening
 revision).** `NewSteadyStateFrontendFrameDecoder` validates ONLY normal
@@ -609,21 +621,23 @@ been removed for this reason.
 (Simple Query) message, a COPY frontend message, or any other
 unrecognized steady-state message reaches `RunExtended`, `ExtendedFrontend`
 fails closed and terminates the standalone runtime without forwarding
-it — this path is Extended-Query-only in this stage. Startup/
-authentication handoff and mixed Simple/Extended Query routing require a
-later, explicitly scoped stage. Extended Query response masking (see
-the next section) is now implemented, opt-in, and independent of this
-mixed-routing gap.
+it — an opt-in connection is Extended-Query-only for its entire lifetime,
+even in stage 8's live wiring. Mixed Simple/Extended Query routing on one
+connection requires a later, explicitly scoped stage. Extended Query
+response masking (see the next section) is implemented, opt-in, and
+independent of this mixed-routing gap.
 
-### Opt-in Extended Query response masking (still not part of the live gateway)
+### Opt-in Extended Query response masking
 
 `gateway.NewExtendedRuntimeWithMasking` adds a second, opt-in constructor
 alongside the existing `NewExtendedRuntime` — same struct, same event
 loop, same single-writer/single-reader ownership guarantees, with masking
 metadata attached only when explicitly requested. `NewExtendedRuntime`
 itself is **completely unchanged** and continues to produce a
-masking-disabled runtime; `cmd/gateway` does not call the masking
-constructor.
+masking-disabled runtime. `cmd/gateway/main.go`'s `runExtendedConnection`
+calls `NewExtendedRuntimeWithMasking` when both
+`protocol.extended_query_enabled: true` and `masking.enabled: true`;
+otherwise it calls the unchanged, masking-disabled `NewExtendedRuntime`.
 
 **Two layers, not one.** `masking.Transformer` (the live Simple Query
 path) was **not** given Extended Query awareness directly — its
@@ -727,6 +741,109 @@ partial recording or background eviction — capacity exhaustion before
 `Execute`'s `State` mutation is a recoverable local rejection; capacity
 exhaustion while processing a real backend Describe is terminal
 fail-closed, exactly like a malformed backend message.
+
+## Opt-in Extended Query gateway wiring
+
+`cmd/gateway/main.go` dispatches every accepted connection to one of two
+fully independent functions based on `cfg.Protocol.ExtendedQueryEnabled`
+(`config.yaml`'s `protocol.extended_query_enabled`, default `false`):
+`runSimpleConnection` (the unchanged, pre-stage-8 `firewall.Gate.Run`/
+`masking.Transformer.Run` path) or `runExtendedConnection` (new, opt-in).
+There is no per-message or per-connection fallback between the two —
+the flag is read once, at the start of each connection.
+
+**Startup/authentication handoff.** `runExtendedConnection` first calls
+`internal/gateway.RunStartupHandoff(ctx, client, target, limits)`, a
+dedicated function that owns both the client and backend transports
+*exclusively* until it returns. It performs no policy evaluation, no
+masking, and constructs no `protocol.State`/`ExtendedRuntime` — it only:
+
+- answers `SSLRequest`/`GSSENCRequest` with `'N'` (looping to handle
+  repeated probes) without ever forwarding them, exactly like
+  `firewall.Gate.Run`;
+- forwards a `CancelRequest` to the backend exactly once and returns
+  immediately (`StartupResult.CancelOnly = true`), constructing no
+  runtime — a cancellation connection never becomes an Extended Query
+  session; the secret key is relayed byte-for-byte, whatever its length
+  (see "Protocol 3.0 and 3.2 compatibility" below) — it is never
+  inspected, compared, or logged;
+- forwards `StartupMessage` once, then relays the full authentication
+  sub-protocol (`AuthenticationOk`/`Cleartext`/`MD5`/`SASL`/
+  `SASLContinue`/`SASLFinal`, `PasswordMessage` responses, backend
+  `ErrorResponse`/`NoticeResponse`) without inspecting or retaining any
+  credential bytes; unsupported authentication codes fail closed;
+- relays backend startup messages (`ParameterStatus`, `BackendKeyData`,
+  `NoticeResponse`, `NegotiateProtocolVersion`) and validates/relays the
+  first real `ReadyForQuery` (only status `'I'`, since a freshly
+  constructed `protocol.State` always starts idle), then returns
+  successfully.
+
+**Protocol 3.0 and 3.2 compatibility.** `StartupMessage`'s major version
+must be `3`; the minor version is not validated or restricted — the real
+backend negotiates it, optionally via `NegotiateProtocolVersion`, which
+the handoff relays unchanged in either authentication phase. This matters
+because PostgreSQL 18 introduced protocol 3.2, which changed
+`BackendKeyData`'s and `CancelRequest`'s secret key from a fixed 4 bytes
+to a variable-length field (4–256 bytes inclusive, extending to the end
+of the message) — PostgreSQL 18 currently sends 32-byte keys. The handoff
+accepts and relays both shapes transparently: it validates only that the
+total key length falls in the documented `[4, 256]` range, and never
+branches on the negotiated startup version to decide which shape to
+expect. `BackendKeyData`/`CancelRequest` PID and secret-key bytes are
+never retained, compared, or logged — only their combined length is
+checked.
+
+All reads use `io.ReadFull` exclusively — never a buffered/read-ahead
+reader — so the handoff consumes exactly the bytes each step declares
+and leaves any subsequent bytes (already sitting in the OS socket buffer
+if the client or backend coalesced writes) completely untouched for the
+next owner to read; there is no private prefetch buffer that could lose
+or duplicate bytes across the ownership boundary. Ownership never
+overlaps: the handoff is the sole reader/writer of both transports until
+it returns, and only then does `ExtendedRuntime`/`ExtendedFrontend`
+begin reading.
+
+**Runtime construction and startup, after a successful, non-cancel
+handoff.** `runExtendedConnection` constructs a fresh `protocol.State`,
+then an `ExtendedRuntime` (via `NewExtendedRuntimeWithMasking` if
+`masking.enabled`, otherwise the unchanged `NewExtendedRuntime`) and an
+`ExtendedFrontend`, starts `ExtendedRuntime.Run` in its own goroutine,
+and calls `rt.WaitStarted(ctx)` to deterministically confirm the event
+loop is actually ready — without polling — before ever calling
+`firewall.Gate{}.RunExtended(ctx, client, frontend)`. If `WaitStarted`
+fails (runtime stopped or context canceled before starting),
+`RunExtended` is never called and the already-started `Run` goroutine is
+still joined before returning. After `RunExtended` returns,
+`runExtendedConnection` joins the runtime goroutine before returning
+itself — no goroutine is ever left running past the function's return.
+
+**Policy and masking hooks reuse existing metrics, exactly once each.**
+`extendedOnDecide` increments `sentineldb_blocked_queries_total` on a
+Parse-time policy block, mirroring the Simple Query path's
+`logGateDecision`. `extendedMaskingHooks`' `OnMaskAttempt` observes
+`sentineldb_masking_plugin_duration_seconds` and increments
+`sentineldb_masked_cells_total` on a successful change, but deliberately
+does **not** increment `sentineldb_masking_errors_total` itself (to avoid
+double-counting against a terminal masking failure) — that counter is
+incremented exactly once, from `rt.Run`'s own returned error
+(`errors.Is(err, gateway.ErrExtendedMaskingFailed)`), in
+`logExtendedRuntimeOutcome`. No SQL text, statement/portal name, Bind
+parameter value, or DataRow cell value is ever logged by any of these
+hooks — only fixed, safe classification strings and (for masking errors)
+the target column name.
+
+**No fallback to Simple Query after handoff.** Once
+`ExtendedRuntime`/`ExtendedFrontend` own a connection, that connection
+remains Extended-Query-only for its entire remaining lifetime — there is
+no per-message mode switch and no code path that re-invokes
+`firewall.Gate.Run`/`masking.Transformer.Run` on the same connection.
+
+**Live gateway limitations even with the flag enabled:** mixed Simple/
+Extended Query routing on one connection, TLS, and `COPY` remain
+unimplemented (see "Mixed Simple/Extended Query routing remains
+unsupported" above, and the [COPY limitation](#copy-limitation) section
+below) — enabling the flag only adds Extended Query Protocol support; it
+does not change any of SentinelDB's other documented limitations.
 
 ## SSLRequest / GSSENCRequest rejection
 

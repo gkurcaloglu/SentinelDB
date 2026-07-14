@@ -75,6 +75,18 @@ and `COPY`. See `docs/design/0001-extended-query-review-checklist.md` and
 this document's [Non-goals](#non-goals) for the full list still
 outstanding.
 
+**Mixed Simple/Extended Query routing now has its own design document.**
+[docs/design/0002-mixed-query-routing.md](0002-mixed-query-routing.md)
+(status: proposed, not implemented) specifies a `protocol.query_mode:
+mixed` connection mode allowing one authenticated connection to
+alternate between Simple Query and Extended Query at clean
+`ReadyForQuery` boundaries — the gap this document's own "What remains
+unimplemented" paragraph above has always flagged. Nothing in that
+document is implemented yet; this document's own status and the
+`extended_only`/Simple-Query-rejection behavior described above remain
+accurate until that separate design is reviewed and its implementation
+lands.
+
 **A dedicated real-driver compatibility stage now exists.**
 `integration/pgxcompat` runs the real, unmodified, stable
 `github.com/jackc/pgx/v5` driver (pinned in its own nested Go module,

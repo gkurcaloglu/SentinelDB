@@ -1,0 +1,34 @@
+# Dedicated SentinelDB gateway config for the pgx driver-compatibility
+# stage (see deploy/driver-compat/docker-compose.yml, scripts/driver-compat.ps1,
+# and integration/pgxcompat). This is NOT the default config.yaml at the
+# repository root - the root config keeps protocol.extended_query_enabled
+# at its default (false); this file exists only so this dedicated,
+# opt-in-only stack can exercise the Extended Query gateway path with a
+# real driver.
+
+firewall:
+  # A single, deterministic blocked phrase, matched by
+  # integration/pgxcompat's Parse-time policy rejection/recovery test.
+  blocked_phrases:
+    - "DROP TABLE"
+
+wasm:
+  plugin_path: "plugins/firewall/v2.wasm"
+
+# Never log full SQL query text in this stack either - the driver-compat
+# runner's log scan (scripts/driver-compat.ps1) treats a leaked query
+# marker as a hard failure.
+logging:
+  log_full_queries: false
+
+masking:
+  enabled: true
+  columns:
+    - email
+
+# The one setting this dedicated config changes relative to the repository
+# root's default config.yaml: opt-in Extended Query gateway support, so an
+# unmodified pgx v5 driver (which defaults to the Extended Query Protocol)
+# can complete a full session instead of being fail-closed rejected.
+protocol:
+  extended_query_enabled: true

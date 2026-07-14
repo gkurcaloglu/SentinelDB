@@ -179,3 +179,25 @@ docker compose down -v
 
 Only run this if you intend to discard the volume. There is no
 confirmation prompt.
+
+## Driver-compatibility stack (separate from this demo stack)
+
+This document covers the default Simple Query demo stack
+(`docker-compose.yml`, `protocol.extended_query_enabled: false`). A
+second, entirely separate, dedicated stack —
+[deploy/driver-compat](../deploy/driver-compat) — exists only to run the
+real pgx v5 driver-compatibility suite (`integration/pgxcompat`) against
+the opt-in Extended Query gateway. It is not started by any command on
+this page and does not share ports, containers, networks, or volumes with
+the stack described above:
+
+```powershell
+pwsh scripts/driver-compat.ps1                     # PostgreSQL 16, leaves the stack running
+pwsh scripts/driver-compat.ps1 -PostgresVersion 18  # PostgreSQL 18
+pwsh scripts/driver-compat.ps1 -Cleanup             # tears the dedicated stack + volume down when done
+```
+
+Gateway `127.0.0.1:25432`, direct PostgreSQL `127.0.0.1:25433`, Compose
+project `sentineldb-driver-compat`. See
+[docs/postgresql-protocol.md](postgresql-protocol.md#pgx-v5-driver-compatibility)
+for what this suite covers and what it discovered.

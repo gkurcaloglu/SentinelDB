@@ -994,3 +994,149 @@ corrupting the value or failing to mask it correctly. Simple Query
 Protocol results are text format by default for standard clients like
 `psql`/libpq, so this limitation is mainly relevant to clients that
 explicitly request binary result formatting.
+
+## pgx v5 driver compatibility
+
+`integration/pgxcompat` is SentinelDB's first dedicated real-driver
+compatibility stage: it runs the real, unmodified, stable
+`github.com/jackc/pgx/v5` driver — pinned in its own nested Go module
+(`integration/pgxcompat/go.mod`), isolated from the production gateway's
+dependencies (`cmd/gateway` never imports pgx) — against real PostgreSQL
+16 and PostgreSQL 18 servers through the opt-in Extended Query gateway
+(`protocol.extended_query_enabled: true`). Run it locally with
+[scripts/driver-compat.ps1](../scripts/driver-compat.ps1) (`-PostgresVersion 16` or
+`-PostgresVersion 18`) against the dedicated
+[deploy/driver-compat](../deploy/driver-compat) Compose stack, or see it run
+in CI's `driver-compat` matrix job.
+
+**This is compatibility evidence for one driver, not a security audit or
+a general driver-compatibility guarantee.** psycopg, JDBC, Npgsql,
+Prisma, other Node.js drivers, and ORMs built on any of them remain
+untested. TLS, `COPY`, and production readiness remain unsupported
+regardless of driver, exactly as described throughout this document.
+
+### What is exercised
+
+- Plaintext startup and PostgreSQL SCRAM authentication through
+  `internal/gateway.RunStartupHandoff`, requesting the latest protocol
+  version pgx supports (3.0 or 3.2) while accepting 3.0 as the minimum.
+- pgx's *default* Extended Query execution mode
+  (`QueryExecModeCacheStatement`) — automatic server-side statement
+  preparation/caching — run repeatedly on one connection, unmodified.
+- An explicit named prepared statement, executed multiple times and
+  closed through pgx's protocol-level `Deallocate` (a real `Close`
+  message, not a textual `DEALLOCATE` statement).
+- Text-format response masking of the configured `email` column,
+  including `NULL` and non-masked columns, verified against the real
+  (unmasked) stored value via a direct, non-gateway connection.
+- A binary-format request against a masked column (see [Text-format
+  masking currently required for masking targets](#text-format-masking-currently-required-for-masking-targets)
+  below).
+- Parse-time policy rejection (the configured blocked phrase) and
+  discard-until-`Sync` recovery on the same connection, without
+  reconnecting.
+- Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`) sent as ordinary
+  Extended Query statements (see [pgx's `Ping` and `Tx` API are
+  incompatible with Extended-only mode](#pgxs-ping-and-tx-api-are-incompatible-with-extended-only-mode)
+  below for why not via pgx's `Tx` convenience wrapper).
+- pgx's normal batch API (`pgx.Batch`/`SendBatch`), proving in-order
+  results and that a genuine mid-batch backend error (division by zero,
+  not a Parse-time policy block) is handled per normal PostgreSQL Sync
+  semantics — later same-cycle pipelined operations are abandoned, and
+  the connection recovers afterward.
+- A real `CancelRequest`, sent through pgx's public
+  `(*pgconn.PgConn).CancelRequest` using the `BackendKeyData` credentials
+  SentinelDB relayed during startup, against both PostgreSQL 16's legacy
+  4-byte cancellation key and PostgreSQL 18's protocol 3.2
+  variable-length key — verified by polling `pg_stat_activity` on a
+  direct connection (never a fixed sleep) and asserting `SQLSTATE 57014`.
+- The documented Extended-only connection-wide boundary: a pgx connection
+  explicitly configured for Simple Query Protocol is rejected fail-closed
+  and terminated by the Extended-only gateway (see [Mixed Simple/Extended
+  Query routing remains
+  unsupported](#opt-in-extended-query-frontend-bridge) above) — this test
+  documents the boundary, it is not a request to support it.
+
+None of this suite's tests print, log, or assert on a password, full DSN,
+SQL text containing a marker, Bind parameter value, raw or masked email
+value, backend PID, cancellation secret key, or server `ErrorResponse`
+field content — see `integration/pgxcompat/helpers_test.go` and
+`scripts/driver-compat.ps1`'s own log privacy scan.
+
+### Text-format masking currently required for masking targets
+
+Requesting a configured masking-target column (`email`) in **binary**
+result format does not silently succeed and does not silently disable
+masking. `ExtendedRuntime`'s Execute-time masking preflight
+(`internal/masking.ErrExtendedBinaryTarget`,
+`gateway.ErrExtendedMaskingPreflightRejected`) detects the binary format
+request before the statement ever executes and rejects it — the raw
+value is never returned. On the Extended Query path specifically, this
+preflight rejection is the same *recoverable*, connection-local local
+rejection category (`SQLSTATE 42501`, discard-until-`Sync`) used for a
+Parse-time policy block, **not** a hard, connection-terminating failure —
+unlike the Simple Query path's `Transformer`, which does fail closed by
+terminating the connection for a binary-format masked column (see
+[Binary format limitation](#binary-format-limitation) above). This suite
+treats the rejection itself as the load-bearing assertion (the raw value
+is never returned) and does not continue using that specific connection
+afterward, rather than asserting a specific recovery behavior beyond what
+is documented here. Masking configured target columns therefore
+currently requires text result format on both protocol paths; binary
+requests against those columns remain fail-closed on both.
+
+### pgx's `Ping` and `Tx` API are currently incompatible with Extended-only mode
+
+This suite discovered — and documents rather than works around — a
+**current** compatibility limitation between two pieces of pinned pgx
+v5.10.0's own public API and SentinelDB's Extended-only gateway mode.
+This is a fact about pgx v5.10.0's implementation and SentinelDB's
+current, deliberately Extended-only gateway mode today, not a
+statement about either project's future behavior:
+
+- **`(*pgx.Conn).Ping`** delegates, in pgx v5.10.0, to
+  `pgconn.PgConn.Ping`, which itself calls `Exec(ctx, "-- ping")` — and
+  that issues a raw Simple Query message. There is no Extended Query
+  option at that layer in this pgx version, and no pgx configuration
+  available today changes it.
+- **pgx's convenience `Tx` API** (`(*pgx.Conn).Begin`,
+  `(pgx.Tx).Commit`, `(pgx.Tx).Rollback`, and pseudo-nested-transaction
+  savepoints), in pgx v5.10.0, issues `begin`/`commit`/`rollback`/
+  `savepoint ...` via `(*pgx.Conn).Exec` with **zero** bind arguments.
+  pgx v5.10.0's own `Exec` forces the Simple Query Protocol whenever it
+  is called with no arguments, regardless of `QueryExecMode` — a general
+  behavior of pgx's `Exec` in this version, not specific to transaction
+  control.
+
+SentinelDB's Extended-only gateway correctly (and, per its current
+design, necessarily) rejects any Simple Query message fail-closed and
+terminates the connection — the same documented boundary
+[`TestSimpleQueryRejectedOnExtendedOnlyGateway`](#pgx-v5-driver-compatibility)
+exercises directly. This means `Ping` cannot currently succeed against
+an Extended-only connection, and pgx's `Tx` wrapper cannot currently
+begin a transaction against one either, with this pinned pgx version and
+this SentinelDB mode. Ordinary parameterized and prepared Extended Query
+operations are unaffected and work normally — this limitation is
+specific to `Ping`, zero-argument `Exec` calls, and the convenience `Tx`
+API. Neither is a SentinelDB bug to work around today: mixed Simple/
+Extended Query routing on one connection is out of scope for this branch
+(see [Mixed Simple/Extended Query routing remains
+unsupported](#opt-in-extended-query-frontend-bridge) above), so
+SentinelDB does not start accepting Simple Query on an Extended-only
+connection merely to accommodate these two pgx behaviors. A future pgx
+release could change how `Ping`/`Exec`/`Tx` are implemented, and a future
+SentinelDB stage could add mixed-routing support — either would change
+this compatibility picture, but no such future support is claimed or
+implemented in this branch.
+
+`integration/pgxcompat` therefore proves connectivity via a trivial
+Extended Query `SELECT` instead of `Ping` everywhere except
+`TestConnectionStartupAuthAndProtocolNegotiation`, which exercises `Ping`
+directly and asserts it currently fails against this pinned pgx version
+(and that the connection remains otherwise provably healthy
+beforehand). Transaction control is proven by sending `BEGIN`/`COMMIT`/
+`ROLLBACK` as ordinary Extended Query statements through pgx's `Query`/
+`Exec`, not through `(*pgx.Conn).Begin`. Applications using pgx v5.10.0
+against an Extended-only SentinelDB gateway today need the same
+workaround: avoid `Ping` and pgx's `Tx` API, and issue transaction
+control as explicit statements instead.

@@ -72,11 +72,18 @@ both `net.Conn`s in `activeConns`, then dispatches on
   on `rt.WaitStarted(ctx)`, and only then calls
   `(&firewall.Gate{}).RunExtended(ctx, client, frontend)`.
 
-Both paths share `gateway.RunStartupHandoff` conceptually (only
-`runExtendedConnection` currently calls it — `runSimpleConnection` relays
-startup/authentication inline via `firewall.Gate.Run`'s own
-`protocol.NewClientDecoder`, which begins in `phaseStartup`). This is
-addressed in [Configuration and migration behavior](#configuration-and-migration-behavior).
+Today, only `runExtendedConnection` calls `gateway.RunStartupHandoff` —
+`runSimpleConnection` does not call it at all, and does not share it:
+`runSimpleConnection` relays startup/authentication inline via
+`firewall.Gate.Run`'s own `protocol.NewClientDecoder`, which begins in
+`phaseStartup`, entirely independent of `RunStartupHandoff`. This design
+adds a third path, `runMixedConnection`, which calls
+`gateway.RunStartupHandoff` — the same function `runExtendedConnection`
+already calls, unmodified — so after this design is implemented,
+`mixed` and `extended_only` will call `RunStartupHandoff`, while
+`simple_only` continues to use its own separate, inline startup path,
+unchanged. This is addressed in
+[Configuration and migration behavior](#configuration-and-migration-behavior).
 
 ### Simple-only path
 
@@ -309,9 +316,18 @@ without:
    behavior is provably unchanged in `simple_only` and `extended_only`
    modes, and semantically equivalent (same policy contract, same masking
    guarantees, same fail-closed categories) in `mixed` mode.
-5. Exactly one goroutine owns `protocol.State`, exactly one owns response
-   sequencing/ordering, exactly one writes to the client, exactly one
-   writes to the backend, at all times, in all three modes.
+5. In `mixed` and `extended_only`, exactly one runtime event-loop
+   goroutine owns `protocol.State`, owns response sequencing/ordering,
+   writes to the client, and writes to the backend, at all times.
+   `simple_only` does not construct `protocol.State`,
+   `ResponseSequencer`, or `ExtendedRuntime` at all — it preserves its
+   own existing `Gate`+`Transformer`+`TxState` ownership model, unchanged
+   (see [Ownership model, clarified per mode](#ownership-model-clarified-per-mode)).
+   The invariant that holds across **all three** modes is narrower than
+   "the same components exist everywhere": no mutable component or
+   transport direction is ever concurrently owned by more than one
+   goroutine, regardless of which concrete components a given mode
+   constructs.
 6. Every locally-rejected or protocol-violating case has a precisely
    defined, fixed, safe error category, a defined connection-fatal-or-
    recoverable classification with justification, and a defined effect
@@ -831,9 +847,49 @@ lifetime); no direct client write from the frontend policy layer
 (`MixedFrontend` never writes to `client`, exactly like `ExtendedFrontend`
 today); no direct backend write from multiple frontend handlers (only the
 runtime event-loop calls `writeAll(r.backend, ...)`); startup handoff
-ownership ends before steady-state ownership begins (unchanged —
-`RunStartupHandoff` returns before `MixedFrontend`/`ExtendedRuntime` are
-constructed, for all three modes alike).
+ownership ends before steady-state ownership begins for `mixed`
+(unchanged from `extended_only`'s existing behavior — `RunStartupHandoff`
+returns before `MixedFrontend`/`ExtendedRuntime` are constructed).
+`simple_only` is not part of this table (it constructs neither
+`MixedFrontend` nor `ExtendedRuntime` — see
+[Ownership model, clarified per mode](#ownership-model-clarified-per-mode)
+below), but the same underlying invariant holds for it too, via its own,
+different mechanism: `firewall.Gate.Run`'s inline startup phase
+(`phaseStartup`) has exclusive ownership of both transports until it
+transitions to steady-state processing, before `Gate`/`Transformer`'s own
+steady-state ownership begins — startup ownership never overlaps
+steady-state ownership in any of the three modes, even though the
+concrete mechanism differs (`RunStartupHandoff` for `mixed`/
+`extended_only`, `Gate.Run`'s own inline phase transition for
+`simple_only`).
+
+### Ownership model, clarified per mode
+
+The table and invariants above describe `mixed` mode specifically — every
+component in it (`protocol.State`, `ResponseSequencer`,
+`SimpleQueryTracker`, `simpleQueryActive`, `simpleMaskPlan`,
+`MixedFrontend`, `ExtendedRuntime`) is a `mixed`-mode-only construction.
+None of this table should be read as describing `simple_only`, which
+constructs **none** of these components. To avoid any ambiguity about
+which components exist in which mode:
+
+| Mode | `protocol.State` | `ResponseSequencer` | `ExtendedRuntime` | Steady-state ownership model |
+|---|---|---|---|---|
+| `simple_only` | **Not constructed.** | **Not constructed.** | **Not constructed.** | Existing, unchanged: `firewall.Gate` (client → server) and `masking.Transformer` (server → client) run in two goroutines, coordinated by `protocol.TxState` (atomic-based) and `protocol.SerializedWriter`; no `protocol.State`, no `ResponseSequencer` — see [Simple-only path](#simple-only-path). |
+| `extended_only` | One instance, runtime event-loop-owned. | One instance, runtime event-loop-owned. | One instance, owns both transports' steady-state writes. | Existing, unchanged: `gateway.ExtendedRuntime` — see [Extended-only path](#extended-only-path). |
+| `mixed` | One instance, runtime event-loop-owned (same type as `extended_only`, reused, not duplicated). | One instance, runtime event-loop-owned, active only while `!simpleQueryActive` (mutually exclusive with `SimpleQueryTracker`, active only while `simpleQueryActive`). | One instance, `ExtendedRuntime` extended in place — see [Ownership model](#ownership-model) table above. | New (this design): the table above. |
+
+`simple_only`'s own ownership model (`Gate.Run`+`Transformer.Run`, one
+goroutine each, coordinated only by `protocol.TxState` and
+`protocol.SerializedWriter`) is **not modified, not extended, and not
+described by the `mixed`-mode ownership table above** — it is restated
+here only to make explicit that this design does not construct
+`protocol.State`/`ResponseSequencer`/`ExtendedRuntime` for `simple_only`,
+never has, and does not propose to. The single invariant that is
+genuinely universal across all three modes is the one stated in
+[Goals](#goals) item 5: no mutable component or transport direction is
+ever concurrently owned by more than one goroutine — each mode satisfies
+this using its own, different set of components, not a shared one.
 
 ## Frontend state machine
 
@@ -845,9 +901,12 @@ parsing happens per-handler, after the discard decision, exactly as
 `Parse`/`Bind`/`Describe`/`Execute`/`Close`/`Flush`/`Sync` handling with
 `ExtendedFrontend` via extracted, shared helper functions (see
 [Staged implementation plan](#staged-implementation-plan), Stage C) — not
-by duplicating that logic, and not by modifying `ExtendedFrontend`'s own
-behavior, which remains byte-for-byte unchanged (verified by its existing,
-unmodified test suite continuing to pass).
+by duplicating that logic. `ExtendedFrontend`'s own source is edited by
+this extraction (its per-message-type logic moves into helpers both types
+call), so its source is not byte-for-byte unchanged; what is unchanged is
+its **public, observable behavior** — verified by its existing test suite
+(unmodified by this refactor) continuing to pass against the refactored
+code, proving the extraction introduced no behavior change.
 
 ### Dispatch table
 
@@ -878,19 +937,27 @@ unmodified test suite continuing to pass).
    returns immediately: no body parsing, no policy evaluation, no
    metrics, no logging occurs for a boundary-violating Query. Otherwise,
    proceed.
-4. Parse the Query body: require exactly one NUL-terminated query string,
-   reject a missing terminator, reject any trailing byte after the
-   terminator (mirrors protocol.trimNullTerminator's existing framing but
-   with an explicit trailing-byte check this design adds — see
+4. Parse the Query body (this is `MixedFrontend`'s own typed-body
+   validation, in `internal/firewall` — distinct from
+   `NewSteadyStateFrontendFrameDecoder`'s tag/length-only framing, which
+   already ran in step 1): require exactly one NUL-terminated query
+   string, reject a missing terminator, reject any trailing byte after
+   the terminator (mirrors protocol.trimNullTerminator's existing framing
+   but with an explicit trailing-byte check this design adds — see
    Protocol Requirements below and the frame-size limit already enforced
    by NewSteadyStateFrontendFrameDecoder's shared MaxFrontendFrameBytes
-   check). On failure: build a fixed ErrMalformedSimpleQueryFrame
-   synthetic response (see Error categories) — SQL is never included, the
+   check). On failure: classify locally as the fixed, `firewall`-package-
+   only `ErrMalformedSimpleQueryFrame` (see Error categories — this
+   sentinel is never declared in or returned by `internal/gateway`) and
+   build a fixed synthetic-response reason — SQL is never included, the
    frame is never forwarded, and (per the "recoverable Parse-body-
    malformed" precedent) this is a LOCAL, recoverable rejection: reply
    with a synthetic ErrorResponse+ReadyForQuery pair, using
    runtime.RejectSimpleQuery(ctx, sqlState, reason, queryReceived=false)
-   — queryReceived=false because no structurally valid Query was ever
+   — the runtime receives only the fixed SQLSTATE string, the fixed
+   reason string, and queryReceived=false through this call; it never
+   receives or constructs ErrMalformedSimpleQueryFrame itself.
+   queryReceived=false because no structurally valid Query was ever
    accepted, so the unnamed-object lifecycle effect must NOT be applied
    (see Correct valid blocked-Query lifecycle semantics below). No
    discard follows (Simple Query has no Sync to recover at). Return.
@@ -1119,12 +1186,15 @@ its synthetic response with no boundary check at all.
    connection-fatal (Case 2), exactly as ForwardSimpleQuery's step 2
    does.
 2. Build protocol.BuildErrorResponse("ERROR", sqlState, reason) — the
-   SAME helper Gate.handle's Block branch already uses today. reason is
-   always one of a small set of fixed, safe strings (the Policy block
-   reason string itself, which - per DenyKeywords's existing contract -
-   is already client-facing/safe, containing at most the matched blocked
-   phrase, never arbitrary SQL; and fixed internal strings for malformed-
-   frame rejection).
+   SAME helper Gate.handle's Block branch already uses today. For the
+   malformed-frame case, reason is always one of a small set of fixed
+   internal strings. For the policy-blocked case, reason comes from
+   Policy.Evaluate's verdict and is NOT assumed small or bounded by this
+   step: DenyKeywords's own reasons happen to be short (derived from
+   sqlmatch's matched phrase), but the Policy interface is generic - a
+   Wasm-backed Policy, a test PolicyFunc, or any other implementation may
+   legitimately return an arbitrarily long reason string. Size is
+   enforced separately, at step 5 below, not assumed here.
 3. If queryReceived (see the method's doc comment above): call
    state.ApplySimpleQueryReceived() — the SAME unnamed-statement/
    unnamed-portal clearing operation ForwardSimpleQuery's step 3 calls
@@ -1151,17 +1221,31 @@ its synthetic response with no boundary check at all.
    the next step should reflect a State that has already had this Query's
    lifecycle effect applied, consistent with ForwardSimpleQuery's own
    ordering.)
-5. writeAll(r.client, errorResponseBytes) then
+5. Enforce the synthetic-frame-size limit (the existing
+   SequencerLimits.MaxSyntheticFrameBytes-style bound, reused, not a new
+   constant) against errorResponseBytes' size, BEFORE any client write —
+   see Synthetic policy-response size enforcement. This check applies
+   uniformly regardless of which Policy implementation produced reason.
+   On failure (oversized): ack the existing fixed, safe, fail-closed
+   bounded-synthetic-frame error category (the same one Extended's own
+   synthetic-error path already uses for this situation - no new
+   sentinel), permanent fail-closed termination; NO client bytes are
+   written (the check runs before writeAll, not after a truncated
+   write); the raw reason string is never logged. If step 3 ran
+   (queryReceived case), State was already mutated with no rollback,
+   matching the same "no speculative rollback" rule used throughout this
+   design.
+6. writeAll(r.client, errorResponseBytes) then
    writeAll(r.client, protocol.BuildReadyForQuery(status)) — both via the
    SAME single-writer path processActions already uses (direct call,
    since — per the clean-boundary invariant proven above — nothing else
    can legitimately be queued ahead of this write at a clean boundary).
-6. Ack success. The connection remains usable — no Sync is required
+7. Ack success. The connection remains usable — no Sync is required
    (Simple Query has no Sync concept at all), unlike a blocked Extended
    Parse, which enters discard-until-Sync and does not immediately
    synthesize a complete, independent response cycle. See
    Transaction-state behavior for the full contrast.
-7. On a client write failure at step 5: ErrClientWriteFailed (existing
+8. On a client write failure at step 6: ErrClientWriteFailed (existing
    sentinel, reused), permanent fail-closed termination — if step 3 ran
    (queryReceived case), State was already mutated with no rollback,
    matching the same "no speculative rollback" rule ForwardSimpleQuery's
@@ -1645,11 +1729,15 @@ What is new is a single extracted helper, proposed for Stage D:
 func BuildRowMaskPlanFromRowDescription(cfg Config, fields []protocol.RowField) RowMaskPlan
 ```
 
-`Transformer.handleRowDescription` is refactored (Stage D) to call this
-helper instead of its current inline loop — a behavior-preserving
-refactor verified by `Transformer`'s existing, unmodified test suite
-continuing to pass unchanged (byte-for-byte identical output for every
-existing test case).
+`Transformer.handleRowDescription`'s source is refactored (Stage D) to
+call this helper instead of its current inline loop — this is a source
+change, not a byte-for-byte-unchanged claim. What is verified,
+precisely: `Transformer`'s existing test suite (source unmodified by this
+refactor) continues to pass, and for every existing test case's input,
+the emitted output bytes are identical to today's — i.e. the refactor is
+behavior-preserving at the level the existing tests actually assert
+(output bytes for given inputs), not a claim that the surrounding source
+code is textually unchanged.
 
 ### Runtime integration (single active plan, mirrors `Transformer` exactly)
 
@@ -1665,7 +1753,8 @@ active result set at a time (multiple statement-result groups within one
 |---|---|
 | `RowDescription` observed (via `SimpleQueryTracker`) | `simpleMaskPlan = BuildRowMaskPlanFromRowDescription(cfg, fields)` (or, if `!cfg.Enabled`, an empty plan — matching `Transformer.handleRowDescription`'s existing `if t.cfg.Enabled` gate). |
 | `DataRow` observed | `out, _, err := masking.MaskDataRow(ctx, masker, simpleMaskPlan, m.Raw, hooks)` — the identical call `ExtendedRuntime.transformDataRowAction` already makes for Extended, reused verbatim. |
-| `CommandComplete` / `EmptyQueryResponse` / `ErrorResponse` / `ReadyForQuery` observed | `simpleMaskPlan = masking.RowMaskPlan{}` — mirrors `Transformer.clearResultSet()` exactly (same four trigger points: `Transformer.handle`'s `MsgCommandComplete`/`MsgErrorResponse` case calls `clearResultSet`; `MsgReadyForQuery` case calls it too; `EmptyQueryResponse` is the fourth clearing point this design adds explicitly, since `Transformer` today never observes `EmptyQueryResponse` mid-result-set the way a multi-statement Simple Query can produce it between groups — Stage D's tests must confirm this exact parity). |
+| `CommandComplete` / `ErrorResponse` / `ReadyForQuery` observed | `simpleMaskPlan = masking.RowMaskPlan{}` — mirrors `Transformer.clearResultSet()` exactly: `Transformer.handle`'s `MsgCommandComplete`/`MsgErrorResponse` case calls `clearResultSet`; `MsgReadyForQuery` case calls it too. |
+| `EmptyQueryResponse` observed | `simpleMaskPlan = masking.RowMaskPlan{}` — a harmless, explicit defensive reset, not a meaningfully new clearing point: per the [transition table](#transition-table), `EmptyQueryResponse` is only ever valid as the very first backend message of an entirely empty/whitespace `Query` string (`AwaitingFirstMessage` → `AwaitingReadyOnly`), so `simpleMaskPlan` is already at its zero value at that point (no `RowDescription` could have preceded it in this phase) — this reset changes nothing observable, it only documents the trigger explicitly rather than relying on the zero value implicitly. `EmptyQueryResponse` never occurs mid-result-set or between a multi-statement `Query`'s result groups — those are separated by `CommandComplete`, not `EmptyQueryResponse` (see the transition table's rejection of `EmptyQueryResponse` from every phase other than `AwaitingFirstMessage`). |
 | Asynchronous message during a result set | No plan change — relayed unchanged, exactly as `Transformer.handle`'s `default` case already does. |
 | Binary-format masking target observed | `masking.MaskDataRow` returns `ErrRowMaskBinaryTarget` (existing, reused) — fail-closed, terminal, connection closed with a fixed `FATAL` `ErrorResponse` (mirrors `Transformer.failClosed`/`ExtendedRuntime.emitMaskingFailureFatal`'s existing pattern; the new sentinel is `ErrSimpleMaskingFailed`, wrapping the same SQLSTATE `58030` reason text `Transformer.failClosed` already uses verbatim — no new SQLSTATE is introduced). |
 | Plugin (`Masker.Mask`) error | `ErrMaskerInvocationFailed` (existing) → `ErrSimpleMaskingFailed` (new wrapper, same terminal fail-closed treatment). |
@@ -2001,12 +2090,14 @@ processed, for every mode.
 
 ## Error and shutdown behavior
 
-### Fixed, safe error categories (new, `internal/gateway` and
-`internal/firewall`, mirroring the existing `Err*` sentinel pattern)
+### Fixed, safe error categories
+
+New sentinels, split across `internal/gateway` and `internal/firewall`,
+mirroring the existing `Err*` sentinel pattern:
 
 | Category | Package | Meaning | Connection-fatal? |
 |---|---|---|---|
-| `ErrMalformedSimpleQueryFrame` | `firewall` (or `protocol`, for the framing-only part) | `Query` body fails structural validation (missing/extra NUL terminator, trailing bytes). | No — recoverable, synthesized `ErrorResponse`+`ReadyForQuery` via `RejectSimpleQuery`, no `Sync` needed (see [Transaction-state behavior](#transaction-state-behavior)). |
+| `ErrMalformedSimpleQueryFrame` | `firewall` (exclusively — see [Query handling](#query-handling); not declared in `internal/gateway`) | `Query` body fails `MixedFrontend`'s own typed-body validation (missing/extra NUL terminator, trailing bytes) — a frontend semantic-validation failure, distinct from `NewSteadyStateFrontendFrameDecoder`'s tag/length-only framing check and distinct from `protocol.SimpleQueryTracker`'s backend response grammar. | No — recoverable, synthesized `ErrorResponse`+`ReadyForQuery` via `RejectSimpleQuery`, no `Sync` needed (see [Transaction-state behavior](#transaction-state-behavior)). |
 | `ErrMixedBoundaryViolation` | `gateway` | A `Query` or Extended message arrived outside the permitted clean boundary (Case 2), reported by `AdmitMixedFrontendMessage`/`checkMixedBoundary` — either the primary admission check or a final operation's defensive re-check. | **Yes** — see [justification](#what-happens-when-a-message-arrives-outside-the-boundary) and [The mixed-message admission gate](#the-mixed-message-admission-gate). |
 | `ErrSimpleResponseOrderingViolation` | `protocol` | `SimpleQueryTracker` observed a backend message sequence the Simple Query grammar forbids. | Yes — mirrors `ErrImpossibleBackendOrdering`'s existing treatment. |
 | `ErrSimpleMaskingFailed` | `gateway` | Terminal Simple Query masking failure (binary target, plugin error, malformed `DataRow`). | Yes — mirrors `ErrExtendedMaskingFailed` exactly, same SQLSTATE `58030`. |
@@ -2037,6 +2128,28 @@ protocol payload bytes into its message — every one follows the existing
 transport error must be classified, the existing safe-classification
 pattern in `startup_handoff.go`'s `classifyClientReadErr`/etc., reused
 unchanged).
+
+**`ErrMalformedSimpleQueryFrame` is an `internal/firewall`-only sentinel,
+never declared in `internal/gateway`.** This follows directly from where
+each validation step actually lives:
+`NewSteadyStateFrontendFrameDecoder` (`internal/protocol`) validates only
+tag/length framing, unchanged; `MixedFrontend` (`internal/firewall`)
+performs `Query`'s own typed-body validation (NUL-terminator/trailing-
+byte checks — see [Query handling](#query-handling), step 4); a
+missing/extra NUL terminator or trailing body byte is therefore a
+*frontend* semantic-validation failure, exactly like a malformed Extended
+`Parse` body is already classified as an `ExtendedFrontend`-owned,
+`firewall`-package concern today, not a `gateway`- or `protocol`-package
+one. `internal/gateway.RejectSimpleQuery` never sees or constructs this
+sentinel — it receives only the already-fixed SQLSTATE string, the
+already-fixed reason string, and the `queryReceived` bool through its
+existing parameters (see
+[`RejectSimpleQuery`'s exact atomic sequence](#rejectsimplequerys-exact-atomic-sequence-event-loop-turn)).
+`internal/protocol.SimpleQueryTracker` is uninvolved entirely — it
+validates *backend* response grammar, never frontend `Query` bodies (see
+[Simple Query response grammar](#simple-query-response-grammar)). No
+duplicate malformed-Query sentinel is declared in `internal/gateway` or
+`internal/protocol`.
 
 ### Startup, cancellation, and shutdown causality
 
@@ -2168,7 +2281,7 @@ synthetic `ReadyForQuery`, no partial-result treated as complete:
 | `RowDescription` field count / frame size | Reuses existing `protocol.maxMessageLength` (1 MiB) and `masking.RowMaskPlan`'s existing shape validation (`ErrDataRowShapeMismatch`). | No new limit. |
 | `DataRow` frame size | Same. | No new limit. |
 | Number of statement-result groups per `Query` message | **Not tracked as a distinct counter** — each group is processed and its (bounded) plan state discarded before the next begins; memory usage is O(1) regardless of how many statements one `Query` message contains. | Explicitly a non-issue by design, not a limit needing a number. |
-| Synthetic frame size (blocked-`Query` `ErrorResponse`) | Reuses the existing `SequencerLimits.MaxSyntheticFrameBytes`-style bound defensively, even though `RejectSimpleQuery`'s reason strings are always fixed/small (Policy block reasons are already bounded by `sqlmatch`'s match-length behavior; internal fixed strings are compile-time constants). | Reused pattern, not a new numeric proposal. |
+| Synthetic frame size (blocked-`Query` `ErrorResponse`) | `RejectSimpleQuery` enforces the existing `SequencerLimits.MaxSyntheticFrameBytes`-style bound **before any client write**, exactly like the existing Extended synthetic-error path already does — see [Synthetic policy-response size enforcement](#synthetic-policy-response-size-enforcement) below. This is not a defensive-only bound assuming small input: `Policy` (`internal/firewall/policy.go`'s interface) is generic — a `Wasm` plugin, a test `PolicyFunc`, or any other `Policy` implementation may return an arbitrarily long `reason` string, unlike `DenyKeywords`, whose match-derived reasons happen to be short. The limit is enforced uniformly, regardless of which `Policy` implementation produced the reason. | Reused pattern (same limit type as Extended's existing synthetic-error bound), not a new numeric proposal — see the open question on its exact value. |
 | Masking plan memory | O(1) per active Simple Query response (one plan, replaced not accumulated). | Not independently limited. |
 | Asynchronous messages | Never retained — relayed and discarded immediately, in both the Extended and Simple dispatch branches, matching the existing rule exactly. | No limit needed. |
 
@@ -2181,6 +2294,41 @@ runtime termination, following the existing `loop()` →
 diagnostic output (every error is a fixed sentinel, never a formatted
 dump of the offending frame).
 
+### Synthetic policy-response size enforcement
+
+`RejectSimpleQuery` builds its synthetic `ErrorResponse` from a `reason`
+string that is **not** guaranteed short by this design — the `Policy`
+interface (`internal/firewall/policy.go`) is generic, and this design
+does not change that interface or its client-facing contract in this
+stage. `DenyKeywords`'s own reasons happen to be short (derived from
+`sqlmatch`'s matched phrase), but a `Wasm`-backed `Policy`, a test
+`PolicyFunc`, or any other `Policy` implementation may legitimately
+return an arbitrarily long `reason` string; this design must not assume
+otherwise.
+
+`RejectSimpleQuery` therefore enforces the same configured synthetic-
+frame-size limit (`SequencerLimits.MaxSyntheticFrameBytes`, reused —
+this design does not introduce a new numeric constant) **before writing
+any byte to the client**, regardless of which `Policy` implementation
+produced the reason:
+
+- The built `ErrorResponse` frame's size is checked against the limit
+  before `writeAll(r.client, ...)` is ever called.
+- If it exceeds the limit: a fixed, safe, fail-closed error is returned
+  (reusing the existing bounded-synthetic-frame error category Extended's
+  own synthetic-error path already uses for the same situation — no new
+  sentinel is introduced by this correction).
+- No partial client frame is ever written — the check happens before the
+  first byte is written, not after a truncated write.
+- The raw `reason` string is never logged by the runtime in this failure
+  path, consistent with [Privacy and logging guarantees](#privacy-and-logging-guarantees)
+  — only the fixed error category is observable.
+- This is the same enforcement point and the same limit type
+  `RegisterAndForwardFrontendOperation`'s synthetic-error path already
+  applies for Extended's own locally-rejected operations — `RejectSimpleQuery`
+  reuses the identical pattern rather than inventing a Simple-Query-
+  specific one.
+
 ## Privacy and logging guarantees
 
 Unchanged, extended to the new code paths:
@@ -2189,10 +2337,11 @@ Unchanged, extended to the new code paths:
   authentication (owned exclusively by the shared, unmodified
   `RunStartupHandoff`).
 - No startup parameter values — same.
-- No Bind values — `MixedFrontend`'s reused `handleBind` logic is
-  byte-for-byte the same as `ExtendedFrontend`'s (extracted shared
-  helper, not reimplemented) — `bindParamNulls` continues to extract
-  only NULL-ness, never values.
+- No Bind values — `MixedFrontend` and `ExtendedFrontend` call the exact
+  same extracted `handleBind` helper (not two independently reimplemented
+  copies), so their behavior is identical by construction, not merely
+  compared after the fact — `bindParamNulls` continues to extract only
+  NULL-ness, never values.
 - No `DataRow` values — `masking.MaskDataRow`'s existing contract
   (never logs, never includes values in its returned errors) is reused
   unchanged for the Simple Query call site too.
@@ -2394,10 +2543,21 @@ at once.
   `if simpleQueryActive` branch, the backend-EOF `simpleQueryActive`/
   `SimpleQueryTracker`-idle condition (see
   [Backend EOF during a Simple response](#backend-eof-during-a-simple-response)),
-  `ErrMixedBoundaryViolation`, `ErrMalformedSimpleQueryFrame`; defensive
-  `checkMixedBoundary` calls added to the entry points of
-  `RegisterAndForwardFrontendOperation`, `SubmitSyntheticErrorForCurrentCycle`,
-  `ForwardFlush`, and `Sync` registration/forwarding).
+  `ErrMixedBoundaryViolation` (`internal/gateway`-owned — Stage B does
+  **not** declare `ErrMalformedSimpleQueryFrame`, which belongs to
+  `internal/firewall`/Stage C; see
+  [Fixed, safe error categories](#fixed-safe-error-categories));
+  `RejectSimpleQuery` accepts only an already-fixed SQLSTATE string,
+  reason string, and `queryReceived bool` — it never receives or
+  constructs a malformed-frame sentinel itself; `RejectSimpleQuery`'s
+  synthetic-frame-size enforcement (see
+  [Synthetic policy-response size enforcement](#synthetic-policy-response-size-enforcement),
+  reusing the existing `SequencerLimits.MaxSyntheticFrameBytes`-style
+  bound, checked before any client write, regardless of which `Policy`
+  implementation produced `reason`); defensive `checkMixedBoundary` calls
+  added to the entry points of `RegisterAndForwardFrontendOperation`,
+  `SubmitSyntheticErrorForCurrentCycle`, `ForwardFlush`, and `Sync`
+  registration/forwarding).
 - **Invariants introduced**: the clean-boundary predicate, evaluated only
   inside the event-loop goroutine; one shared `checkMixedBoundary` helper
   backing both the primary admission gate and every final operation's
@@ -2405,19 +2565,25 @@ at once.
   [The mixed-message admission gate](#the-mixed-message-admission-gate));
   "Simple Query never enters the `ResponseSequencer` plan queue";
   "`simpleQueryActive` transitions are atomic within one event-loop
-  turn"; the backend-EOF rule's four fixed outcomes.
+  turn"; the backend-EOF rule's four fixed outcomes; `RejectSimpleQuery`'s
+  reason string is never assumed bounded by `Policy` implementation.
 - **Tests required**: `internal/gateway/extended_runtime_test.go`
   additions mirroring the existing `TestExtendedRuntime_*` structure —
   `AdmitMixedFrontendMessage`/`checkMixedBoundary` acceptance/rejection
   for every `State`/`simpleQueryActive` combination and every admissible
   message type; `ForwardSimpleQuery`/`RejectSimpleQuery` (both
-  `queryReceived` values) success and every failure path (malformed
-  frame, boundary violation, backend write failure); the 8 blocked-Query
-  lifecycle tests and 8 Extended-admission-while-Simple-active tests
-  listed above; the 7 backend-EOF tests listed above; a race test
-  confirming no concurrent access to `simpleQueryActive`/`simpleMaskPlan`
-  (via `-race`, mirroring the existing
-  `TestExtendedRuntime_Writes_MaxConcurrencyIsOne`-style test).
+  `queryReceived` values, called with pre-fixed SQLSTATE/reason strings —
+  Stage B's tests never construct or reference `ErrMalformedSimpleQueryFrame`,
+  which is `internal/firewall`/Stage C's own sentinel, not Stage B's)
+  success and every failure path (boundary violation, backend write
+  failure, oversized synthetic reason from a fake `Policy` implementation
+  returning a deliberately long string — proving the limit is enforced
+  regardless of `Policy` source); the 8 blocked-Query lifecycle tests and
+  8 Extended-admission-while-Simple-active tests listed above; the 7
+  backend-EOF tests listed above; a race test confirming no concurrent
+  access to `simpleQueryActive`/`simpleMaskPlan` (via `-race`, mirroring
+  the existing `TestExtendedRuntime_Writes_MaxConcurrencyIsOne`-style
+  test).
 - **Commit boundary**: no `firewall`/`cmd/gateway` changes yet — these
   new runtime methods are exercised only by new, direct unit tests
   constructing an `ExtendedRuntime` in-process (mirroring how existing
@@ -2430,8 +2596,12 @@ at once.
 
 - **Files/types**: new `internal/firewall/mixed_frontend.go`
   (`MixedFrontend`, `Gate.RunMixed`, `ErrMixedFrontendUnsupportedMessage`,
-  `ErrMixedFrontendDecodeFailed`); refactor of
-  `internal/firewall/extended_frontend.go` to extract shared
+  `ErrMixedFrontendDecodeFailed`, **`ErrMalformedSimpleQueryFrame`** — the
+  sole owner of this sentinel; `MixedFrontend`'s own `Query` typed-body
+  validation returns it directly, and it is never declared in
+  `internal/gateway` or `internal/protocol` — see
+  [Choose one package owner for `ErrMalformedSimpleQueryFrame`](#fixed-safe-error-categories));
+  refactor of `internal/firewall/extended_frontend.go` to extract shared
   per-message-type handler logic (Parse/Bind/Describe/Execute/Close/
   Flush/Sync/Terminate/discard) into helpers both `ExtendedFrontend` and
   `MixedFrontend` call — `ExtendedFrontend`'s own public behavior
@@ -2452,7 +2622,12 @@ at once.
   metrics calls occurred on the fake double when admission fails; the
   5-step error-precedence ordering (see
   [Deterministic error precedence](#deterministic-error-precedence));
-  a regression test confirming `ExtendedFrontend`'s existing test suite
+  **every row of the `Query` frame validation rules (missing terminator,
+  extra terminator, trailing bytes) — this is where
+  `ErrMalformedSimpleQueryFrame` is owned and tested; it belongs here,
+  in `internal/firewall`, not in `internal/gateway/extended_runtime_test.go`
+  (Stage B) or `internal/protocol/simple_query_test.go` (Stage A)**; a
+  regression test confirming `ExtendedFrontend`'s existing test suite
   still passes unmodified after the shared-helper extraction.
 - **Commit boundary**: `MixedFrontend` is constructed and exercised only
   by new unit tests, using the same fake-runtime-double pattern
@@ -2470,12 +2645,18 @@ at once.
   `simpleMaskPlan` set/clear/mask-call into the Stage B dispatch branch;
   `ErrSimpleMaskingFailed`.
 - **Invariants introduced**: single-active-plan correctness (no
-  generation keying needed); the four plan-clearing trigger points
-  (`CommandComplete`/`EmptyQueryResponse`/`ErrorResponse`/`ReadyForQuery`);
+  generation keying needed); the three meaningful plan-clearing trigger
+  points (`CommandComplete`/`ErrorResponse`/`ReadyForQuery`), plus a
+  harmless defensive reset on `EmptyQueryResponse` (which is only ever
+  valid as the first backend message of an empty `Query` string, when
+  `simpleMaskPlan` is already at its zero value — see
+  [Runtime integration](#runtime-integration-single-active-plan-mirrors-transformer-exactly));
   `MaskingErrorsTotal`'s exactly-once rule extended to the new error.
-- **Tests required**: `internal/masking/transformer_test.go` — confirm
-  zero behavior change after the extraction (run unmodified, must still
-  pass byte-for-byte); a new multi-statement-Simple-Query masking test
+- **Tests required**: `internal/masking/transformer_test.go` — run its
+  existing test cases unmodified against the refactored
+  `handleRowDescription` and confirm each still produces the same
+  emitted output bytes for the same input, proving the extraction is
+  behavior-preserving; a new multi-statement-Simple-Query masking test
   (row-returning statement, then non-row-returning statement, then a
   second row-returning statement, in one `Query` message, mixed masked/
   unmasked columns, `NULL` preservation); binary-target fail-closed;
@@ -2664,12 +2845,18 @@ new `mixed`-mode `deploy/driver-compat` configuration variant:
 
 ## Review checklist
 
-- [ ] **Single transport ownership**: exactly one client reader (frontend
-      goroutine), one backend reader (backend-reader goroutine), one
-      client writer, one backend writer, one `protocol.State` owner, one
-      active response-sequencing subsystem at any instant — all
-      (re-)stated in [Ownership model](#ownership-model) and preserved
-      per [Preserve one steady-state transport owner](#ownership-model).
+- [ ] **Single transport ownership**: for `mixed` and `extended_only`,
+      exactly one client reader (frontend goroutine), one backend reader
+      (backend-reader goroutine), one client writer, one backend writer,
+      one `protocol.State` owner, one active response-sequencing
+      subsystem at any instant — all (re-)stated in
+      [Ownership model](#ownership-model) and preserved per
+      [Preserve one steady-state transport owner](#ownership-model). For
+      `simple_only`, its own existing, unmodified `Gate`+`Transformer`
+      ownership model (no `protocol.State`, no `ResponseSequencer`)
+      satisfies the same no-concurrent-ownership invariant by its own,
+      different means — see
+      [Ownership model, clarified per mode](#ownership-model-clarified-per-mode).
 - [ ] **Registration-before-forwarding**: preserved for both Simple
       (`ApplySimpleQueryReceived()` before `writeAll(r.backend,...)`) and
       Extended (unchanged) — see
@@ -2748,7 +2935,11 @@ new `mixed`-mode `deploy/driver-compat` configuration variant:
 - [ ] **Fixed safe errors**: every new sentinel listed in
       [Error and shutdown behavior](#error-and-shutdown-behavior)
       is a fixed, value-free category; none wraps arbitrary transport/SQL
-      text.
+      text; each has exactly one declaring package (`ErrMalformedSimpleQueryFrame`
+      is `internal/firewall`-only — never declared in `internal/gateway`
+      or `internal/protocol`; `RejectSimpleQuery` receives only a
+      pre-fixed SQLSTATE/reason and `queryReceived bool`, never the
+      sentinel itself).
 - [ ] **Shutdown causality**: entirely inherited, unmodified, from
       `ExtendedRuntime.Run`'s existing `shutdownCause` design.
 - [ ] **Error precedence**: the exact 5-step deterministic ordering
@@ -2768,10 +2959,17 @@ new `mixed`-mode `deploy/driver-compat` configuration variant:
       `RunStartupHandoff`; `simple_only` keeps its own `Gate.Run` startup
       path — Goals, [Configuration and migration behavior](#configuration-and-migration-behavior),
       and Stage E no longer contradict each other on this point.
-- [ ] **Default Simple-only preservation**: `simple_only` behavior is
-      byte-for-byte unchanged (no code path in `runSimpleConnection` is
-      touched; `Transformer`'s only change is a behavior-preserving
-      helper extraction, verified by its unmodified existing tests).
+- [ ] **Default Simple-only preservation**: `simple_only`'s **observable
+      network behavior** is unchanged. `runSimpleConnection` and
+      `firewall.Gate`/`firewall.Gate.Run` are not touched at all by this
+      design (genuinely byte-for-byte identical source, since no edit
+      exists). `masking.Transformer`'s source IS edited (Stage D extracts
+      `handleRowDescription`'s inline loop into the shared
+      `BuildRowMaskPlanFromRowDescription` helper) — not a byte-for-byte-
+      unchanged source claim; what is verified is that
+      `Transformer`'s existing test suite (unmodified by this refactor)
+      continues to pass against the refactored code, producing the same
+      emitted output bytes for the same inputs.
 - [ ] **Extended-only preservation**: `extended_only`'s **observable
       network behavior** is unchanged — not a byte-for-byte-unchanged
       source claim, since `ExtendedFrontend`'s per-message-type handler

@@ -1240,23 +1240,97 @@ func (s *State) TransactionStatus() byte {
 
 // --- Simple Query yardimcisi -----------------------------------------------
 
-// ApplyAllowedSimpleQuery, Policy tarafindan IZIN VERILEN (Block edilmemis)
-// bir Simple Query ('Q') mesaji gercek sunucuya iletilecegi/iletildigi anda
-// cagrilmalidir - engellenen bir Simple Query icin bu metod hic
-// CAGRILMAMALIDIR (bu, "hicbir degisiklik yok" davranisinin nasil temsil
-// edildigidir).
+// ApplySimpleQueryReceived, gercek sunucunun protokol kuralini uygular: "a
+// simple Query message also destroys the unnamed statement" ve "a simple
+// Query message also destroys the unnamed portal" (bkz.
+// https://www.postgresql.org/docs/current/protocol-flow.html). Bu cagrilmalidir
+// cunku SentinelDB, YAPISAL OLARAK GECERLI bir Simple Query ('Q') mesajini
+// TEMIZ bir sinirda (clean boundary) KABUL ETMISTIR ve istemciye TAM bir
+// yanit dongusu (response cycle) dondurecektir - bu, Policy'nin nihai
+// karari (Allow ya da Block) NE OLURSA OLSUN dogrudur:
+//
+//   - Allow: gercek sunucuya iletilmeden HEMEN ONCE cagrilir.
+//   - Block (ama yapisal olarak gecerli bir Query): sentetik
+//     ErrorResponse+ReadyForQuery yazilmadan HEMEN ONCE cagrilir - SQL hic
+//     iletilmemis olsa da, SentinelDB istemciye TAM olarak gercek,
+//     engellenmemis bir Query'nin gorunecegi gibi bir yanit dongusu
+//     dondurdugu icin, isimsiz-nesne-yok-etme yan etkisi yine de
+//     tetiklenir.
+//   - Yapisal olarak GECERSIZ bir Query govdesi (eksik/fazla NUL
+//     sonlandirici, fazladan bayt): bu metod HIC CAGRILMAMALIDIR - hicbir
+//     yapisal olarak gecerli Query hic kabul edilmemistir, bu yuzden
+//     tetiklenecek bir "Query mesaji alindi" olayi yoktur.
+//
+// (Bu metod eskiden yalnizca Allow durumu icin cagrilan ApplyAllowedSimpleQuery
+// olarak adlandirilmisti - bu isim yaniltici oldugu icin, "yalnizca-izin-
+// verilen" anlamini tasimayan bu isme yeniden adlandirildi; ALTTAKI
+// temizleme davranisi TAMAMEN AYNI kalir.)
 //
 // Mevcut isimsiz statement ve isimsiz portal "current" isaretcilerini
 // HEMEN temizler (gercek sunucunun Simple Query islemeye baslarken kendi
-// isimsiz nesnelerini yok etmesini yansitir - bkz. docs/design/
-// 0001-extended-query.md, "Mixed Simple/Extended Query state handling").
-// Isimli statement'lar ve portal'lar ETKILENMEZ. Hala bir portal
-// tarafindan referans verilen tarihsel (historical) generation'lar
-// (varsa) dahili olarak kalmaya devam eder.
-func (s *State) ApplyAllowedSimpleQuery() {
+// isimsiz nesnelerini yok etmesini yansitir). Isimli statement'lar ve
+// portal'lar ETKILENMEZ. Hala bir portal tarafindan referans verilen
+// tarihsel (historical) generation'lar (varsa) dahili olarak kalmaya
+// devam eder.
+func (s *State) ApplySimpleQueryReceived() {
 	s.unnamedStatementCurrent = NoGeneration
 	s.unnamedPortalCurrent = NoGeneration
 	s.cleanup()
+}
+
+// ApplySimpleQueryReadyForQuery, gercek sunucudan gelen, ALLOWED (iletilen)
+// bir Simple Query'nin yanitini sonlandiran GERCEK bir ReadyForQuery
+// mesajini bildirir. ApplyReadyForQuery'nin aksine (bekleyen bir OpSync
+// islemi VE bos-olmayan bir outstandingSyncCycles kuyrugu gerektirir),
+// Simple Query'nin Parse/Bind/Sync kimligi yoktur - bu metod:
+//
+//  1. status'un tam olarak 'I'/'T'/'E' oldugunu dogrular - degilse
+//     ErrInvalidTransactionStatus doner ve State HICBIR sekilde
+//     degismez (dogrulama, HERHANGI bir mutasyondan ONCE yapilir);
+//  2. s.txStatus'u gecerli status'a gunceller;
+//  3. status TxStatusIdle ise, SU AN izlenen HER portali (isimli VE
+//     isimsiz, pending VE committed) gecersiz kilar - bu,
+//     ApplyReadyForQuery'nin daha DAR, cycle-sinirli
+//     invalidatePortalsThroughCycle'inden farkli olarak GUVENLIDIR
+//     (yaklasik/approximation degil): mixed-routing sinir-yalnizca
+//     (boundary-only) degisim kurali (bkz. docs/design/
+//     0002-mixed-query-routing.md), bir Simple Query'nin baslamasina
+//     izin verildigi ANDA OutstandingCycleCount()==0 oldugunu garanti
+//     eder - yani korunmasi gereken, daha sonraki-pipeline edilmis bir
+//     Extended cycle'in portali YOKTUR;
+//  4. gecerli mutasyondan SONRA mevcut ic cleanup() gecisini calistirir.
+//
+// Statement'lar HICBIR status icin gecersiz kilinmaz (ApplyReadyForQuery
+// ile AYNI kural). Bu metod hicbir PendingOperation tuketmez, hicbir
+// outstanding Sync cycle'ini tuketmez, yeni bir cycle olusturmaz ve hicbir
+// CycleID dondurmez.
+//
+// Bu tamamen EKLEMELI (additive) bir metoddur - ApplyReadyForQuery'nin
+// kendi imzasi ya da davranisi hicbir sekilde degistirilmez.
+func (s *State) ApplySimpleQueryReadyForQuery(status byte) error {
+	if status != TxStatusIdle && status != TxStatusInTransaction && status != TxStatusFailedTransaction {
+		return ErrInvalidTransactionStatus
+	}
+	s.txStatus = status
+	if status == TxStatusIdle {
+		s.invalidateAllPortals()
+	}
+	s.cleanup()
+	return nil
+}
+
+// invalidateAllPortals, su an izlenen (statements haritasindan farkli
+// olarak) HER portal generation kaydini (isimli, isimsiz, pending,
+// committed - hepsini) kosulsuzca kaldirir. invalidatePortalsThroughCycle
+// ile AYNI dahili yardimciyi (detachPortalPointer) kullanir, ancak
+// CreatedCycle karsilastirmasi YOKTUR - cagiran, bunun her zaman guvenli
+// oldugunu (korunmasi gereken hicbir daha-sonraki-cycle portali olmadigini)
+// zaten dogrulamis olmalidir (bkz. ApplySimpleQueryReadyForQuery).
+func (s *State) invalidateAllPortals() {
+	for id, p := range s.portals {
+		s.detachPortalPointer(p)
+		delete(s.portals, id)
+	}
 }
 
 // --- Temizlik (cleanup) -----------------------------------------------------

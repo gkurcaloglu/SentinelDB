@@ -146,7 +146,7 @@ func FuzzExtendedStateSequence(f *testing.F) {
 			if !ok {
 				break
 			}
-			switch int(opb) % 13 {
+			switch int(opb) % 14 {
 			case 0: // CreateParse
 				i, ok := r.pick(len(stmtNames))
 				if !ok {
@@ -289,8 +289,8 @@ func FuzzExtendedStateSequence(f *testing.F) {
 						}
 					}
 				}
-			case 10: // ApplyAllowedSimpleQuery
-				s.ApplyAllowedSimpleQuery()
+			case 10: // ApplySimpleQueryReceived
+				s.ApplySimpleQueryReceived()
 			case 11: // Ack with a random, likely-invalid operation ID (never a real one)
 				b, ok := r.next()
 				if !ok {
@@ -313,6 +313,35 @@ func FuzzExtendedStateSequence(f *testing.F) {
 							t.Fatalf("ReadyForQuery('I') for cycle %d left portal %d with CreatedCycle %d (<= completed cycle)", cyc, id, p.CreatedCycle)
 						}
 					}
+				}
+			case 13: // ApplySimpleQueryReadyForQuery with a random (possibly invalid) status
+				i, ok := r.pick(len(statuses))
+				if !ok {
+					continue
+				}
+				status := statuses[i]
+				beforePending := s.PendingOperationCount()
+				beforeCycles := s.OutstandingCycleCount()
+				beforeCur := s.CurrentCycle()
+				err := s.ApplySimpleQueryReadyForQuery(status)
+				if err == nil {
+					if status == TxStatusIdle && s.PortalCount() != 0 {
+						t.Fatalf("ApplySimpleQueryReadyForQuery('I') left %d live portal(s)", s.PortalCount())
+					}
+					if s.TransactionStatus() != status {
+						t.Fatalf("expected TransactionStatus %q after ApplySimpleQueryReadyForQuery, got %q", status, s.TransactionStatus())
+					}
+				}
+				// Consumes no pending operation, no outstanding cycle, and
+				// creates no new cycle - true whether it succeeded or failed.
+				if s.PendingOperationCount() != beforePending {
+					t.Fatalf("ApplySimpleQueryReadyForQuery changed PendingOperationCount: before=%d after=%d", beforePending, s.PendingOperationCount())
+				}
+				if s.OutstandingCycleCount() != beforeCycles {
+					t.Fatalf("ApplySimpleQueryReadyForQuery changed OutstandingCycleCount: before=%d after=%d", beforeCycles, s.OutstandingCycleCount())
+				}
+				if s.CurrentCycle() != beforeCur {
+					t.Fatalf("ApplySimpleQueryReadyForQuery changed CurrentCycle: before=%d after=%d", beforeCur, s.CurrentCycle())
 				}
 			}
 			checkStructuralInvariants(t, s)
@@ -1201,15 +1230,23 @@ func TestState_PendingStatementClose_StillCascadesToPortals(t *testing.T) {
 }
 
 // --- Simple Query tests -------------------------------------------------
+//
+// These test the renamed ApplySimpleQueryReceived() (previously
+// ApplyAllowedSimpleQuery()) - the clearing behavior is byte-for-byte the
+// same; only the name (and, per the design correction, the set of
+// legitimate callers - both an allowed AND a locally-blocked-but-
+// structurally-valid Simple Query now call it, not "allowed-only") has
+// changed. Every assertion below is ported unweakened from the pre-rename
+// test suite.
 
-func TestState_AllowedSimpleQueryClearsUnnamedSlots(t *testing.T) {
+func TestState_SimpleQueryReceivedClearsUnnamedSlots(t *testing.T) {
 	s := NewState()
 	sop, _, _ := s.CreateParse("", "SELECT 1", nil)
 	s.ApplyParseComplete(sop.ID)
 	bop, _, _ := s.CreateBind("", "", nil, nil, nil)
 	s.ApplyBindComplete(bop.ID)
 
-	s.ApplyAllowedSimpleQuery()
+	s.ApplySimpleQueryReceived()
 
 	if _, ok := s.ResolveStatement(""); ok {
 		t.Fatal("expected unnamed statement slot to be cleared")
@@ -1219,27 +1256,27 @@ func TestState_AllowedSimpleQueryClearsUnnamedSlots(t *testing.T) {
 	}
 }
 
-func TestState_AllowedSimpleQueryPreservesNamedObjects(t *testing.T) {
+func TestState_SimpleQueryReceivedPreservesNamedObjects(t *testing.T) {
 	s := NewState()
 	sop, sgen, _ := s.CreateParse("s1", "SELECT 1", nil)
 	s.ApplyParseComplete(sop.ID)
 	bop, pgen, _ := s.CreateBind("p1", "s1", nil, nil, nil)
 	s.ApplyBindComplete(bop.ID)
 
-	s.ApplyAllowedSimpleQuery()
+	s.ApplySimpleQueryReceived()
 
 	if _, ok := s.CommittedStatement("s1"); !ok {
-		t.Fatal("expected named statement to survive an allowed Simple Query")
+		t.Fatal("expected named statement to survive a received Simple Query")
 	}
 	if _, ok := s.CommittedPortal("p1"); !ok {
-		t.Fatal("expected named portal to survive an allowed Simple Query")
+		t.Fatal("expected named portal to survive a received Simple Query")
 	}
 	_ = sgen
 	_ = pgen
 }
 
-// TestState_AllowedSimpleQueryHistoricalSnapshotsRemainUsable dogrular:
-// bir Simple Query izin verilip iletildigi anda hala IN-FLIGHT (bekleyen,
+// TestState_SimpleQueryReceivedHistoricalSnapshotsRemainUsable dogrular:
+// bir Simple Query kabul edilip iletildigi anda hala IN-FLIGHT (bekleyen,
 // henuz onaylanmamis) bir Bind/Execute varsa, bu islemin (name,generation)
 // anlik goruntusu (snapshot) mevcut isimsiz isaretcilerin temizlenmesinden
 // ETKILENMEZ - kendi backend onayi geldiginde hala dogru sekilde
@@ -1249,7 +1286,7 @@ func TestState_AllowedSimpleQueryPreservesNamedObjects(t *testing.T) {
 // gercek sunucunun da yikacagi isimsiz nesne oldugu icin, "current"
 // isaretcisi temizlenir temizlenmez cleanup tarafindan kaldirilmasi
 // BEKLENEN dogru davranistir (ayri, asagidaki NoLongerCurrent testi).
-func TestState_AllowedSimpleQueryHistoricalSnapshotsRemainUsable(t *testing.T) {
+func TestState_SimpleQueryReceivedHistoricalSnapshotsRemainUsable(t *testing.T) {
 	s := NewState()
 	sop, sgen, _ := s.CreateParse("", "SELECT 1", nil)
 	s.ApplyParseComplete(sop.ID)
@@ -1260,7 +1297,7 @@ func TestState_AllowedSimpleQueryHistoricalSnapshotsRemainUsable(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	s.ApplyAllowedSimpleQuery()
+	s.ApplySimpleQueryReceived()
 
 	if _, ok := s.Portal(pgen.ID); !ok {
 		t.Fatal("expected the in-flight (still-pending) portal snapshot to remain usable")
@@ -1274,36 +1311,161 @@ func TestState_AllowedSimpleQueryHistoricalSnapshotsRemainUsable(t *testing.T) {
 	}
 }
 
-// TestState_AllowedSimpleQuery_AlreadyCommittedUnnamedPortalIsDestroyed
+// TestState_SimpleQueryReceived_AlreadyCommittedUnnamedPortalIsDestroyed
 // dogrular: ZATEN commit edilmis (bekleyen islemi kalmamis) bir isimsiz
 // portal, gercek sunucunun da onu yok ettigi Simple Query sonrasi hemen
 // temizlenir - "current" isaretcisi temizlenince baska hicbir referansi
 // kalmiyorsa artik erisilemez olmalidir.
-func TestState_AllowedSimpleQuery_AlreadyCommittedUnnamedPortalIsDestroyed(t *testing.T) {
+func TestState_SimpleQueryReceived_AlreadyCommittedUnnamedPortalIsDestroyed(t *testing.T) {
 	s := NewState()
 	sop, _, _ := s.CreateParse("", "SELECT 1", nil)
 	s.ApplyParseComplete(sop.ID)
 	bop, pgen, _ := s.CreateBind("", "", nil, nil, nil)
 	s.ApplyBindComplete(bop.ID)
 
-	s.ApplyAllowedSimpleQuery()
+	s.ApplySimpleQueryReceived()
 
 	if _, ok := s.Portal(pgen.ID); ok {
 		t.Fatal("expected an already-committed, no-longer-referenced unnamed portal to be cleaned up after the Simple Query destroyed it")
 	}
 }
 
-func TestState_BlockedSimpleQueryIsNoMutation(t *testing.T) {
+func TestState_BlockedMalformedSimpleQueryIsNoMutation(t *testing.T) {
 	s := NewState()
 	sop, _, _ := s.CreateParse("", "SELECT 1", nil)
 	s.ApplyParseComplete(sop.ID)
 	before, _ := s.ResolveStatement("")
 
-	// A blocked Simple Query is represented by simply NOT calling
-	// ApplyAllowedSimpleQuery at all.
+	// A malformed Simple Query body (never structurally accepted, so
+	// ApplySimpleQueryReceived is never called for it - see
+	// docs/design/0002-mixed-query-routing.md, "Correct valid blocked-Query
+	// lifecycle semantics") is represented by simply NOT calling
+	// ApplySimpleQueryReceived at all.
 	after, ok := s.ResolveStatement("")
 	if !ok || after.ID != before.ID {
 		t.Fatal("expected no mutation to occur when the Simple Query helper is never called")
+	}
+}
+
+// TestState_SimpleQueryReceived_CalledForBothAllowAndBlockVerdicts proves
+// the corrected mixed-mode contract directly: ApplySimpleQueryReceived's
+// unnamed-object-clearing side effect is triggered by SentinelDB ACCEPTING
+// a structurally valid Query at a clean boundary - not by Policy's Allow/
+// Block verdict. Calling it identically for both an "allowed" and a
+// "locally blocked, but structurally valid" Query must produce exactly the
+// same State effect.
+func TestState_SimpleQueryReceived_CalledForBothAllowAndBlockVerdicts(t *testing.T) {
+	allowed := NewState()
+	{
+		sop, _, _ := allowed.CreateParse("", "SELECT 1", nil)
+		allowed.ApplyParseComplete(sop.ID)
+		allowed.ApplySimpleQueryReceived() // represents the Allow verdict path
+	}
+
+	blocked := NewState()
+	{
+		sop, _, _ := blocked.CreateParse("", "SELECT 1", nil)
+		blocked.ApplyParseComplete(sop.ID)
+		blocked.ApplySimpleQueryReceived() // represents the Block verdict path (queryReceived=true)
+	}
+
+	if _, ok := allowed.ResolveStatement(""); ok {
+		t.Fatal("expected the allow-path unnamed statement slot to be cleared")
+	}
+	if _, ok := blocked.ResolveStatement(""); ok {
+		t.Fatal("expected the block-path unnamed statement slot to ALSO be cleared - the lifecycle effect must not depend on the verdict")
+	}
+}
+
+// TestState_SimpleQueryReceived_Idempotent dogrular: ApplySimpleQueryReceived
+// arka arkaya birden fazla kez cagrilsa bile (ör. savunmaci/tekrarlanan bir
+// cagri), sonuc her zaman aynidir - ikinci cagri hicbir ek/farkli etki
+// yaratmaz.
+func TestState_SimpleQueryReceived_Idempotent(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop, _, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+	uop, _, _ := s.CreateParse("", "SELECT 2", nil)
+	s.ApplyParseComplete(uop.ID)
+
+	s.ApplySimpleQueryReceived()
+	after1 := snapshotState(s)
+	s.ApplySimpleQueryReceived()
+	after2 := snapshotState(s)
+
+	assertStateUnchanged(t, after1, after2)
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected named statement to remain resolvable after repeated calls")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected named portal to remain resolvable after repeated calls")
+	}
+}
+
+// TestState_SimpleQueryReceived_DoesNotChangePendingCycleOrTxCounters
+// dogrular: ApplySimpleQueryReceived, statement/portal isaretcileri
+// disinda HICBIR sey degistirmez - bekleyen islem sayisi, outstanding
+// cycle sayisi, islem (transaction) durumu ve mevcut cycle tamamen
+// etkilenmeden kalir.
+func TestState_SimpleQueryReceived_DoesNotChangePendingCycleOrTxCounters(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	// Bir bekleyen (henuz onaylanmamis) islem birak.
+	s.CreateBind("", "s1", nil, nil, nil)
+	s.CreateSync()
+
+	beforePending := s.PendingOperationCount()
+	beforeCycles := s.OutstandingCycleCount()
+	beforeStatus := s.TransactionStatus()
+	beforeCurrentCycle := s.CurrentCycle()
+
+	s.ApplySimpleQueryReceived()
+
+	if s.PendingOperationCount() != beforePending {
+		t.Fatalf("expected PendingOperationCount unchanged: before=%d after=%d", beforePending, s.PendingOperationCount())
+	}
+	if s.OutstandingCycleCount() != beforeCycles {
+		t.Fatalf("expected OutstandingCycleCount unchanged: before=%d after=%d", beforeCycles, s.OutstandingCycleCount())
+	}
+	if s.TransactionStatus() != beforeStatus {
+		t.Fatalf("expected TransactionStatus unchanged: before=%q after=%q", beforeStatus, s.TransactionStatus())
+	}
+	if s.CurrentCycle() != beforeCurrentCycle {
+		t.Fatalf("expected CurrentCycle unchanged: before=%d after=%d", beforeCurrentCycle, s.CurrentCycle())
+	}
+}
+
+// TestState_SimpleQueryReceived_HistoricalGenerationStillReferencedByNamedPortalSurvives
+// dogrular: bir isimsiz statement generation'i artik "current" olmasa bile,
+// hala ISIMLI (named) bir portal tarafindan referans veriliyorsa, cleanup
+// tarafindan yanlislikla kaldirilmaz - yalnizca GERCEKTEN erisilemez
+// generation'lar kaldirilir.
+func TestState_SimpleQueryReceived_HistoricalGenerationStillReferencedByNamedPortalSurvives(t *testing.T) {
+	s := NewState()
+	// Isimsiz statement: named bir portal tarafindan referans verilecek.
+	sop, sgen, _ := s.CreateParse("", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop, _, _ := s.CreateBind("p1", "", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+
+	// Yeni bir isimsiz Parse ile "current" isaretcisini ileri tasi - eski
+	// generation artik "current" degil, ama p1 hala ona referans veriyor.
+	sop2, sgen2, _ := s.CreateParse("", "SELECT 2", nil)
+	s.ApplyParseComplete(sop2.ID)
+
+	s.ApplySimpleQueryReceived()
+
+	if _, ok := s.Statement(sgen.ID); !ok {
+		t.Fatal("expected the historical statement generation still referenced by a named portal to survive cleanup")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected the named portal itself to remain resolvable")
+	}
+	if _, ok := s.Statement(sgen2.ID); ok {
+		t.Fatal("expected the newer unnamed statement generation to be cleared (it was 'current' and is now cleared by ApplySimpleQueryReceived, with no portal referencing it)")
 	}
 }
 
@@ -2138,4 +2300,232 @@ func TestState_InvariantsHoldAfterMutatingEveryReturnedSnapshot(t *testing.T) {
 	}
 
 	checkStructuralInvariants(t, s)
+}
+
+// --- ApplySimpleQueryReadyForQuery tests ---------------------------------
+//
+// These test the new, additive State.ApplySimpleQueryReadyForQuery method
+// (bkz. docs/design/0002-mixed-query-routing.md, "New, additive State
+// method"): unlike ApplyReadyForQuery, it requires no pending OpSync/
+// outstanding Sync cycle, consumes nothing, and creates no new cycle - it
+// only updates transaction status and (on 'I') unconditionally invalidates
+// every currently-tracked portal.
+
+func TestState_SimpleQueryReadyForQuery_I_UpdatesStatusAndRemovesAllPortals(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop1, _, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop1.ID)
+	// Also leave an unnamed, uncommitted (still-pending) portal in flight -
+	// "every currently-tracked portal" must mean named AND unnamed, pending
+	// AND committed.
+	s.CreateBind("", "s1", nil, nil, nil)
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.TransactionStatus() != TxStatusIdle {
+		t.Fatalf("expected TransactionStatus 'I', got %q", s.TransactionStatus())
+	}
+	if s.PortalCount() != 0 {
+		t.Fatalf("expected zero live portals after ApplySimpleQueryReadyForQuery('I'), got %d", s.PortalCount())
+	}
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("expected named, committed portal to be invalidated")
+	}
+	if _, ok := s.ResolvePortal(""); ok {
+		t.Fatal("expected unnamed, still-pending portal to ALSO be invalidated")
+	}
+}
+
+func TestState_SimpleQueryReadyForQuery_I_PreservesStatements(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	uop, _, _ := s.CreateParse("", "SELECT 2", nil)
+	s.ApplyParseComplete(uop.ID)
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected named prepared statement to survive ApplySimpleQueryReadyForQuery('I')")
+	}
+	if _, ok := s.ResolveStatement(""); !ok {
+		t.Fatal("expected unnamed prepared statement to survive ApplySimpleQueryReadyForQuery('I') - statements are never invalidated by this method")
+	}
+}
+
+func TestState_SimpleQueryReadyForQuery_T_UpdatesStatusPreservesEverything(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop, _, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusInTransaction); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.TransactionStatus() != TxStatusInTransaction {
+		t.Fatalf("expected TransactionStatus 'T', got %q", s.TransactionStatus())
+	}
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected statement to survive ApplySimpleQueryReadyForQuery('T')")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected portal to survive ApplySimpleQueryReadyForQuery('T')")
+	}
+}
+
+func TestState_SimpleQueryReadyForQuery_E_UpdatesStatusPreservesEverything(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop, _, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusFailedTransaction); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.TransactionStatus() != TxStatusFailedTransaction {
+		t.Fatalf("expected TransactionStatus 'E', got %q", s.TransactionStatus())
+	}
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected statement to survive ApplySimpleQueryReadyForQuery('E')")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected portal to survive ApplySimpleQueryReadyForQuery('E')")
+	}
+}
+
+// TestState_SimpleQueryReadyForQuery_ITEI_Deterministic dogrular: I -> T ->
+// E -> I gecis zinciri, her adimda beklenen (deterministik) davranisi
+// uretir - ozellikle: yalnizca SON 'I' gecisi, o ana kadar biriken portal'i
+// gecersiz kilar (aradaki T/E adimlari onu korur).
+func TestState_SimpleQueryReadyForQuery_ITEI_Deterministic(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop, _, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("I: unexpected error: %v", err)
+	}
+	if s.TransactionStatus() != TxStatusIdle {
+		t.Fatalf("I: expected 'I', got %q", s.TransactionStatus())
+	}
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("I: expected portal to be invalidated")
+	}
+
+	// Re-establish a portal for the T/E/I chain below.
+	bop2, _, _ := s.CreateBind("p2", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop2.ID)
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusInTransaction); err != nil {
+		t.Fatalf("T: unexpected error: %v", err)
+	}
+	if s.TransactionStatus() != TxStatusInTransaction {
+		t.Fatalf("T: expected 'T', got %q", s.TransactionStatus())
+	}
+	if _, ok := s.CommittedPortal("p2"); !ok {
+		t.Fatal("T: expected portal to survive")
+	}
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusFailedTransaction); err != nil {
+		t.Fatalf("E: unexpected error: %v", err)
+	}
+	if s.TransactionStatus() != TxStatusFailedTransaction {
+		t.Fatalf("E: expected 'E', got %q", s.TransactionStatus())
+	}
+	if _, ok := s.CommittedPortal("p2"); !ok {
+		t.Fatal("E: expected portal to survive")
+	}
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("final I: unexpected error: %v", err)
+	}
+	if s.TransactionStatus() != TxStatusIdle {
+		t.Fatalf("final I: expected 'I', got %q", s.TransactionStatus())
+	}
+	if _, ok := s.CommittedPortal("p2"); ok {
+		t.Fatal("final I: expected portal to now be invalidated")
+	}
+}
+
+func TestState_SimpleQueryReadyForQuery_InvalidStatusIsFullyAtomic(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop, _, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusInTransaction); err != nil {
+		t.Fatalf("setup: unexpected error: %v", err)
+	}
+	s.CreateSync() // leave a pending operation + outstanding cycle in place too
+	before := snapshotState(s)
+
+	if err := s.ApplySimpleQueryReadyForQuery('X'); !errors.Is(err, ErrInvalidTransactionStatus) {
+		t.Fatalf("expected ErrInvalidTransactionStatus, got %v", err)
+	}
+
+	after := snapshotState(s)
+	assertStateUnchanged(t, before, after)
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected portal to survive an invalid-status call")
+	}
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected statement to survive an invalid-status call")
+	}
+}
+
+func TestState_SimpleQueryReadyForQuery_DoesNotConsumeSyncOperation(t *testing.T) {
+	s := NewState()
+	syncOp, err := s.CreateSync()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	beforePending := s.PendingOperationCount()
+	beforeCycles := s.OutstandingCycleCount()
+	beforeCurrent := s.CurrentCycle()
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if s.PendingOperationCount() != beforePending {
+		t.Fatalf("expected PendingOperationCount unchanged (no Sync consumed): before=%d after=%d", beforePending, s.PendingOperationCount())
+	}
+	if s.OutstandingCycleCount() != beforeCycles {
+		t.Fatalf("expected OutstandingCycleCount unchanged (no cycle consumed): before=%d after=%d", beforeCycles, s.OutstandingCycleCount())
+	}
+	if s.CurrentCycle() != beforeCurrent {
+		t.Fatalf("expected CurrentCycle unchanged (no new cycle created): before=%d after=%d", beforeCurrent, s.CurrentCycle())
+	}
+	// The real Sync operation registered above must remain exactly as it
+	// was - untouched by the Simple Query method.
+	ops := s.PendingOperations()
+	if len(ops) != 1 || ops[0].ID != syncOp.ID || ops[0].Kind != OpSync {
+		t.Fatalf("expected the real pending Sync operation to remain queued untouched, got %+v", ops)
+	}
+}
+
+func TestState_SimpleQueryReadyForQuery_RepeatedValidCallsAreDeterministic(t *testing.T) {
+	s := NewState()
+	sop, _, _ := s.CreateParse("s1", "SELECT 1", nil)
+	s.ApplyParseComplete(sop.ID)
+	bop, _, _ := s.CreateBind("p1", "s1", nil, nil, nil)
+	s.ApplyBindComplete(bop.ID)
+
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("first call: unexpected error: %v", err)
+	}
+	after1 := snapshotState(s)
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusIdle); err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+	after2 := snapshotState(s)
+	assertStateUnchanged(t, after1, after2)
 }

@@ -185,3 +185,124 @@ jobs:
       - name: Ensure stack is shut down
         if: always()
         run: docker compose down
+
+  driver-compat:
+    name: pgx driver compatibility (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    needs: [go-quality]
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [16, 18]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Runs the SAME script used for local verification
+      # (scripts/driver-compat.ps1): selects the dedicated Compose project
+      # (deploy/driver-compat/docker-compose.yml, project name
+      # sentineldb-driver-compat - entirely separate from the root demo
+      # stack/e2e job above), builds/starts it with the matrix PostgreSQL
+      # image, waits for both services to report healthy, runs the real
+      # pgx v5 compatibility suite (integration/pgxcompat) against it, then
+      # captures gateway logs and runs its own privacy/marker scan. No
+      # -Cleanup here - the stack stays up for the -race step below and
+      # this job's own log-collection-on-failure steps; it is always torn
+      # down in the final step regardless of outcome.
+      - name: Run driver-compat stack + pgx compatibility suite
+        shell: pwsh
+        run: ./scripts/driver-compat.ps1 -PostgresVersion ${{ matrix.postgres }}
+
+      # Race-detects the same real pgx suite against the same live stack,
+      # on Linux, for one matrix entry - PostgreSQL 18, so both the
+      # variable-length protocol-3.2 cancellation key path and the race
+      # detector are exercised together. Local Windows race testing is
+      # unavailable (no C compiler; see CONTRIBUTING.md) - this is the
+      # source of truth. Demo-only credentials, not secrets - see
+      # deploy/driver-compat/docker-compose.yml.
+      - name: Run pgx compatibility suite under -race (PostgreSQL 18, stack still running)
+        if: matrix.postgres == 18
+        shell: bash
+        working-directory: integration/pgxcompat
+        env:
+          SENTINELDB_DRIVER_DSN: "postgres://pgxcompat:pgxcompat_demo_only_change_me@127.0.0.1:25432/pgxcompat?sslmode=disable&application_name=pgxcompat_race_ci&connect_timeout=10"
+          SENTINELDB_DIRECT_DSN: "postgres://pgxcompat:pgxcompat_demo_only_change_me@127.0.0.1:25433/pgxcompat?sslmode=disable&application_name=pgxcompat_race_ci_direct&connect_timeout=10"
+          SENTINELDB_EXPECT_LONG_CANCEL_KEY: "true"
+        run: go test ./... -race -count=1
+
+      # Captures gateway logs to a file only (no console tail yet - see the
+      # scan step below, which gates whether it is safe to print/upload).
+      - name: Capture SentinelDB logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          docker compose -f deploy/driver-compat/docker-compose.yml -p sentineldb-driver-compat logs sentineldb --no-color > driver-compat-ci-logs.txt 2>&1 || true
+
+      # Independent privacy/marker scan of the captured logs (mirrors
+      # scripts/driver-compat.ps1's own scan). Never prints a marker's
+      # actual value (one marker IS the dedicated stack's demo password) -
+      # only a safe category label - and deliberately does not print or
+      # upload the log content itself if any marker is found.
+      - name: Privacy/marker scan on captured logs
+        id: privacy_scan
+        if: failure()
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f driver-compat-ci-logs.txt ]; then
+            echo "no captured log file; nothing to scan"
+            exit 0
+          fi
+          markers=(
+            "PASSWORD:pgxcompat_demo_only_change_me"
+            "EMAIL:alice.distinctive@example.com"
+            "EMAIL:bob.other@example.com"
+            "EMAIL:binary.target@example.com"
+            "MASKED_VALUE:al****@example.com"
+            "MASKED_VALUE:bo****@example.com"
+            "BLOCKED_QUERY_TEXT:pgxcompat_policy_"
+            "KEY_FIELD:SecretKey"
+            "KEY_FIELD:secretKey"
+          )
+          leaked=0
+          for entry in "${markers[@]}"; do
+            label="${entry%%:*}"
+            value="${entry#*:}"
+            if grep -qF -- "$value" driver-compat-ci-logs.txt; then
+              echo "::error::sensitive marker leaked in gateway logs (category: $label)"
+              leaked=1
+            fi
+          done
+          if [ "$leaked" -eq 1 ]; then
+            echo "::error::privacy scan failed - raw logs will not be printed or uploaded"
+            exit 1
+          fi
+
+      - name: Show captured logs on failure (privacy scan passed)
+        if: failure() && steps.privacy_scan.outcome == 'success'
+        shell: bash
+        run: |
+          echo "----- driver-compat-ci-logs.txt (tail) -----"
+          tail -n 300 driver-compat-ci-logs.txt || echo "no logs captured"
+
+      - name: Upload sanitized logs on failure (privacy scan passed)
+        if: failure() && steps.privacy_scan.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: driver-compat-logs-pg${{ matrix.postgres }}
+          path: driver-compat-ci-logs.txt
+          retention-days: 7
+
+      # Unconditional safety net, same rationale as the e2e job's final
+      # step above - always tears down the dedicated stack and its
+      # dedicated, ephemeral volume, regardless of outcome.
+      - name: Ensure dedicated stack and volume are torn down
+        if: always()
+        shell: bash
+        run: docker compose -f deploy/driver-compat/docker-compose.yml -p sentineldb-driver-compat down -v

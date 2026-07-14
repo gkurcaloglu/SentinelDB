@@ -71,10 +71,23 @@ rejected with a `FATAL` `ErrorResponse` and the connection is closed
 Extended Query routing on one connection (an opt-in connection is
 Extended-only for its entire lifetime — Simple Query's `'Q'` is rejected
 by `ExtendedFrontend` exactly like every other unsupported message), TLS,
-`COPY`, and a real driver compatibility test stage (planned as separate,
-later work). See `docs/design/0001-extended-query-review-checklist.md`
-and this document's [Non-goals](#non-goals) for the full list still
+and `COPY`. See `docs/design/0001-extended-query-review-checklist.md` and
+this document's [Non-goals](#non-goals) for the full list still
 outstanding.
+
+**A dedicated real-driver compatibility stage now exists.**
+`integration/pgxcompat` runs the real, unmodified, stable
+`github.com/jackc/pgx/v5` driver (pinned in its own nested Go module,
+isolated from the production gateway's dependencies) against real
+PostgreSQL 16 and PostgreSQL 18 servers through this opt-in Extended
+Query gateway — see
+[docs/postgresql-protocol.md](../postgresql-protocol.md#pgx-v5-driver-compatibility)
+for what is covered and what this suite discovered, including two real
+pgx-driver behaviors (`Ping` and the convenience `Tx` API) that are
+permanently incompatible with Extended-only mode by design, not
+SentinelDB bugs. This is compatibility evidence for one driver, not a
+security audit or a general driver-compatibility guarantee; psycopg,
+JDBC, Npgsql, Prisma, and other drivers/ORMs remain untested.
 
 ## Context
 

@@ -1,0 +1,107 @@
+# Dedicated, minimal Docker Compose stack for SentinelDB's pgx v5 driver-
+# compatibility stage (see scripts/driver-compat.ps1 and
+# integration/pgxcompat). This stack is intentionally separate from the
+# root docker-compose.yml demo stack:
+#
+#   - it contains ONLY PostgreSQL and SentinelDB (no Prometheus, Grafana,
+#     or dashboard - those are not needed to prove driver compatibility);
+#   - it uses a dedicated Extended Query config
+#     (deploy/driver-compat/config.yaml), not the repository root's
+#     default (Extended Query disabled) config.yaml;
+#   - it uses ports distinct from the normal demo stack (25432/25433
+#     instead of 5432/5433 - chosen outside both the demo stack's range and
+#     Windows' default Hyper-V/WSL dynamic port-exclusion ranges, which can
+#     otherwise make a host bind fail with "socket... forbidden by its
+#     access permissions" for no obvious reason) and a dedicated, ephemeral
+#     named volume, so it can run alongside (or instead of) the normal demo
+#     stack without any collision;
+#   - its PostgreSQL image/version is selectable via POSTGRES_IMAGE, so the
+#     exact same stack definition exercises PostgreSQL 16 locally by
+#     default and PostgreSQL 18 in CI (see .github/workflows/ci.yml's
+#     driver-compat job).
+#
+# Credentials below are DEMO-ONLY, used solely by this local/CI
+# compatibility stack - never reused anywhere real. Run with:
+#   docker compose -f deploy/driver-compat/docker-compose.yml -p sentineldb-driver-compat up -d --build
+# and tear down (including the dedicated volume) with:
+#   docker compose -f deploy/driver-compat/docker-compose.yml -p sentineldb-driver-compat down -v
+
+name: sentineldb-driver-compat
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      # DEMO ONLY - used solely by this dedicated compatibility stack.
+      POSTGRES_USER: pgxcompat
+      POSTGRES_PASSWORD: pgxcompat_demo_only_change_me
+      POSTGRES_DB: pgxcompat
+    volumes:
+      # Mounted at the parent directory, not .../postgresql/data: the
+      # postgres:18+ Docker image changed to a pg_ctlcluster-style,
+      # major-version-specific data directory layout under
+      # /var/lib/postgresql (see
+      # https://github.com/docker-library/postgres/pull/1259) and refuses
+      # to start if something is already mounted directly at
+      # /var/lib/postgresql/data. Mounting the volume one level up works
+      # for both postgres:16 and postgres:18 images - each creates its own
+      # subdirectory inside it.
+      - driver-compat-pgdata:/var/lib/postgresql
+    ports:
+      # Direct access to the real database for test setup/verification
+      # (integration/pgxcompat's SENTINELDB_DIRECT_DSN) and for the
+      # CancelRequest test's pg_stat_activity polling. Loopback-only, and a
+      # port distinct from the normal demo stack's 5433.
+      - "127.0.0.1:25433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - driver-compat-net
+
+  sentineldb:
+    build:
+      # Built from the repository root, exactly like the root
+      # docker-compose.yml's sentineldb service - this is the SAME
+      # production gateway binary/image, only the mounted config differs.
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SENTINELDB_LISTEN_ADDR: "0.0.0.0:5432"
+      SENTINELDB_TARGET_ADDR: "postgres:5432"
+      SENTINELDB_METRICS_ADDR: ":9090"
+      SENTINELDB_API_ADDR: ":8080"
+    ports:
+      # PostgreSQL gateway with the Extended Query path enabled (see
+      # config.yaml below). Loopback-only, and a port distinct from the
+      # normal demo stack's 5432.
+      - "127.0.0.1:25432:5432"
+    volumes:
+      # A dedicated config (protocol.extended_query_enabled: true,
+      # masking enabled for email, blocked phrase "DROP TABLE") - NOT the
+      # repository root's default config.yaml. Mounted read-only, same
+      # pattern as the root docker-compose.yml.
+      - ./config.yaml:/app/config.yaml:ro
+      - ../../plugins/firewall/v2.wasm:/app/plugins/firewall/v2.wasm:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/api/status"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+    networks:
+      - driver-compat-net
+
+volumes:
+  # Dedicated, ephemeral volume for this stack only - never the root
+  # stack's `pgdata` named volume. `docker compose down -v` removes it.
+  driver-compat-pgdata:
+
+networks:
+  driver-compat-net:
+    driver: bridge

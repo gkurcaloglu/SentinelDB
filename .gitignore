@@ -13,6 +13,11 @@ coverage/
 coverage.*
 *.cover
 
+# scripts/driver-compat.ps1'in ürettiği captured log dosyası (bkz. gorev:
+# pgx driver compatibility) - asla commit edilmemeli, sanitize edilmemiş
+# tam container loglarını içerebilir.
+driver-compat-*.log
+
 # Ortam degiskenleri
 .env
 .env.*

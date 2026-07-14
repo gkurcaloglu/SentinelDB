@@ -85,6 +85,31 @@ flowchart LR
 See [docs/postgresql-protocol.md](docs/postgresql-protocol.md) for the
 full, exact breakdown.
 
+## Driver compatibility
+
+The opt-in Extended Query gateway (`protocol.extended_query_enabled: true`)
+is continuously tested against the real, unmodified, stable
+[`pgx v5`](https://github.com/jackc/pgx) driver on real PostgreSQL 16 and
+PostgreSQL 18 servers — parameterized and prepared queries, pgx's normal
+batch API, transactions, response masking, Parse-time policy
+rejection/recovery, and a real `CancelRequest` using the relayed
+`BackendKeyData` credentials, on both PostgreSQL 16's legacy and
+PostgreSQL 18's protocol 3.2 variable-length cancellation keys. This is
+compatibility evidence for one driver, not a security audit or a general
+driver-compatibility guarantee — psycopg, JDBC, Npgsql, Prisma, and other
+drivers/ORMs remain untested.
+
+```powershell
+pwsh scripts/driver-compat.ps1                     # PostgreSQL 16
+pwsh scripts/driver-compat.ps1 -PostgresVersion 18  # PostgreSQL 18
+```
+
+See [docs/postgresql-protocol.md](docs/postgresql-protocol.md#pgx-v5-driver-compatibility)
+for exactly what is covered, including two real pgx-driver behaviors
+(`Ping` and its convenience `Tx` API) that this suite discovered are
+permanently incompatible with Extended-only mode by design — not
+SentinelDB bugs.
+
 ## Quick start (Docker Compose)
 
 Prerequisites: Docker Desktop (or Docker Engine + Compose v2).
@@ -219,6 +244,15 @@ go test ./...
 
 (`go test -race` requires a cgo-capable toolchain; if `CGO_ENABLED=0` or no C compiler is installed, that flag will fail with a cgo error unrelated to test correctness. CI runs it on Linux — see [.github/workflows/ci.yml](.github/workflows/ci.yml).)
 
+`integration/pgxcompat` is a separate, nested Go module (its own
+`go.mod`/`go.sum`, pinning `github.com/jackc/pgx/v5`) so the commands
+above, run from the repository root, never need to resolve or compile
+pgx. Its own tests are hermetic without Docker (they skip with a clear
+reason when `SENTINELDB_DRIVER_DSN`/`SENTINELDB_DIRECT_DSN` are unset);
+to actually run them against a real PostgreSQL 16 or 18 server, use
+[scripts/driver-compat.ps1](scripts/driver-compat.ps1) — see [Driver
+compatibility](#driver-compatibility) above.
+
 ## Benchmarks
 
 Local Go microbenchmarks (wire-protocol parsing, response masking, Wasm
@@ -260,10 +294,13 @@ internal/
   wasmproto/           shared host<->guest JSON envelope
 plugins/firewall/      Wasm guest source + compiled v2.wasm
 dashboard/             React (Vite) monitoring dashboard
+integration/
+  pgxcompat/           real pgx v5 driver-compatibility suite (own nested Go module)
 deploy/
   prometheus/          prometheus.yml (scrape config)
   grafana/             datasource + dashboard provisioning
-scripts/               PowerShell helper scripts (build wasm, E2E demo)
+  driver-compat/        dedicated Compose stack + config for the pgx suite
+scripts/               PowerShell helper scripts (build wasm, E2E demo, driver-compat)
 config.yaml             gateway runtime configuration
 Dockerfile              gateway production image
 docker-compose.yml     postgres + sentineldb + prometheus + grafana + dashboard
@@ -276,7 +313,9 @@ docker-compose.yml     postgres + sentineldb + prometheus + grafana + dashboard
   boundaries
 - [docs/postgresql-protocol.md](docs/postgresql-protocol.md) — exact
   wire-protocol support (this README's [protocol table](#supported--unsupported-protocol)
-  in full detail)
+  in full detail), including the
+  [pgx v5 driver-compatibility](docs/postgresql-protocol.md#pgx-v5-driver-compatibility)
+  section
 - [docs/plugin-api.md](docs/plugin-api.md) — the Wasm plugin's
   `evaluate_query`/`mask_value` JSON contract, limits, and rebuild steps
 - [docs/threat-model.md](docs/threat-model.md) — assets, trust
@@ -327,7 +366,8 @@ full assets/trust-boundaries/known-bypass breakdown.
 
 ## Roadmap
 
-- Extended Query Protocol support (Parse/Bind/Describe/Execute) with correct error/resync semantics — opt-in implementation now available behind `protocol.extended_query_enabled`; mixed Simple/Extended routing on one connection, and a dedicated real-driver compatibility test stage, remain future work
+- Extended Query Protocol support (Parse/Bind/Describe/Execute) with correct error/resync semantics — opt-in implementation now available behind `protocol.extended_query_enabled`, continuously tested against the real pgx v5 driver on PostgreSQL 16 and 18 (see [Driver compatibility](#driver-compatibility) below); mixed Simple/Extended routing on one connection remains future work
+- Additional real driver coverage beyond pgx v5 (psycopg, JDBC, Npgsql, Prisma, and other Node.js drivers/ORMs remain untested)
 - TLS termination between client and gateway
 - Additional masking types beyond email (phone numbers, national IDs, free-text redaction)
 - COPY protocol support

@@ -89,6 +89,29 @@ powershell -ExecutionPolicy Bypass -File .\scripts\e2e-demo.ps1 -Cleanup
 See [docs/operations.md](docs/operations.md) for port bindings, health
 checks, and troubleshooting.
 
+## pgx driver-compatibility testing
+
+If you changed anything under `internal/gateway`, `internal/firewall`,
+`internal/protocol`, or `integration/pgxcompat` itself, run the real
+driver-compatibility suite against a real PostgreSQL server before
+opening a PR:
+
+```powershell
+pwsh scripts/driver-compat.ps1                     # PostgreSQL 16
+pwsh scripts/driver-compat.ps1 -PostgresVersion 18  # PostgreSQL 18
+```
+
+This starts a dedicated Docker Compose stack
+([deploy/driver-compat](deploy/driver-compat), entirely separate from the
+demo stack above) and runs `integration/pgxcompat` — a real,
+unmodified, stable `github.com/jackc/pgx/v5` driver against it. That
+package is its own nested Go module (its own `go.mod`/`go.sum`) so pgx
+never becomes a dependency of the root module or the production gateway
+binary; `go build ./...`/`go test ./...` from the repository root never
+need it. See
+[docs/postgresql-protocol.md](docs/postgresql-protocol.md#pgx-v5-driver-compatibility)
+for what the suite covers.
+
 ## Branch and commit expectations
 
 - Branch off `main`; do not commit directly to `main`.

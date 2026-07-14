@@ -764,7 +764,9 @@ masking, and constructs no `protocol.State`/`ExtendedRuntime` — it only:
 - forwards a `CancelRequest` to the backend exactly once and returns
   immediately (`StartupResult.CancelOnly = true`), constructing no
   runtime — a cancellation connection never becomes an Extended Query
-  session;
+  session; the secret key is relayed byte-for-byte, whatever its length
+  (see "Protocol 3.0 and 3.2 compatibility" below) — it is never
+  inspected, compared, or logged;
 - forwards `StartupMessage` once, then relays the full authentication
   sub-protocol (`AuthenticationOk`/`Cleartext`/`MD5`/`SASL`/
   `SASLContinue`/`SASLFinal`, `PasswordMessage` responses, backend
@@ -772,7 +774,24 @@ masking, and constructs no `protocol.State`/`ExtendedRuntime` — it only:
   credential bytes; unsupported authentication codes fail closed;
 - relays backend startup messages (`ParameterStatus`, `BackendKeyData`,
   `NoticeResponse`, `NegotiateProtocolVersion`) and validates/relays the
-  first real `ReadyForQuery`, then returns successfully.
+  first real `ReadyForQuery` (only status `'I'`, since a freshly
+  constructed `protocol.State` always starts idle), then returns
+  successfully.
+
+**Protocol 3.0 and 3.2 compatibility.** `StartupMessage`'s major version
+must be `3`; the minor version is not validated or restricted — the real
+backend negotiates it, optionally via `NegotiateProtocolVersion`, which
+the handoff relays unchanged in either authentication phase. This matters
+because PostgreSQL 18 introduced protocol 3.2, which changed
+`BackendKeyData`'s and `CancelRequest`'s secret key from a fixed 4 bytes
+to a variable-length field (4–256 bytes inclusive, extending to the end
+of the message) — PostgreSQL 18 currently sends 32-byte keys. The handoff
+accepts and relays both shapes transparently: it validates only that the
+total key length falls in the documented `[4, 256]` range, and never
+branches on the negotiated startup version to decide which shape to
+expect. `BackendKeyData`/`CancelRequest` PID and secret-key bytes are
+never retained, compared, or logged — only their combined length is
+checked.
 
 All reads use `io.ReadFull` exclusively — never a buffered/read-ahead
 reader — so the handoff consumes exactly the bytes each step declares

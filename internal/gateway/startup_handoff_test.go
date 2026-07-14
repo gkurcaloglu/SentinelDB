@@ -39,6 +39,17 @@ func cancelRequestFrame(pid, secret uint32) []byte {
 	return startupFrame(cancelRequestCode, body)
 }
 
+// cancelRequestFrameWithKey builds a CancelRequest carrying an arbitrary-
+// length secret key (bkz. PostgreSQL protocol 3.2 / PostgreSQL 18+) -
+// unlike cancelRequestFrame, which always builds the legacy 4-byte key
+// shape.
+func cancelRequestFrameWithKey(pid uint32, key []byte) []byte {
+	body := make([]byte, 4+len(key))
+	binary.BigEndian.PutUint32(body[0:4], pid)
+	copy(body[4:], key)
+	return startupFrame(cancelRequestCode, body)
+}
+
 func startupParamBody(pairs ...string) []byte {
 	var body []byte
 	for _, p := range pairs {
@@ -103,6 +114,28 @@ func backendKeyDataFrame(pid, secret uint32) []byte {
 	binary.BigEndian.PutUint32(body[0:4], pid)
 	binary.BigEndian.PutUint32(body[4:8], secret)
 	return buildFrame(protocol.MsgBackendKeyData, body)
+}
+
+// backendKeyDataFrameWithKey builds a BackendKeyData carrying an arbitrary-
+// length secret key (bkz. PostgreSQL protocol 3.2 / PostgreSQL 18+) -
+// unlike backendKeyDataFrame, which always builds the legacy 4-byte key
+// shape.
+func backendKeyDataFrameWithKey(pid uint32, key []byte) []byte {
+	body := make([]byte, 4+len(key))
+	binary.BigEndian.PutUint32(body[0:4], pid)
+	copy(body[4:], key)
+	return buildFrame(protocol.MsgBackendKeyData, body)
+}
+
+// randomKeyBytes returns a deterministic, non-zero byte slice of length n -
+// used as a stand-in secret key; the exact bytes are never inspected by
+// production code, only forwarded/relayed.
+func randomKeyBytes(n int) []byte {
+	key := make([]byte, n)
+	for i := range key {
+		key[i] = byte(0x41 + (i % 26))
+	}
+	return key
 }
 
 func noticeResponseFrame(text string) []byte {
@@ -510,19 +543,17 @@ func TestStartupHandoff_CancelRequest_WrongLength_FailsClosed(t *testing.T) {
 	h := newHandoffHarness(t)
 	defer h.cancel()
 
-	// Manually build an oversized "CancelRequest"-coded frame (extra
-	// trailing bytes) - must be rejected, not silently absorbed.
-	body := make([]byte, 12) // code(4) + pid(4) + secret(4) + 4 extra bytes below via length field
-	binary.BigEndian.PutUint32(body[0:4], cancelRequestCode)
+	// Total frame length below minCancelRequestBytes (16) - too short to
+	// even hold the minimum 4-byte legacy secret key.
 	frame := make([]byte, 4)
-	binary.BigEndian.PutUint32(frame, uint32(4+len(body)+4))
-	frame = append(frame, body...)
-	frame = append(frame, 0, 0, 0, 0) // 4 extra trailing bytes within the declared length
+	binary.BigEndian.PutUint32(frame, 15)
+	frame = append(frame, make([]byte, 11)...) // code(4)+pid(4)+3 key bytes = 11, total 15
+	binary.BigEndian.PutUint32(frame[4:8], cancelRequestCode)
 	writeFrame(t, h.clientTest, frame)
 
 	o := h.waitOutcome()
 	if !errors.Is(o.err, ErrStartupProtocolFailure) {
-		t.Fatalf("expected ErrStartupProtocolFailure for a wrong-length CancelRequest, got %v", o.err)
+		t.Fatalf("expected ErrStartupProtocolFailure for a too-short CancelRequest, got %v", o.err)
 	}
 }
 
@@ -531,8 +562,9 @@ func TestStartupHandoff_CancelRequest_MarkersAbsentFromError(t *testing.T) {
 	defer h.cancel()
 
 	const markerPID, markerSecret = 0x1337, 0x7331
-	writeFrame(t, h.clientTest, cancelRequestFrame(markerPID, markerSecret))
-	readExactly(t, h.backendTest, cancelRequestBytes)
+	cr := cancelRequestFrame(markerPID, markerSecret)
+	writeFrame(t, h.clientTest, cr)
+	readExactly(t, h.backendTest, len(cr))
 
 	o := h.waitOutcome()
 	if o.err != nil {
@@ -1992,4 +2024,330 @@ func TestStartupHandoff_TransportErrorMarker_BackendWriteFailure_NeverLeaks(t *t
 	if !errors.Is(err, ErrStartupBackendWriteFailed) {
 		t.Fatalf("expected ErrStartupBackendWriteFailed, got %v", err)
 	}
+}
+
+// ==========================================================================
+// Protocol 3.2 (PostgreSQL 18+) variable-length cancellation keys - bkz.
+// PostgreSQL protocol documentation: BackendKeyData's and CancelRequest's
+// secret key is no longer always 4 bytes; it now extends to the end of the
+// message, 4 through 256 bytes inclusive. Protocol 3.0's legacy 4-byte key
+// remains supported as the minimum-length case; the gateway does not branch
+// on the StartupMessage's negotiated minor version - it accepts any key
+// length in the documented range regardless.
+// ==========================================================================
+
+func TestStartupHandoff_BackendKeyData_4ByteKey_Accepted(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	bkd := backendKeyDataFrameWithKey(4242, randomKeyBytes(4))
+	writeFrame(t, h.backendTest, bkd)
+	got := readExactly(t, h.clientTest, len(bkd))
+	if !bytes.Equal(got, bkd) {
+		t.Fatalf("expected the legacy 4-byte-key BackendKeyData relayed unchanged, got %x want %x", got, bkd)
+	}
+	o := finishWithReadyForQuery(t, h, protocol.TxStatusIdle)
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+}
+
+func TestStartupHandoff_BackendKeyData_32ByteKey_Accepted(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	// PostgreSQL 18 currently sends 32-byte secret keys.
+	bkd := backendKeyDataFrameWithKey(4242, randomKeyBytes(32))
+	writeFrame(t, h.backendTest, bkd)
+	got := readExactly(t, h.clientTest, len(bkd))
+	if !bytes.Equal(got, bkd) {
+		t.Fatalf("expected the 32-byte-key BackendKeyData relayed unchanged, got %x want %x", got, bkd)
+	}
+	o := finishWithReadyForQuery(t, h, protocol.TxStatusIdle)
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+}
+
+func TestStartupHandoff_BackendKeyData_256ByteKey_Accepted(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	// The documented upper bound.
+	bkd := backendKeyDataFrameWithKey(4242, randomKeyBytes(256))
+	writeFrame(t, h.backendTest, bkd)
+	got := readExactly(t, h.clientTest, len(bkd))
+	if !bytes.Equal(got, bkd) {
+		t.Fatalf("expected the 256-byte-key BackendKeyData relayed unchanged, got %x want %x", got, bkd)
+	}
+	o := finishWithReadyForQuery(t, h, protocol.TxStatusIdle)
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+}
+
+func TestStartupHandoff_BackendKeyData_3ByteKey_Rejected(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	writeFrame(t, h.backendTest, backendKeyDataFrameWithKey(4242, randomKeyBytes(3)))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a 3-byte BackendKeyData key, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_BackendKeyData_257ByteKey_Rejected(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	writeFrame(t, h.backendTest, backendKeyDataFrameWithKey(4242, randomKeyBytes(257)))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a 257-byte BackendKeyData key, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_BackendKeyData_TruncatedPID_Rejected(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	// Only 2 bytes total - cannot even hold a complete 4-byte PID.
+	writeFrame(t, h.backendTest, buildFrame(protocol.MsgBackendKeyData, []byte{1, 2}))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a truncated BackendKeyData PID, got %v", o.err)
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_BackendKeyData_MarkersAbsentFromError(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+	runToStartupMessage(t, h)
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	const markerPID = 0xC0FFEE
+	markerKey := []byte("SECRET_BACKEND_KEY_DATA_MARKER_9f3a")
+	writeFrame(t, h.backendTest, backendKeyDataFrameWithKey(markerPID, append(markerKey, randomKeyBytes(300)...))) // oversized -> rejected
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure, got %v", o.err)
+	}
+	for _, formatted := range []string{fmt.Sprintf("%v", o.err), fmt.Sprintf("%+v", o.err), fmt.Sprintf("%#v", o.err)} {
+		if strings.Contains(formatted, string(markerKey)) || strings.Contains(formatted, "C0FFEE") {
+			t.Fatalf("PID/secret key leaked into formatted error: %s", formatted)
+		}
+	}
+}
+
+func TestStartupHandoff_CancelRequest_LegacyFourByteKey(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	cr := cancelRequestFrameWithKey(4242, randomKeyBytes(4))
+	writeFrame(t, h.clientTest, cr)
+	got := readExactly(t, h.backendTest, len(cr))
+	if !bytes.Equal(got, cr) {
+		t.Fatalf("expected the legacy 4-byte-key CancelRequest forwarded unchanged, got %x want %x", got, cr)
+	}
+	o := h.waitOutcome()
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+	if !o.result.CancelOnly {
+		t.Fatal("expected CancelOnly=true")
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_CancelRequest_32ByteKey_Accepted(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	// PostgreSQL 18-style key length.
+	cr := cancelRequestFrameWithKey(4242, randomKeyBytes(32))
+	writeFrame(t, h.clientTest, cr)
+	got := readExactly(t, h.backendTest, len(cr))
+	if !bytes.Equal(got, cr) {
+		t.Fatalf("expected the 32-byte-key CancelRequest forwarded unchanged, got %x want %x", got, cr)
+	}
+	o := h.waitOutcome()
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+	if !o.result.CancelOnly {
+		t.Fatal("expected CancelOnly=true")
+	}
+	// No backend response is ever awaited/relayed, and no runtime is
+	// constructed - nothing further should have been written to the
+	// client.
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_CancelRequest_256ByteKey_Accepted(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	// The documented upper bound.
+	cr := cancelRequestFrameWithKey(4242, randomKeyBytes(256))
+	writeFrame(t, h.clientTest, cr)
+	got := readExactly(t, h.backendTest, len(cr))
+	if !bytes.Equal(got, cr) {
+		t.Fatalf("expected the 256-byte-key CancelRequest forwarded unchanged, got %x want %x", got, cr)
+	}
+	o := h.waitOutcome()
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+	if !o.result.CancelOnly {
+		t.Fatal("expected CancelOnly=true")
+	}
+	assertNoClientBytes(t, h)
+}
+
+func TestStartupHandoff_CancelRequest_3ByteKey_Rejected(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	writeFrame(t, h.clientTest, cancelRequestFrameWithKey(4242, randomKeyBytes(3)))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a 3-byte CancelRequest key, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_CancelRequest_257ByteKey_Rejected(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	writeFrame(t, h.clientTest, cancelRequestFrameWithKey(4242, randomKeyBytes(257)))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a 257-byte CancelRequest key, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_CancelRequest_MissingPIDAndKey_Rejected(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	// A CancelRequest-coded frame with NO PID/key material at all (total
+	// frame is just length+code, 8 bytes - well below the 16-byte
+	// minimum).
+	frame := startupFrame(cancelRequestCode, nil)
+	writeFrame(t, h.clientTest, frame)
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure for a CancelRequest missing PID/key material, got %v", o.err)
+	}
+	assertNoBytesForwarded(t, h)
+}
+
+func TestStartupHandoff_CancelRequest_MarkersAbsentFromError_VariableKey(t *testing.T) {
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	const markerPID = 0xDEADBEEF
+	markerKey := []byte("SECRET_CANCEL_KEY_MARKER_7c21")
+	// 257 bytes -> rejected, forcing an error path that must not leak the
+	// PID/key.
+	writeFrame(t, h.clientTest, cancelRequestFrameWithKey(markerPID, append(markerKey, randomKeyBytes(230)...)))
+
+	o := h.waitOutcome()
+	if !errors.Is(o.err, ErrStartupProtocolFailure) {
+		t.Fatalf("expected ErrStartupProtocolFailure, got %v", o.err)
+	}
+	for _, formatted := range []string{fmt.Sprintf("%v", o.err), fmt.Sprintf("%+v", o.err), fmt.Sprintf("%#v", o.err)} {
+		if strings.Contains(formatted, string(markerKey)) || strings.Contains(formatted, "DEADBEEF") {
+			t.Fatalf("PID/secret key leaked into formatted error: %s", formatted)
+		}
+	}
+}
+
+func TestStartupHandoff_Protocol32_FullStartupRegression(t *testing.T) {
+	// StartupMessage version 3.2 -> supported authentication ->
+	// AuthenticationOk -> BackendKeyData with a 32-byte key ->
+	// ReadyForQuery('I') -> successful handoff.
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	sm := startupMessageFrame(3, 2, "user", "alice", "database", "postgres")
+	writeFrame(t, h.clientTest, sm)
+	got := readExactly(t, h.backendTest, len(sm))
+	if !bytes.Equal(got, sm) {
+		t.Fatalf("expected the protocol 3.2 StartupMessage forwarded unchanged, got %x want %x", got, sm)
+	}
+
+	writeFrame(t, h.backendTest, authOkFrame())
+	readExactly(t, h.clientTest, len(authOkFrame()))
+
+	bkd := backendKeyDataFrameWithKey(9001, randomKeyBytes(32))
+	writeFrame(t, h.backendTest, bkd)
+	gotBkd := readExactly(t, h.clientTest, len(bkd))
+	if !bytes.Equal(gotBkd, bkd) {
+		t.Fatalf("expected the protocol 3.2 BackendKeyData relayed unchanged, got %x want %x", gotBkd, bkd)
+	}
+
+	o := finishWithReadyForQuery(t, h, protocol.TxStatusIdle)
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+	if o.result.ReadyStatus != protocol.TxStatusIdle || o.result.CancelOnly {
+		t.Fatalf("unexpected result: %+v", o.result)
+	}
+}
+
+func TestStartupHandoff_Protocol32_CancelRequestRegression(t *testing.T) {
+	// A CancelRequest using the protocol 3.2 variable-length key shape,
+	// independent of any StartupMessage - CancelRequest carries no
+	// protocol version of its own.
+	h := newHandoffHarness(t)
+	defer h.cancel()
+
+	cr := cancelRequestFrameWithKey(9001, randomKeyBytes(32))
+	writeFrame(t, h.clientTest, cr)
+	got := readExactly(t, h.backendTest, len(cr))
+	if !bytes.Equal(got, cr) {
+		t.Fatalf("expected the protocol 3.2 CancelRequest forwarded unchanged, got %x want %x", got, cr)
+	}
+
+	o := h.waitOutcome()
+	if o.err != nil {
+		t.Fatalf("unexpected error: %v", o.err)
+	}
+	if !o.result.CancelOnly {
+		t.Fatal("expected CancelOnly=true")
+	}
+	assertNoClientBytes(t, h)
 }

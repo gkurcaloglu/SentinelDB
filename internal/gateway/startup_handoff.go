@@ -140,10 +140,38 @@ type StartupResult struct {
 // --- PostgreSQL wire sabitleri (yalnizca bu dosya icin gerekli olanlar) ----
 
 const (
-	sslRequestCode     uint32 = 80877103
-	gssEncRequestCode  uint32 = 80877104
-	cancelRequestCode  uint32 = 80877102
-	cancelRequestBytes        = 16 // length(4)+code(4)+pid(4)+secretkey(4), TAM OLARAK
+	sslRequestCode    uint32 = 80877103
+	gssEncRequestCode uint32 = 80877104
+	cancelRequestCode uint32 = 80877102
+
+	// cancelRequestPrefixLen, CancelRequest'in surum kodundan SONRAKI,
+	// secret key'den ONCEKI sabit onekidir: Int32 backend PID (4 bayt).
+	// Uzunluk(4)+kod(4) zaten readStartupStyleFrame tarafindan ayri
+	// tutulur (frame degiskeni onlari da icerir) - bkz. asagidaki
+	// min/maxCancelRequestBytes hesaplamasi (12 = uzunluk(4)+kod(4)+pid(4)
+	// DEGIL, yalnizca frame'in surum-kodu ALANINDAN sonraki kisim; asil
+	// hesap negotiateStartup icinde frame'in TOPLAM boyutu uzerinden
+	// yapilir - bkz. oradaki yorum).
+	cancelRequestPIDLen = 4
+
+	// PostgreSQL protokol 3.2 (PostgreSQL 18+) ile CancelRequest'in secret
+	// key alani ARTIK sabit 4 bayt DEGIL, degisken uzunlukludur (govdenin
+	// SONUNA kadar uzanir) - protokol belgelerinde belirtilen sinirlar 4
+	// ile 256 bayt ARASINDADIR (dahil). Protokol 3.0'da anahtar HER ZAMAN
+	// tam olarak 4 bayttir - bu, asagidaki minimum (4 baytlik anahtar)
+	// durumuyla ZATEN kapsanir; ayri bir surum dallanmasi GEREKMEZ, cunku
+	// CancelRequest'in kendisi bir surum numarasi tasimaz (yalnizca sabit
+	// bir istek kodu) - gateway her iki bicimi de, hangi PostgreSQL
+	// surumunun gonderdigine bakmaksizin, SEFFAF sekilde kabul eder.
+	minCancelSecretKeyLen = 4
+	maxCancelSecretKeyLen = 256
+
+	// minCancelRequestBytes/maxCancelRequestBytes, TOPLAM CancelRequest
+	// cerceve boyutunun (uzunluk(4)+kod(4)+pid(4)+secretkey(4..256)) izin
+	// verilen araligidir: 16 (eski, 4 baytlik anahtar) ile 268 (protokol
+	// 3.2'nin belgelenmis ust siniri, 256 baytlik anahtar) ARASINDA.
+	minCancelRequestBytes = startupMessageHeaderSize + cancelRequestPIDLen + minCancelSecretKeyLen // 16
+	maxCancelRequestBytes = startupMessageHeaderSize + cancelRequestPIDLen + maxCancelSecretKeyLen // 268
 
 	startupFrameLenSize = 4
 	minStartupFrameLen  = 8 // en az uzunluk(4)+kod(4) - SSLRequest/GSSENCRequest icin TAM OLARAK bu kadar
@@ -165,10 +193,30 @@ const (
 	tagReadyForQuery      byte = 'Z'
 	tagNegotiateProtoVers byte = 'v'
 
-	// backendKeyDataBodyLen, PostgreSQL protokol belgelerinde tanimlanan
-	// BackendKeyData govde boyutudur: Int32 process ID + Int32 secret key -
-	// TAM OLARAK 8 bayt, baska hicbir surum farkliligi yoktur.
-	backendKeyDataBodyLen = 8
+	// backendKeyDataPIDLen, BackendKeyData govdesinin surum-bagimsiz sabit
+	// onekidir: Int32 process ID (4 bayt).
+	backendKeyDataPIDLen = 4
+
+	// PostgreSQL protokol 3.2 (PostgreSQL 18+) ile BackendKeyData'nin
+	// secret key alani ARTIK sabit 4 bayt DEGIL, govdenin SONUNA kadar
+	// uzanan degisken uzunluklu bir alandir - protokol belgelerinde
+	// belirtilen sinirlar 4 ile 256 bayt ARASINDADIR (dahil). Protokol
+	// 3.0'da anahtar HER ZAMAN tam olarak 4 bayttir; PostgreSQL 18
+	// su anda 32 baytlik anahtarlar gonderir - HER IKI bicim de (ve
+	// belgelenmis 256 baytlik ust sinira kadar HERHANGI bir uzunluk) ayni
+	// sekilde, SEFFAF olarak kabul edilip relay edilir; StartupMessage'in
+	// surum alanina (3.0 ya da 3.2) bakilarak dallanma YAPILMAZ - bu,
+	// gateway'in transparan bir relay olmasi ilkesiyle tutarlidir (bkz.
+	// gorev 3).
+	minBackendKeyDataSecretLen = 4
+	maxBackendKeyDataSecretLen = 256
+
+	// minBackendKeyDataBodyLen/maxBackendKeyDataBodyLen, TOPLAM
+	// BackendKeyData GOVDE boyutunun (pid(4)+secretkey(4..256)) izin
+	// verilen araligidir: 8 (eski, 4 baytlik anahtar) ile 260 (protokol
+	// 3.2'nin belgelenmis ust siniri, 256 baytlik anahtar) ARASINDA.
+	minBackendKeyDataBodyLen = backendKeyDataPIDLen + minBackendKeyDataSecretLen // 8
+	maxBackendKeyDataBodyLen = backendKeyDataPIDLen + maxBackendKeyDataSecretLen // 260
 )
 
 // Authentication alt-kodlari (backend 'R' mesajinin govdesindeki ilk
@@ -363,10 +411,14 @@ func runStartupHandoffWork(client Transport, backend BackendTransport, limits St
 //     Gecerliyse istemciye TEK bayt 'N' yazilir, backend'e HIC dokunulmadan
 //     bir SONRAKI baslangic cercevesi beklenir (istemci birden fazla kez
 //     "problayabilir" - bkz. gorev 6/eski "SSL/GSS").
-//   - CancelRequest: TAM OLARAK 16 baytlik cerceve DEGILSE fail-closed
-//     reddedilir. Gecerliyse backend'e bir kez iletilir, yanit beklenmeden
-//     (true, nil) doner - bu, is yolunun BASARILI bir terminal noktasidir
-//     (bkz. cause.succeed()).
+//   - CancelRequest: TOPLAM cerceve boyutu [minCancelRequestBytes,
+//     maxCancelRequestBytes] araligi DISINDAYSA fail-closed reddedilir -
+//     bkz. bu sabitlerin doc yorumu icin PostgreSQL protokol 3.2 (18+)
+//     degisken uzunluklu secret key destegi. Gecerliyse cerceve (PID VE
+//     secret key DAHIL, HERHANGI bir yorumlama/karsilastirma yapilmadan)
+//     backend'e AYNEN bir kez iletilir, yanit beklenmeden (true, nil)
+//     doner - bu, is yolunun BASARILI bir terminal noktasidir (bkz.
+//     cause.succeed()).
 //   - Surum kodu major==3 olan herhangi bir deger (StartupMessage): govde
 //     (parametre alani) yapisal olarak dogrulanir (bkz.
 //     validateStartupParams) - gecersizse ya da yapisal olarak dolu,
@@ -394,7 +446,7 @@ func negotiateStartup(client Transport, backend BackendTransport, limits Startup
 			}
 			continue
 		case cancelRequestCode:
-			if len(frame) != cancelRequestBytes {
+			if len(frame) < minCancelRequestBytes || len(frame) > maxCancelRequestBytes {
 				return false, cause.fail(ErrStartupProtocolFailure)
 			}
 			if err := writeAll(backend, frame); err != nil {
@@ -678,11 +730,18 @@ func validateTwoStringFrame(body []byte) error {
 }
 
 // validateBackendKeyData, BackendKeyData govdesinin PostgreSQL protokol
-// belgelerinde tanimlanan TAM bicimine (Int32 process ID + Int32 secret
-// key = TAM OLARAK 8 bayt) uydugunu dogrular. Hicbir deger
-// saklanmaz/loglanmaz.
+// belgelerinde tanimlanan bicimine uydugunu dogrular: Int32 process ID
+// (bkz. backendKeyDataPIDLen) + govdenin SONUNA kadar uzanan degisken
+// uzunluklu bir secret key. Protokol 3.0'da anahtar HER ZAMAN 4 bayttir;
+// protokol 3.2 (PostgreSQL 18+) ile anahtar 4 ile 256 bayt (dahil)
+// arasinda HERHANGI bir uzunlukta olabilir (PostgreSQL su anda 32 bayt
+// kullanir) - gateway StartupMessage'in surumune BAKMAKSIZIN her iki
+// bicimi de SEFFAF olarak kabul eder (bkz. minBackendKeyDataBodyLen/
+// maxBackendKeyDataBodyLen'in doc yorumu). Hicbir deger (PID ya da secret
+// key) saklanmaz/loglanmaz/yorumlanmaz - yalnizca TOPLAM govde uzunlugu
+// dogrulanir.
 func validateBackendKeyData(body []byte) error {
-	if len(body) != backendKeyDataBodyLen {
+	if len(body) < minBackendKeyDataBodyLen || len(body) > maxBackendKeyDataBodyLen {
 		return ErrStartupProtocolFailure
 	}
 	return nil

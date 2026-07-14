@@ -107,8 +107,10 @@ pwsh scripts/driver-compat.ps1 -PostgresVersion 18  # PostgreSQL 18
 See [docs/postgresql-protocol.md](docs/postgresql-protocol.md#pgx-v5-driver-compatibility)
 for exactly what is covered, including two real pgx-driver behaviors
 (`Ping` and its convenience `Tx` API) that this suite discovered are
-permanently incompatible with Extended-only mode by design — not
-SentinelDB bugs.
+currently incompatible with Extended-only mode as pinned pgx v5.10.0 and
+SentinelDB are implemented today — not SentinelDB bugs, and not a claim
+about future pgx or SentinelDB behavior. Ordinary parameterized/prepared
+Extended Query operations are unaffected.
 
 ## Quick start (Docker Compose)
 

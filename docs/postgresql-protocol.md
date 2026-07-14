@@ -1085,44 +1085,58 @@ is documented here. Masking configured target columns therefore
 currently requires text result format on both protocol paths; binary
 requests against those columns remain fail-closed on both.
 
-### pgx's `Ping` and `Tx` API are incompatible with Extended-only mode
+### pgx's `Ping` and `Tx` API are currently incompatible with Extended-only mode
 
-This suite discovered — and documents rather than works around — a real,
-permanent incompatibility between two pieces of pgx's own public API and
-SentinelDB's Extended-only gateway mode:
+This suite discovered — and documents rather than works around — a
+**current** compatibility limitation between two pieces of pinned pgx
+v5.10.0's own public API and SentinelDB's Extended-only gateway mode.
+This is a fact about pgx v5.10.0's implementation and SentinelDB's
+current, deliberately Extended-only gateway mode today, not a
+statement about either project's future behavior:
 
-- **`(*pgx.Conn).Ping`** is hard-wired, inside `pgconn.PgConn.Ping`, to
-  `Exec(ctx, "-- ping")`, which always issues a raw Simple Query message.
-  There is no Extended Query option at that layer and no pgx
-  configuration changes it.
+- **`(*pgx.Conn).Ping`** delegates, in pgx v5.10.0, to
+  `pgconn.PgConn.Ping`, which itself calls `Exec(ctx, "-- ping")` — and
+  that issues a raw Simple Query message. There is no Extended Query
+  option at that layer in this pgx version, and no pgx configuration
+  available today changes it.
 - **pgx's convenience `Tx` API** (`(*pgx.Conn).Begin`,
   `(pgx.Tx).Commit`, `(pgx.Tx).Rollback`, and pseudo-nested-transaction
-  savepoints) always issues `begin`/`commit`/`rollback`/`savepoint ...`
-  via `(*pgx.Conn).Exec` with **zero** bind arguments. pgx's own `Exec`
-  unconditionally downgrades to the Simple Query Protocol whenever it is
-  called with no arguments, regardless of `QueryExecMode` — a general
-  behavior of pgx's `Exec`, not specific to transaction control.
+  savepoints), in pgx v5.10.0, issues `begin`/`commit`/`rollback`/
+  `savepoint ...` via `(*pgx.Conn).Exec` with **zero** bind arguments.
+  pgx v5.10.0's own `Exec` forces the Simple Query Protocol whenever it
+  is called with no arguments, regardless of `QueryExecMode` — a general
+  behavior of pgx's `Exec` in this version, not specific to transaction
+  control.
 
-SentinelDB's Extended-only gateway correctly (and, per its design,
-necessarily) rejects any Simple Query message fail-closed and terminates
-the connection — the same documented boundary
+SentinelDB's Extended-only gateway correctly (and, per its current
+design, necessarily) rejects any Simple Query message fail-closed and
+terminates the connection — the same documented boundary
 [`TestSimpleQueryRejectedOnExtendedOnlyGateway`](#pgx-v5-driver-compatibility)
-exercises directly. This means `Ping` can never succeed against an
-Extended-only connection, and pgx's `Tx` wrapper can never begin a
-transaction against one either. Neither is a SentinelDB bug to work
-around: mixed Simple/Extended Query routing on one connection is out of
-scope (see [Mixed Simple/Extended Query routing remains
+exercises directly. This means `Ping` cannot currently succeed against
+an Extended-only connection, and pgx's `Tx` wrapper cannot currently
+begin a transaction against one either, with this pinned pgx version and
+this SentinelDB mode. Ordinary parameterized and prepared Extended Query
+operations are unaffected and work normally — this limitation is
+specific to `Ping`, zero-argument `Exec` calls, and the convenience `Tx`
+API. Neither is a SentinelDB bug to work around today: mixed Simple/
+Extended Query routing on one connection is out of scope for this branch
+(see [Mixed Simple/Extended Query routing remains
 unsupported](#opt-in-extended-query-frontend-bridge) above), so
-SentinelDB must not start accepting Simple Query on an Extended-only
-connection merely to accommodate these two pgx behaviors.
+SentinelDB does not start accepting Simple Query on an Extended-only
+connection merely to accommodate these two pgx behaviors. A future pgx
+release could change how `Ping`/`Exec`/`Tx` are implemented, and a future
+SentinelDB stage could add mixed-routing support — either would change
+this compatibility picture, but no such future support is claimed or
+implemented in this branch.
 
 `integration/pgxcompat` therefore proves connectivity via a trivial
 Extended Query `SELECT` instead of `Ping` everywhere except
 `TestConnectionStartupAuthAndProtocolNegotiation`, which exercises `Ping`
-directly and asserts it fails (and that the connection remains otherwise
-provably healthy beforehand). Transaction control is proven by sending
-`BEGIN`/`COMMIT`/`ROLLBACK` as ordinary Extended Query statements through
-pgx's `Query`/`Exec`, not through `(*pgx.Conn).Begin`. Applications using
-pgx against an Extended-only SentinelDB gateway today need the same
+directly and asserts it currently fails against this pinned pgx version
+(and that the connection remains otherwise provably healthy
+beforehand). Transaction control is proven by sending `BEGIN`/`COMMIT`/
+`ROLLBACK` as ordinary Extended Query statements through pgx's `Query`/
+`Exec`, not through `(*pgx.Conn).Begin`. Applications using pgx v5.10.0
+against an Extended-only SentinelDB gateway today need the same
 workaround: avoid `Ping` and pgx's `Tx` API, and issue transaction
 control as explicit statements instead.

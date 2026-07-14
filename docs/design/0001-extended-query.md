@@ -84,10 +84,13 @@ Query gateway — see
 [docs/postgresql-protocol.md](../postgresql-protocol.md#pgx-v5-driver-compatibility)
 for what is covered and what this suite discovered, including two real
 pgx-driver behaviors (`Ping` and the convenience `Tx` API) that are
-permanently incompatible with Extended-only mode by design, not
-SentinelDB bugs. This is compatibility evidence for one driver, not a
-security audit or a general driver-compatibility guarantee; psycopg,
-JDBC, Npgsql, Prisma, and other drivers/ORMs remain untested.
+currently incompatible with Extended-only mode given pinned pgx v5.10.0
+and SentinelDB's current implementation — not SentinelDB bugs, and not a
+claim about future pgx or SentinelDB behavior; ordinary parameterized/
+prepared Extended Query operations are unaffected. This is compatibility
+evidence for one driver, not a security audit or a general
+driver-compatibility guarantee; psycopg, JDBC, Npgsql, Prisma, and other
+drivers/ORMs remain untested.
 
 ## Context
 

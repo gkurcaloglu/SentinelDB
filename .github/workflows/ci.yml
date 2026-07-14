@@ -199,6 +199,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # Dependency-free (no Docker, no Pester), deterministic regression
+      # checks for the privacy-scan/log-capture decision logic shared by
+      # scripts/driver-compat.ps1 and scripts/driver-compat-ci-diagnostics.ps1
+      # (both dot-source scripts/lib/driver-compat-privacy.ps1). Runs
+      # first, before anything Docker-dependent, as a fast-fail gate.
+      - name: pgx driver-compat privacy-scan self-test
+        shell: pwsh
+        run: ./scripts/driver-compat-privacy-selftest.ps1
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -236,67 +245,28 @@ jobs:
           SENTINELDB_EXPECT_LONG_CANCEL_KEY: "true"
         run: go test ./... -race -count=1
 
-      # Captures gateway logs to a file only (no console tail yet - see the
-      # scan step below, which gates whether it is safe to print/upload).
-      - name: Capture SentinelDB logs on failure
+      # Captures fresh (this-run) SentinelDB logs and runs the exact same
+      # privacy scan scripts/driver-compat.ps1 uses - both dot-source
+      # scripts/lib/driver-compat-privacy.ps1, so there is one shared
+      # source of truth for the marker catalog and for the rule that a log
+      # tail is only ever printed after a scan of THIS run's logs has
+      # actually passed (never an old/stale file, never before scanning,
+      # never a marker's actual value - only safe category labels). See
+      # scripts/driver-compat-ci-diagnostics.ps1 and this job's own first
+      # step (the Docker-free privacy-scan self-test) for the regression
+      # proof of this exact logic.
+      - name: Capture SentinelDB logs and run privacy scan on failure
+        id: privacy_diag
         if: failure()
-        shell: bash
-        run: |
-          docker compose -f deploy/driver-compat/docker-compose.yml -p sentineldb-driver-compat logs sentineldb --no-color > driver-compat-ci-logs.txt 2>&1 || true
+        shell: pwsh
+        run: ./scripts/driver-compat-ci-diagnostics.ps1 -ProjectName sentineldb-driver-compat -ComposeFile deploy/driver-compat/docker-compose.yml
 
-      # Independent privacy/marker scan of the captured logs (mirrors
-      # scripts/driver-compat.ps1's own scan). Never prints a marker's
-      # actual value (one marker IS the dedicated stack's demo password) -
-      # only a safe category label - and deliberately does not print or
-      # upload the log content itself if any marker is found.
-      - name: Privacy/marker scan on captured logs
-        id: privacy_scan
-        if: failure()
-        shell: bash
-        run: |
-          set -e
-          if [ ! -f driver-compat-ci-logs.txt ]; then
-            echo "no captured log file; nothing to scan"
-            exit 0
-          fi
-          markers=(
-            "PASSWORD:pgxcompat_demo_only_change_me"
-            "EMAIL:alice.distinctive@example.com"
-            "EMAIL:bob.other@example.com"
-            "EMAIL:binary.target@example.com"
-            "MASKED_VALUE:al****@example.com"
-            "MASKED_VALUE:bo****@example.com"
-            "BLOCKED_QUERY_TEXT:pgxcompat_policy_"
-            "KEY_FIELD:SecretKey"
-            "KEY_FIELD:secretKey"
-          )
-          leaked=0
-          for entry in "${markers[@]}"; do
-            label="${entry%%:*}"
-            value="${entry#*:}"
-            if grep -qF -- "$value" driver-compat-ci-logs.txt; then
-              echo "::error::sensitive marker leaked in gateway logs (category: $label)"
-              leaked=1
-            fi
-          done
-          if [ "$leaked" -eq 1 ]; then
-            echo "::error::privacy scan failed - raw logs will not be printed or uploaded"
-            exit 1
-          fi
-
-      - name: Show captured logs on failure (privacy scan passed)
-        if: failure() && steps.privacy_scan.outcome == 'success'
-        shell: bash
-        run: |
-          echo "----- driver-compat-ci-logs.txt (tail) -----"
-          tail -n 300 driver-compat-ci-logs.txt || echo "no logs captured"
-
-      - name: Upload sanitized logs on failure (privacy scan passed)
-        if: failure() && steps.privacy_scan.outcome == 'success'
+      - name: Upload privacy-scanned logs on failure
+        if: failure() && steps.privacy_diag.outputs.showtail == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: driver-compat-logs-pg${{ matrix.postgres }}
-          path: driver-compat-ci-logs.txt
+          path: ${{ steps.privacy_diag.outputs.logpath }}
           retention-days: 7
 
       # Unconditional safety net, same rationale as the e2e job's final

@@ -16,16 +16,20 @@ import (
 //
 // This deliberately does NOT use pgx's convenience Tx API
 // ((*pgx.Conn).Begin / (pgx.Tx).Commit / (pgx.Tx).Rollback): this suite
-// discovered that pgx's Tx implementation always issues "begin"/"commit"/
-// "rollback" via (*pgx.Conn).Exec with zero bind arguments, which - like
-// (*pgx.Conn).Ping (see helpers_test.go's assertAlive doc comment) -
-// always downgrades to the Simple Query Protocol. SentinelDB's
-// Extended-only gateway correctly rejects that fail-closed and terminates
-// the connection, so pgx's Tx API is currently incompatible with
-// Extended-only mode - a genuine, permanent driver/gateway-mode
-// combination limitation, not a SentinelDB bug (mixed Simple/Extended
-// routing is explicitly out of scope; SentinelDB must not start accepting
-// Simple Query on an Extended-only connection to accommodate it).
+// discovered that pinned pgx v5.10.0's Tx implementation issues
+// "begin"/"commit"/"rollback" via (*pgx.Conn).Exec with zero bind
+// arguments, which - like (*pgx.Conn).Ping (see helpers_test.go's
+// assertAlive doc comment) - forces the Simple Query Protocol in this
+// pgx version. SentinelDB's Extended-only gateway correctly rejects that
+// fail-closed and terminates the connection, so pgx's Tx API is
+// currently incompatible with Extended-only mode - a *current*
+// driver/gateway-mode combination limitation of pinned pgx v5.10.0 with
+// SentinelDB's current implementation, not a SentinelDB bug and not a
+// claim that this can never change (mixed Simple/Extended routing is
+// explicitly out of scope for this branch; SentinelDB does not start
+// accepting Simple Query on an Extended-only connection to accommodate
+// it). Ordinary parameterized/prepared Extended Query operations are
+// unaffected.
 //
 // BEGIN/COMMIT/ROLLBACK are, however, ordinary SQL statements from the
 // wire protocol's point of view - this test sends them explicitly through

@@ -22,19 +22,21 @@ import (
 // never read into a log line or failure message - only their length.
 //
 // (*pgx.Conn).Ping is deliberately exercised last, and expected to fail
-// *and* terminate the connection: pgconn.PgConn.Ping is hard-wired to
-// `Exec(ctx, "-- ping")`, which always issues a raw Simple Query message -
-// there is no Extended Query option at that layer, and no pgx
-// configuration changes it. SentinelDB's Extended-only gateway
-// unconditionally (and correctly) rejects that Simple Query fail-closed
-// and terminates the connection, exactly like the documented
+// *and* terminate the connection: in pinned pgx v5.10.0, pgconn.PgConn.Ping
+// delegates to `Exec(ctx, "-- ping")`, which issues a raw Simple Query
+// message - there is no Extended Query option at that layer in this pgx
+// version, and no pgx configuration available today changes it.
+// SentinelDB's Extended-only gateway correctly rejects that Simple Query
+// fail-closed and terminates the connection, exactly like the documented
 // mixed-protocol boundary (see TestSimpleQueryRejectedOnExtendedOnlyGateway).
-// This is a genuine, permanent incompatibility between pgx's Ping and
-// Extended-only mode that this suite discovered and documents here - not
-// a SentinelDB bug to work around (SentinelDB must not start accepting
-// Simple Query on an Extended-only connection to accommodate it); every
-// other test in this package proves connectivity via Extended Query
-// instead (see helpers_test.go's assertAlive).
+// This is a genuine, *current* compatibility limitation between pinned
+// pgx v5.10.0's Ping and SentinelDB's current Extended-only mode that
+// this suite discovered and documents here - not a SentinelDB bug to
+// work around (SentinelDB does not start accepting Simple Query on an
+// Extended-only connection to accommodate it), and not a claim that this
+// can never change in a future pgx release or a future SentinelDB stage;
+// every other test in this package proves connectivity via Extended
+// Query instead (see helpers_test.go's assertAlive).
 func TestConnectionStartupAuthAndProtocolNegotiation(t *testing.T) {
 	env := requireIntegrationEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

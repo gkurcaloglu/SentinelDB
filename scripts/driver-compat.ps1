@@ -19,6 +19,13 @@
 # production kimlik bilgisi degildir ve konsola HICBIR ZAMAN yazilmaz -
 # yalnizca `go test` alt surecine ortam degiskeni olarak gecilir.
 #
+# Log/privacy safety: this script never prints a log tail (or claims logs
+# are clean) unless a fresh, THIS-RUN capture of SentinelDB's logs has
+# been privacy-scanned and found clean - see
+# scripts/lib/driver-compat-privacy.ps1's file-header comment for the
+# exact design invariant, and scripts/driver-compat-privacy-selftest.ps1
+# for the deterministic (Docker-free) regression checks proving it.
+#
 # Usage:
 #   pwsh scripts/driver-compat.ps1                        # PostgreSQL 16, leaves the stack running afterwards
 #   pwsh scripts/driver-compat.ps1 -PostgresVersion 18     # PostgreSQL 18
@@ -39,13 +46,18 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
+. (Join-Path $PSScriptRoot "lib/driver-compat-privacy.ps1")
+
 $ComposeFile = "deploy/driver-compat/docker-compose.yml"
 $ProjectName = "sentineldb-driver-compat"
+$ServiceName = "sentineldb"
 
 # DEMO/TEST ONLY - must match deploy/driver-compat/docker-compose.yml and
 # deploy/driver-compat/config.yaml exactly. Never a real credential; never
 # printed to the console via Write-Host - only assembled into a DSN passed
-# to the `go test` child process as an environment variable.
+# to the `go test` child process as an environment variable, and passed to
+# Get-DriverCompatMarkerCatalog so the privacy scan can detect it if it
+# ever leaked.
 $PgUser = "pgxcompat"
 $PgPassword = "pgxcompat_demo_only_change_me"
 $PgDb = "pgxcompat"
@@ -82,62 +94,28 @@ function Wait-Healthy {
     }
 }
 
-# Sensitive test markers that must NEVER appear in SentinelDB's own logs -
-# see integration/pgxcompat for where each one originates:
-#   - $PgPassword                    : the dedicated stack's demo password
-#   - the three raw emails           : Bind parameter values used by the
-#                                      masking tests (never SQL text - real
-#                                      Bind values)
-#   - the two masked-value strings   : DataRow cell values, which
-#                                      SentinelDB must never log either
-#   - "pgxcompat_policy_"            : the static prefix of the table name
-#                                      used only inside the blocked DROP
-#                                      TABLE statement
-#                                      (TestParseTimePolicyRejectionAndRecovery)
-#                                      - if this appears anywhere in the
-#                                      gateway's logs it means the actual
-#                                      blocked SQL TEXT leaked. Note this is
-#                                      deliberately NOT the literal string
-#                                      "DROP TABLE": SentinelDB safely and
-#                                      intentionally logs the *configured*
-#                                      blocked-phrase name as part of its
-#                                      policy-decision reason (e.g. `neden=...
-#                                      (yasaklı ifade: "DROP TABLE")`) - a
-#                                      known constant from config.yaml, not
-#                                      client-supplied data - so scanning for
-#                                      that alone would always false-positive.
-#   - "SecretKey"/"secretKey"        : PID/cancellation-key values are never
-#                                      read into any printable Go value in
-#                                      the first place (see
-#                                      internal/gateway/startup_handoff.go
-#                                      and integration/pgxcompat/cancel_test.go),
-#                                      so there is no literal byte sequence to
-#                                      scan for - these two tokens instead
-#                                      catch any *accidental* future
-#                                      debug-logging of the field itself.
-$SensitiveMarkers = @(
-    $PgPassword,
-    "alice.distinctive@example.com",
-    "bob.other@example.com",
-    "binary.target@example.com",
-    "al****@example.com",
-    "bo****@example.com",
-    "pgxcompat_policy_",
-    "SecretKey",
-    "secretKey"
-)
+# logFile is unique to THIS process invocation (see
+# New-DriverCompatLogPath) - a file left behind by an earlier run can
+# never be read or printed by this one.
+$logFile = New-DriverCompatLogPath -RepoRoot $repoRoot
+$markers = Get-DriverCompatMarkerCatalog -PgPassword $PgPassword
 
-$logFile = Join-Path $repoRoot "driver-compat-sentineldb.log"
+# $diagnostics is populated the first time this run actually attempts a
+# capture+scan (either during the normal flow below, or - if the normal
+# flow never got that far - as a best-effort fallback at the top of the
+# catch block). Left $null until then, so the catch block can tell "have
+# we already captured/scanned this run" apart from "not yet attempted".
+$diagnostics = $null
 $exitCode = 0
 
 try {
-    Write-Section "1/6 Selecting dedicated Compose project ($ProjectName), PostgreSQL $PostgresVersion"
+    Write-Section "1/5 Selecting dedicated Compose project ($ProjectName), PostgreSQL $PostgresVersion"
     docker compose -f $ComposeFile -p $ProjectName up -d --build
     if ($LASTEXITCODE -ne 0) { throw "docker compose up failed" }
 
-    Write-Section "2/6 Waiting for postgres and sentineldb to be healthy"
+    Write-Section "2/5 Waiting for postgres and sentineldb to be healthy"
     $postgresContainer = (docker compose -f $ComposeFile -p $ProjectName ps -q postgres).Trim()
-    $gatewayContainer = (docker compose -f $ComposeFile -p $ProjectName ps -q sentineldb).Trim()
+    $gatewayContainer = (docker compose -f $ComposeFile -p $ProjectName ps -q $ServiceName).Trim()
     if (-not $postgresContainer) { throw "postgres container not found" }
     if (-not $gatewayContainer) { throw "sentineldb container not found" }
     Wait-Healthy -ContainerName $postgresContainer
@@ -145,7 +123,7 @@ try {
     Wait-Healthy -ContainerName $gatewayContainer
     Write-Host "  sentineldb: healthy" -ForegroundColor Green
 
-    Write-Section "3/6 Running the real pgx driver-compatibility suite (PostgreSQL $PostgresVersion)"
+    Write-Section "3/5 Running the real pgx driver-compatibility suite (PostgreSQL $PostgresVersion)"
     $driverDsn = "postgres://" + $PgUser + ":" + $PgPassword + "@127.0.0.1:" + $GatewayHostPort + "/" + $PgDb + "?sslmode=disable&application_name=pgxcompat_driver_compat_ps1&connect_timeout=10"
     $directDsn = "postgres://" + $PgUser + ":" + $PgPassword + "@127.0.0.1:" + $DirectHostPort + "/" + $PgDb + "?sslmode=disable&application_name=pgxcompat_driver_compat_ps1_direct&connect_timeout=10"
     $expectLongKey = "false"
@@ -165,35 +143,51 @@ try {
         Remove-Item Env:\SENTINELDB_EXPECT_LONG_CANCEL_KEY -ErrorAction SilentlyContinue
         Pop-Location
     }
+
+    # Capture + privacy-scan ALWAYS runs, regardless of whether the suite
+    # itself passed - a privacy leak must fail the run even if every test
+    # passed, and diagnostics must be ready before any throw below.
+    Write-Section "4/5 Capturing SentinelDB logs and running privacy scan"
+    $diagnostics = Invoke-DriverCompatDiagnostics -ComposeFile $ComposeFile -ProjectName $ProjectName -ServiceName $ServiceName -LogPath $logFile -Markers $markers
+    if (-not $diagnostics.Captured) {
+        throw "SentinelDB logs could not be captured for this run; cannot verify the privacy scan, treating as failure."
+    }
+    if (-not $diagnostics.Scanned) {
+        throw "Captured SentinelDB logs could not be read for the privacy scan; treating as failure."
+    }
+    if (-not $diagnostics.Passed) {
+        $decision = Get-DriverCompatFailureDiagnostic -Diagnostics $diagnostics
+        throw $decision.Message
+    }
+    Write-Host "  privacy scan: PASS (no password/email/blocked-query-text/masked-value/key markers found)" -ForegroundColor Green
+
     if ($testExit -ne 0) { throw "pgx driver-compatibility suite failed (go test exit code $testExit)" }
     Write-Host "  pgx compatibility suite: PASS (PostgreSQL $PostgresVersion)" -ForegroundColor Green
 
-    Write-Section "4/6 Capturing SentinelDB logs"
-    docker compose -f $ComposeFile -p $ProjectName logs sentineldb --no-color 2>&1 | Out-File -FilePath $logFile -Encoding utf8
-    Write-Host "  logs captured: $logFile"
-
-    Write-Section "5/6 Scanning logs for sensitive test markers"
-    $logContent = Get-Content -Path $logFile -Raw -ErrorAction SilentlyContinue
-    if (-not $logContent) { $logContent = "" }
-    $leaked = @()
-    foreach ($marker in $SensitiveMarkers) {
-        if ($logContent.Contains($marker)) { $leaked += $marker }
-    }
-    if ($leaked.Count -gt 0) {
-        throw "privacy scan FAILED: SentinelDB logs contain $($leaked.Count) sensitive marker(s) that must never be logged (see $logFile for sanitized review - do not share this file as-is)"
-    }
-    Write-Host "  privacy scan: PASS (no password/email/blocked-SQL/masked-value/key markers found)" -ForegroundColor Green
-
-    Write-Section "6/6 Done"
+    Write-Section "5/5 Done"
     Write-Host "PostgreSQL $PostgresVersion driver-compatibility run PASSED." -ForegroundColor Green
 }
 catch {
     $exitCode = 1
     Write-Host ""
     Write-Host "DRIVER-COMPAT RUN FAILED: $($_.Exception.Message)" -ForegroundColor Red
-    if (Test-Path $logFile) {
+
+    # If the run never reached (or never completed) its own capture+scan
+    # above - e.g. `docker compose up` or the health wait itself failed -
+    # attempt one now, purely for diagnostics. This is always a FRESH
+    # capture of the current run's logs (never a stale file - see
+    # New-DriverCompatLogPath), and the same privacy scan gates whether
+    # any of it may be shown below.
+    if (-not $diagnostics) {
+        $diagnostics = Invoke-DriverCompatDiagnostics -ComposeFile $ComposeFile -ProjectName $ProjectName -ServiceName $ServiceName -LogPath $logFile -Markers $markers
+    }
+
+    $decision = Get-DriverCompatFailureDiagnostic -Diagnostics $diagnostics
+    Write-Host ""
+    Write-Host $decision.Message -ForegroundColor Yellow
+    if ($decision.ShowTail) {
         Write-Host ""
-        Write-Host "-- last 100 lines of $logFile (already scanned for sensitive markers above) --" -ForegroundColor Yellow
+        Write-Host "-- last 100 lines of $logFile (privacy-scanned, not sanitized/redacted) --" -ForegroundColor Yellow
         Get-Content -Path $logFile -Tail 100 -ErrorAction SilentlyContinue
     }
 }

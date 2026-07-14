@@ -186,17 +186,21 @@ func pollUntilTrue(ctx context.Context, interval time.Duration, check func(conte
 // through Extended Query (Query never downgrades to Simple Query
 // regardless of argument count - see execExtended's doc comment).
 //
-// It deliberately does NOT call (*pgx.Conn).Ping: pgconn.PgConn.Ping is
-// hard-wired to `pgConn.Exec(ctx, "-- ping")`, which always issues a raw
-// PostgreSQL Simple Query ('Q') message - there is no Extended Query
-// option at that layer, and no pgx configuration changes it. Against
-// SentinelDB's opt-in Extended-only gateway that unconditionally rejects
-// Simple Query fail-closed, Ping can never succeed; this is a genuine,
-// permanent incompatibility this suite discovered and documents (see
+// It deliberately does NOT call (*pgx.Conn).Ping: in pinned pgx v5.10.0,
+// pgconn.PgConn.Ping delegates to `pgConn.Exec(ctx, "-- ping")`, which
+// issues a raw PostgreSQL Simple Query ('Q') message - there is no
+// Extended Query option at that layer in this pgx version, and no pgx
+// configuration available today changes it. Against SentinelDB's opt-in
+// Extended-only gateway, which rejects Simple Query fail-closed, Ping
+// cannot currently succeed; this is a *current* compatibility limitation
+// of pinned pgx v5.10.0 with SentinelDB's current Extended-only mode
+// that this suite discovered and documents (see
 // TestConnectionStartupAuthAndProtocolNegotiation and
 // docs/postgresql-protocol.md's driver-compatibility notes) rather than a
-// SentinelDB bug to work around - SentinelDB must not start accepting
-// Simple Query on an Extended-only connection to accommodate it.
+// SentinelDB bug to work around - SentinelDB does not start accepting
+// Simple Query on an Extended-only connection to accommodate it. A
+// future pgx release or a future SentinelDB mixed-routing stage could
+// change this; neither is claimed or implemented in this branch.
 func assertAlive(ctx context.Context, t *testing.T, conn *pgx.Conn) {
 	t.Helper()
 	var one int

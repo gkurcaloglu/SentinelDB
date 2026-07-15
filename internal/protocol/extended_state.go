@@ -220,6 +220,19 @@ var (
 	ErrInvalidTransactionStatus   = errors.New("extendedstate: gecersiz islem durumu baytı")
 	ErrCycleClosed                = errors.New("extendedstate: bekleyen (acik) cycle yok")
 	ErrIdentifierExhaustion       = errors.New("extendedstate: tanimlayici (identifier) tukendi")
+	// ErrUnknownSimpleQueryLifecycleEffect, ApplySimpleQueryLifecycleEffect'e
+	// SimpleQueryLifecycleNone/SimpleQueryInvalidatePortals/
+	// SimpleQueryInvalidateStatementsAndPortals disinda bir deger
+	// gecildiginde doner - State HICBIR sekilde degismez.
+	ErrUnknownSimpleQueryLifecycleEffect = errors.New("extendedstate: bilinmeyen simple query yasam-dongusu etkisi")
+	// ErrSimpleQueryUncleanBoundary, ApplySimpleQueryLifecycleEffect
+	// cagrildiginda bekleyen bir Extended islemi (PendingOperationCount()
+	// != 0) ya da bekleyen (outstanding) bir Extended Sync cycle'i
+	// (OutstandingCycleCount() != 0) varsa doner - State HICBIR sekilde
+	// degismez. Bu, Stage B'nin "Simple Query yalnizca temiz bir sinirda
+	// baslar" garantisinin bu metod icin savunmaci (defensive) bir
+	// tekrar-dogrulamasidir (bkz. ApplySimpleQueryLifecycleEffect).
+	ErrSimpleQueryUncleanBoundary = errors.New("extendedstate: simple query yasam-dongusu etkisi temiz olmayan bir sinirda uygulanamaz")
 )
 
 // State, tek bir baglanti icin Extended Query Protocol durumunu tasir.
@@ -1300,10 +1313,35 @@ func (s *State) ApplySimpleQueryReceived() {
 //     Extended cycle'in portali YOKTUR;
 //  4. gecerli mutasyondan SONRA mevcut ic cleanup() gecisini calistirir.
 //
-// Statement'lar HICBIR status icin gecersiz kilinmaz (ApplyReadyForQuery
-// ile AYNI kural). Bu metod hicbir PendingOperation tuketmez, hicbir
-// outstanding Sync cycle'ini tuketmez, yeni bir cycle olusturmaz ve hicbir
-// CycleID dondurmez.
+// ONEMLI - "I" disindaki (T/E) durumlarda portallarin GUVENLE korunabilmesi
+// icin gereken TAM on-kosul: bu metod, TEK BASINA, bir Simple Query
+// mesajinin (ör. "COMMIT; BEGIN" gibi COK-ifadeli bir mesajin) ORTASINDA
+// eski islemi sonlandiran bir komutu ASLA GOREMEZ - yalnizca mesajin EN
+// SONUNDAKI gercek ReadyForQuery'yi gorur. Bu yuzden final status 'T' ya da
+// 'E' olsa bile (islem hala acikmis gibi gorunse bile), o Query mesaji
+// SIRASINDA daha ONCE bir COMMIT/ROLLBACK/PREPARE TRANSACTION/cursor-close/
+// DEALLOCATE/DISCARD ALL CommandComplete'i GERCEKTEN gorulmus olabilir -
+// boyle bir CommandComplete'in kendi yasam-dongusu etkisi (bkz.
+// protocol.SimpleQueryLifecycleEffect,
+// classifySimpleQueryCommandTag) BU ReadyForQuery'den ONCE, KENDI
+// CommandComplete'i islenirken, ApplySimpleQueryLifecycleEffect araciligiyla
+// ZATEN uygulanmis olmalidir - bu metodun kendisi bunu tekrar KONTROL ETMEZ
+// ya da CIKARSAMAZ (hicbir SQL metni incelenmez). Dolayisiyla: bu metodun
+// "T/E'de her seyi koru" kurali yalnizca DOGRU sonuc verir CUNKU cagiran,
+// her CommandComplete'in kendi yasam-dongusu etkisini, bu metod
+// cagrilmadan ONCE, sirayla uygulamis olmalidir - "final ReadyForQuery
+// durumu TEK BASINA portal omrunu tam olarak belirler" onceki (yanlis)
+// varsayimi ARTIK GECERLI DEGILDIR (bkz.
+// docs/design/0002-mixed-query-routing.md, "CommandComplete lifecycle-
+// effect classification").
+//
+// Statement'lar bu metod tarafindan HICBIR status icin gecersiz kilinmaz
+// (ApplyReadyForQuery ile AYNI kural, DEGISMEDEN) - bir Simple Query
+// mesaji SIRASINDA gorulen bir DEALLOCATE/DISCARD ALL CommandComplete'i
+// varsa, statement'lar zaten ApplySimpleQueryLifecycleEffect araciligiyla,
+// bu metod cagrilmadan cok ONCE, kaldirilmis olur. Bu metod hicbir
+// PendingOperation tuketmez, hicbir outstanding Sync cycle'ini tuketmez,
+// yeni bir cycle olusturmaz ve hicbir CycleID dondurmez.
 //
 // Bu tamamen EKLEMELI (additive) bir metoddur - ApplyReadyForQuery'nin
 // kendi imzasi ya da davranisi hicbir sekilde degistirilmez.
@@ -1319,17 +1357,103 @@ func (s *State) ApplySimpleQueryReadyForQuery(status byte) error {
 	return nil
 }
 
+// ApplySimpleQueryLifecycleEffect, tek bir dogrulanmis, sirasi GECERLI
+// CommandComplete'in sinirli yasam-dongusu etkisini (bkz.
+// protocol.SimpleQueryLifecycleEffect) State'e ATOMIK olarak uygular. Bu,
+// bir Simple Query mesaji SIRASINDA (henuz o mesajin kendi ReadyForQuery'si
+// gelmeden) COMMIT/ROLLBACK/PREPARE TRANSACTION/cursor-close/DEALLOCATE/
+// DISCARD ALL gibi bir komutun GERCEKTEN calistigini bildiren metoddur -
+// bkz. ApplySimpleQueryReadyForQuery'nin dokumantasyonundaki "COMMIT;
+// BEGIN" ornegi.
+//
+// Dogrulama SIRASI (tumu, HERHANGI bir mutasyondan ONCE):
+//
+//  1. effect, tanimli uc degerden (SimpleQueryLifecycleNone/
+//     SimpleQueryInvalidatePortals/SimpleQueryInvalidateStatementsAndPortals)
+//     biri DEGILSE: ErrUnknownSimpleQueryLifecycleEffect, State HICBIR
+//     sekilde degismez.
+//  2. PendingOperationCount() != 0 YA DA OutstandingCycleCount() != 0 ise:
+//     ErrSimpleQueryUncleanBoundary, State HICBIR sekilde degismez - bu,
+//     Stage B'nin "Simple Query yalnizca PendingOperationCount()==0 &&
+//     OutstandingCycleCount()==0 iken baslar ve bu boyunca boyle kalir"
+//     garantisinin (bkz. docs/design/0002-mixed-query-routing.md, "Exact
+//     clean-boundary predicate") burada savunmaci bir TEKRAR-dogrulamasidir -
+//     normal calismada bu kontrol HICBIR ZAMAN basarisiz olmamalidir
+//     (Simple Query aktifken Extended islemler zaten kabul edilmez), ama
+//     dogrudan API kotuye kullanimina karsi fail-closed korur.
+//
+// Basarili oldugunda (SIRASIYLA):
+//
+//   - SimpleQueryLifecycleNone: hicbir mutasyon yapilmaz (ack basarili).
+//   - SimpleQueryInvalidatePortals: invalidateAllPortals() - su an izlenen
+//     HER portal (isimli, isimsiz, pending, committed) kaldirilir; HER
+//     prepared statement KORUNUR.
+//   - SimpleQueryInvalidateStatementsAndPortals: ONCE invalidateAllPortals(),
+//     SONRA invalidateAllStatements() - portallar HER ZAMAN statement'lardan
+//     ONCE kaldirilir (ApplyCloseComplete'in kendi "portal'lar ONCE,
+//     statement'lar SONRA" sirasiyla AYNI ilke), boylece kaldirilan bir
+//     statement'a referans veren TEK bir portal bile ARTA KALMAZ.
+//
+// Islem durumu (transaction status) DEGISTIRILMEZ, hicbir PendingOperation/
+// outstanding cycle tuketilmez ya da olusturulmaz, hicbir yeni cycle
+// yaratilmaz - bu metod YALNIZCA statement/portal izleme haritalarini
+// etkiler.
+func (s *State) ApplySimpleQueryLifecycleEffect(effect SimpleQueryLifecycleEffect) error {
+	switch effect {
+	case SimpleQueryLifecycleNone, SimpleQueryInvalidatePortals, SimpleQueryInvalidateStatementsAndPortals:
+	default:
+		return ErrUnknownSimpleQueryLifecycleEffect
+	}
+	if s.PendingOperationCount() != 0 || s.OutstandingCycleCount() != 0 {
+		return ErrSimpleQueryUncleanBoundary
+	}
+
+	switch effect {
+	case SimpleQueryLifecycleNone:
+		return nil
+	case SimpleQueryInvalidatePortals:
+		s.invalidateAllPortals()
+	case SimpleQueryInvalidateStatementsAndPortals:
+		s.invalidateAllPortals()
+		s.invalidateAllStatements()
+	}
+	s.cleanup()
+	return nil
+}
+
 // invalidateAllPortals, su an izlenen (statements haritasindan farkli
 // olarak) HER portal generation kaydini (isimli, isimsiz, pending,
 // committed - hepsini) kosulsuzca kaldirir. invalidatePortalsThroughCycle
 // ile AYNI dahili yardimciyi (detachPortalPointer) kullanir, ancak
 // CreatedCycle karsilastirmasi YOKTUR - cagiran, bunun her zaman guvenli
 // oldugunu (korunmasi gereken hicbir daha-sonraki-cycle portali olmadigini)
-// zaten dogrulamis olmalidir (bkz. ApplySimpleQueryReadyForQuery).
+// zaten dogrulamis olmalidir (bkz. ApplySimpleQueryReadyForQuery,
+// ApplySimpleQueryLifecycleEffect). Kaldirilan her portal'in
+// unnamedPortalRollback girdisi de temizlenir - PendingOperationCount()==0
+// oldugundan (her iki cagiran da bunu dogrular) hicbir bekleyen Bind bu
+// hedefe ASLA basvurmayacaktir, bu yuzden bu girdileri canli tutmanin
+// hicbir nedeni yoktur (bkz. isUnnamedPortalRollbackTarget).
 func (s *State) invalidateAllPortals() {
 	for id, p := range s.portals {
 		s.detachPortalPointer(p)
 		delete(s.portals, id)
+		delete(s.unnamedPortalRollback, id)
+	}
+}
+
+// invalidateAllStatements, su an izlenen HER statement generation kaydini
+// (isimli, isimsiz, pending, committed - hepsini) kosulsuzca kaldirir.
+// invalidateAllPortals ile AYNI ilke (detachStatementPointer + dogrudan
+// silme + rollback girdisi temizligi) - YALNIZCA
+// ApplySimpleQueryLifecycleEffect'in SimpleQueryInvalidateStatementsAndPortals
+// dalinda, portallar ZATEN kaldirildiktan SONRA cagrilir, boylece hicbir
+// portal kaldirilan bir statement'a referans verir durumda KALMAZ (bkz.
+// ApplyCloseComplete'in "portal'lar ONCE, statement'lar SONRA" sirasi).
+func (s *State) invalidateAllStatements() {
+	for id, g := range s.statements {
+		s.detachStatementPointer(g)
+		delete(s.statements, id)
+		delete(s.unnamedStatementRollback, id)
 	}
 }
 

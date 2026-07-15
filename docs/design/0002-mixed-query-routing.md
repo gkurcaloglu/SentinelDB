@@ -1275,6 +1275,22 @@ if r.simpleQueryActive {
         // ErrSimpleMaskingFailed (new sentinel, same shape as
         // ErrExtendedMaskingFailed)
     }
+    if result.MessageType == protocol.MsgCommandComplete &&
+        result.LifecycleEffect != protocol.SimpleQueryLifecycleNone {
+        // Applied BEFORE the relay write, mirroring the existing
+        // "mutate State before forwarding" convention (see
+        // ForwardSimpleQuery's own atomic sequence) — this is what makes
+        // a mid-Query "COMMIT; BEGIN" correct: the old transaction's
+        // portals are gone by the time this very CommandComplete's bytes
+        // reach the client, long before the Query's own terminating
+        // ReadyForQuery is observed. See CommandComplete lifecycle-effect
+        // classification.
+        if err := state.ApplySimpleQueryLifecycleEffect(result.LifecycleEffect); err != nil {
+            // structurally unreachable in correct operation (mirrors the
+            // existing "impossible ordering" defensive-only errors);
+            // still a fixed, safe, fail-closed category if ever hit.
+        }
+    }
     writeAll(r.client, out)
     if result.CycleCompleted {
         status := <the ReadyForQuery status byte just observed>
@@ -1894,7 +1910,147 @@ The two are provably reconcilable without any special-casing:
    a malformed frame instead of a policy-blocked one, and verify the
    unnamed statement/portal remains referenceable afterward.
 
-### New, additive `State` method
+### CommandComplete lifecycle-effect classification
+
+**An earlier draft of this document was wrong.** It claimed that final
+`ReadyForQuery` status alone fully determines named portal lifetime — that
+`ReadyForQuery('I')` invalidates all portals, `ReadyForQuery('T')`/`('E')`
+preserve all portals, and a Simple Query never invalidates named prepared
+statements. This is **not** protocol-correct, because PostgreSQL named
+prepared statements and named portals are not isolated from Simple Query
+SQL:
+
+- named prepared statements created through Extended `Parse` can also be
+  destroyed through SQL-level `DEALLOCATE`;
+- named portals (and any portal) can be destroyed through SQL-level cursor
+  commands (`CLOSE`), and are destroyed by transaction-ending commands
+  (`COMMIT`/`ROLLBACK`/`PREPARE TRANSACTION`);
+- **one multi-statement Simple `Query` may `COMMIT` an old transaction and
+  then `BEGIN` a new one**, so the *final* `ReadyForQuery` status can still
+  be `'T'` even though an old transaction's portals were destroyed
+  partway through the same `Query` message. Concretely: an Extended cycle
+  creates a named portal inside transaction A; a Simple `Query` executes
+  `"COMMIT; BEGIN"`; PostgreSQL destroys the old portal at `COMMIT`; the
+  final `ReadyForQuery` is `'T'` (the *new* transaction); the old,
+  previously-documented rule would have incorrectly preserved the old
+  portal, because it only ever looked at the final status byte.
+- a successful SQL `DEALLOCATE name` can remove a protocol-created named
+  prepared statement while the old rule left its generation and masking
+  metadata in place indefinitely.
+
+#### Verified PostgreSQL command tags
+
+Verified against the official PostgreSQL 18 source
+(`src/include/tcop/cmdtaglist.h`'s `PG_CMDTAG` table and
+`src/backend/tcop/utility.c`'s `CreateCommandTag` function — the
+authoritative source for exact wire-visible `CommandComplete` tag
+strings, since the SQL reference pages do not enumerate them) and
+`https://www.postgresql.org/docs/current/sql-discard.html`,
+`sql-commit-prepared.html`, `sql-prepare-transaction.html`. No PostgreSQL
+16-vs-18 difference was found for any tag cited below; the counted-tag
+format (`INSERT`/`DELETE`/`UPDATE`/`MERGE`/`SELECT`/`MOVE`/`FETCH`/`COPY`,
+each followed by a row count) is independently documented in
+`protocol-message-formats.html` and has been stable across versions.
+
+| Tag (exact, wire-visible) | SQL command(s) that produce it | Verified behavior |
+|---|---|---|
+| `COMMIT` | `COMMIT`, `END`, `COMMIT AND CHAIN` | `CreateCommandTag`'s `TRANS_STMT_COMMIT` case returns `CMDTAG_COMMIT` unconditionally (the chain flag does not change the tag). Ends the current transaction. |
+| `ROLLBACK` | `ROLLBACK`, `ABORT`, `ROLLBACK AND CHAIN`, **and `ROLLBACK TO SAVEPOINT`** | `CreateCommandTag`'s source: `case TRANS_STMT_ROLLBACK: case TRANS_STMT_ROLLBACK_TO: tag = CMDTAG_ROLLBACK;` — a full transaction rollback and a savepoint-only rollback are **indistinguishable at the tag level**. See "Conservative classification" below. |
+| `PREPARE TRANSACTION` | `PREPARE TRANSACTION` | `sql-prepare-transaction.html`: "not unlike a `ROLLBACK` command: after executing it, there is no active current transaction." Ends the current transaction from the session's point of view. |
+| `COMMIT PREPARED` | `COMMIT PREPARED` | `sql-commit-prepared.html`: "This command cannot be executed inside a transaction block." Operates on an externally-prepared (two-phase-commit) transaction *by name*, never the current session transaction. |
+| `ROLLBACK PREPARED` | `ROLLBACK PREPARED` | Same restriction as `COMMIT PREPARED` (symmetric, `sql-rollback-prepared.html`). |
+| `CLOSE CURSOR` | `CLOSE <name>` | `utility.c`'s `T_ClosePortalStmt` handling: `stmt->portalname != NULL` → `CMDTAG_CLOSE_CURSOR`. The tag never carries the closed cursor's name. |
+| `CLOSE CURSOR ALL` | `CLOSE ALL` | Same handling, `stmt->portalname == NULL` → `CMDTAG_CLOSE_CURSOR_ALL`. |
+| `DECLARE CURSOR` | `DECLARE ... CURSOR ...` | Creates a new SQL-level cursor; destroys nothing. |
+| `FETCH` | `FETCH ...` (non-`MOVE`) | `utility.c`'s `T_FetchStmt`: `stmt->ismove` selects `CMDTAG_MOVE` vs `CMDTAG_FETCH`. Only reads rows; destroys nothing. |
+| `MOVE` | `MOVE ...` / `FETCH ... ismove` | Only repositions the cursor; destroys nothing. |
+| `DEALLOCATE` | `DEALLOCATE name` | `utility.c`'s `T_DeallocateStmt`: `stmt->name != NULL` → `CMDTAG_DEALLOCATE`. The tag never carries the deallocated name. |
+| `DEALLOCATE ALL` | `DEALLOCATE ALL` | Same handling, `stmt->name == NULL` → `CMDTAG_DEALLOCATE_ALL`. |
+| `DISCARD ALL` | `DISCARD ALL` | `sql-discard.html`: documented as equivalent to `CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; DEALLOCATE ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES;` — both portals (via the leading `CLOSE ALL`) and prepared statements (via `DEALLOCATE ALL`) are destroyed. |
+| `DISCARD PLANS` | `DISCARD PLANS` | `sql-discard.html`: "Releases all cached query plans... does **NOT** drop or destroy prepared statements." |
+| `DISCARD SEQUENCES` | `DISCARD SEQUENCES` | Affects only cached sequence state (`currval`/`lastval`/preallocated values) — never statements or portals. |
+| `DISCARD TEMP` | `DISCARD TEMP` | "Drops all temporary tables" — never statements or portals. |
+| `BEGIN` / `START TRANSACTION` / `SAVEPOINT` / `RELEASE` | (same names) | Start a transaction or manage savepoints; destroy nothing currently tracked. |
+| `PREPARE` / `EXECUTE` | SQL `PREPARE name AS ...` / `EXECUTE name` | Create/use an SQL-level prepared statement never imported into `protocol.State` in the first place (see "SQL-created-object fail-closed limitation" below) — nothing tracked is destroyed. |
+| Counted tags (`SELECT n`, `INSERT 0 n`, `UPDATE n`, `DELETE n`, `MERGE n`, `COPY n`, counted `FETCH`/`MOVE`) | ordinary DML/queries | Never lifecycle-affecting. |
+
+#### Conservative classification, never SQL parsing
+
+Several of the tags above **cannot identify the exact object affected**
+(`ROLLBACK` vs. `ROLLBACK TO SAVEPOINT`; `CLOSE CURSOR`'s closed name;
+`DEALLOCATE`'s deallocated name) — the wire tag alone is genuinely
+insufficient, and this design does **not** parse SQL or extract object
+names to resolve the ambiguity (see [Non-goals](#non-goals)). The
+accepted, deliberately conservative rule: **where a tag cannot identify
+the exact affected name, invalidate the entire corresponding locally-
+tracked namespace.** Concretely, `ROLLBACK TO SAVEPOINT` (which does not
+actually end the transaction) is classified identically to a full
+`ROLLBACK` — this over-invalidates relative to what PostgreSQL itself
+actually destroyed (a later legitimate reference to a portal that
+survived a real `ROLLBACK TO SAVEPOINT` server-side will be rejected
+*locally* by SentinelDB, fail-closed), but never under-invalidates. An
+under-invalidation (leaving a stale local reference to an object
+PostgreSQL already destroyed) is the only outcome this design must avoid;
+an over-invalidation is a false-rejection, not a correctness or security
+hole, and is the explicitly accepted tradeoff.
+
+Tag matching is **exact, full-string equality only — never a prefix or
+substring test** (`internal/protocol/simple_query.go`'s
+`classifySimpleQueryCommandTag`), specifically so that `"COMMIT PREPARED"`
+can never be mistaken for `"COMMIT"`, nor `"DISCARD PLANS"` for
+`"DISCARD ALL"`, nor any unrelated/extension command tag for any of the
+above.
+
+#### `SimpleQueryLifecycleEffect`: bounded, value-free classification
+
+```go
+// SimpleQueryLifecycleEffect is a bounded, value-free classification of
+// the protocol.State mutation a validated CommandComplete tag requires.
+// The zero value means no lifecycle effect. Deliberately NOT a bitmask -
+// InvalidateStatementsAndPortals is a third, distinct value, so State's
+// own application method can reject any unrecognized value outright.
+type SimpleQueryLifecycleEffect uint8
+
+const (
+    SimpleQueryLifecycleNone SimpleQueryLifecycleEffect = iota
+    SimpleQueryInvalidatePortals
+    SimpleQueryInvalidateStatementsAndPortals
+)
+```
+
+`SimpleQueryResult` (see
+[Simple Query response grammar](#simple-query-response-grammar)) gains one
+additional field, `LifecycleEffect SimpleQueryLifecycleEffect` — populated
+only for an ordering-valid `CommandComplete` (a structurally malformed tag,
+or a `CommandComplete` rejected by the phase/order transition table,
+always yields `SimpleQueryLifecycleNone`); every other message type also
+always yields `SimpleQueryLifecycleNone`. Like every other field on
+`SimpleQueryResult`, this carries no SQL, no command-tag string, no
+statement/portal name, no `[]byte`, and no arbitrary numeric count — only
+the fixed, bounded effect value; the tag's content is read exactly once,
+transiently, for the classification comparison itself, and is never
+returned, logged, or retained anywhere.
+
+#### SQL-created-object fail-closed limitation
+
+A successful SQL `PREPARE`/`DECLARE ... CURSOR` creates a server object
+that `protocol.State` did **not** create through Extended `Parse`/`Bind`.
+This design does **not** invent a `State` generation for such an object:
+
+- SQL-created prepared statements or portals are **not** automatically
+  imported into `protocol.State` — `State` remains exclusively a model of
+  what *this design's own* Extended `Parse`/`Bind` calls created.
+- A later Extended `Bind`/`Describe`/`Execute` referencing such an
+  unknown (SQL-created) object is rejected **locally** by `State`'s
+  existing, unmodified "unknown statement/portal" checks
+  (`ErrUnknownStatement`/`ErrUnknownPortal`) — exactly as it already
+  rejects a reference to any other nonexistent object.
+- No guessed shape, generation, or name is ever created for it.
+- This remains an explicit, documented first-stage mixed-routing
+  limitation — not a claim that SQL-created statements/portals are usable
+  through the Extended protocol side of a `mixed`-mode connection.
+
+### New, additive `State` methods
 
 ```go
 // ApplySimpleQueryReadyForQuery updates transaction status and portal
@@ -1906,20 +2062,60 @@ The two are provably reconcilable without any special-casing:
 //      ErrInvalidTransactionStatus, reused);
 //   2. sets s.txStatus = status;
 //   3. if status == TxStatusIdle, invalidates EVERY currently-tracked
-//      portal (named and unnamed) - safe, and NOT merely an
-//      approximation, because the boundary-only alternation rule (see
-//      docs/design/0002-mixed-query-routing.md) guarantees
-//      OutstandingCycleCount() == 0 at the moment a Simple Query is
-//      allowed to start, so there is no later-pipelined Extended cycle's
-//      portal to protect from premature invalidation, unlike
-//      ApplyReadyForQuery's narrower, cycle-bounded
-//      invalidatePortalsThroughCycle;
+//      portal (named and unnamed) - covering IMPLICIT transaction
+//      completion (a bare "SELECT 1" with no explicit BEGIN/COMMIT text
+//      at all, whose implicit transaction ends only at the Query's own
+//      end - there is no CommandComplete tag to carry a lifecycle effect
+//      for this case, so this unconditional invalidation on 'I' remains
+//      the ONLY mechanism covering it);
 //   4. runs the existing internal cleanup() pass.
-// Statements are never invalidated (same rule as ApplyReadyForQuery).
+// Statements are never invalidated by this method (same rule as
+// ApplyReadyForQuery) - a DEALLOCATE/DISCARD ALL CommandComplete's own
+// effect, applied earlier via ApplySimpleQueryLifecycleEffect (below),
+// already removed them by the time this method runs.
+//
+// IMPORTANT: this method's own "preserve everything on T/E" behavior is
+// correct ONLY because the caller has already applied every earlier
+// CommandComplete's own lifecycle effect, in order, via
+// ApplySimpleQueryLifecycleEffect, before this method is ever called for
+// the Query's terminating ReadyForQuery - see the "COMMIT; BEGIN" example
+// above. This method never re-derives or infers that history itself; it
+// has no visibility into what happened earlier in the same Query message
+// beyond the final status byte.
 func (s *State) ApplySimpleQueryReadyForQuery(status byte) error
+
+// ApplySimpleQueryLifecycleEffect applies a single validated,
+// ordering-valid CommandComplete's classified SimpleQueryLifecycleEffect
+// to State, atomically - this is what makes the "COMMIT; BEGIN"
+// mid-Query case correct, by running BEFORE the Query's own terminating
+// ReadyForQuery is ever observed.
+//
+// Validates fully before any mutation:
+//   1. effect must be one of the three defined values, else
+//      ErrUnknownSimpleQueryLifecycleEffect (new sentinel), State
+//      unchanged;
+//   2. PendingOperationCount() == 0 && OutstandingCycleCount() == 0, else
+//      ErrSimpleQueryUncleanBoundary (new sentinel), State unchanged -
+//      a defensive re-verification of the same clean-boundary guarantee
+//      Stage B's admission gate already provides for the whole Simple
+//      Query response (see The mixed-message admission gate); this
+//      should never fail in correct operation, and exists only as an
+//      impossible-divergence backstop against direct API misuse.
+//
+// Applies (SimpleQueryLifecycleNone is a no-op; the other two reuse the
+// existing invalidateAllPortals/invalidateAllStatements helpers -
+// portals are always invalidated before statements, so no portal is ever
+// left referencing a removed statement, mirroring
+// ApplyCloseComplete's own "portals first, statements second" ordering).
+// Never mutates transaction status; never consumes/creates a
+// PendingOperation, outstanding cycle, or new cycle.
+func (s *State) ApplySimpleQueryLifecycleEffect(effect SimpleQueryLifecycleEffect) error
 ```
 
-This is additive only — `ApplyReadyForQuery` itself is not modified.
+Both are additive only — `ApplyReadyForQuery` itself is not modified, and
+`ApplySimpleQueryReadyForQuery`'s own signature and validation are
+unchanged from the prior draft; only its documentation, and its relationship
+to the new `ApplySimpleQueryLifecycleEffect`, are corrected here.
 
 ### Locally blocked Simple Query vs. locally blocked Extended `Parse`
 
@@ -1952,6 +2148,18 @@ real `ReadyForQuery('T')` response, relayed and applied via
 `ApplySimpleQueryReadyForQuery`, that updates `state.TransactionStatus()`
 — never a client-side or gateway-side parse of the string `"begin"`
 itself.
+
+This is not contradicted by
+[CommandComplete lifecycle-effect classification](#commandcomplete-lifecycle-effect-classification)
+above: `classifySimpleQueryCommandTag` inspects a **backend-generated**
+`CommandComplete` *tag* (PostgreSQL's own authoritative report of what it
+just executed), never the **client-sent** `Query` *SQL text* — the tag is
+a fixed, closed-vocabulary wire-protocol signal PostgreSQL itself emits,
+categorically different from parsing or pattern-matching arbitrary SQL.
+Transaction *status* is still set exclusively by real `ReadyForQuery`
+bytes; the tag classification only decides *portal/statement* lifecycle,
+a separate concern, and never inspects or infers status from SQL text
+either.
 
 ## Configuration and migration behavior
 
@@ -2102,6 +2310,8 @@ mirroring the existing `Err*` sentinel pattern:
 | `ErrSimpleResponseOrderingViolation` | `protocol` | `SimpleQueryTracker` observed a backend message sequence the Simple Query grammar forbids. | Yes — mirrors `ErrImpossibleBackendOrdering`'s existing treatment. |
 | `ErrSimpleMaskingFailed` | `gateway` | Terminal Simple Query masking failure (binary target, plugin error, malformed `DataRow`). | Yes — mirrors `ErrExtendedMaskingFailed` exactly, same SQLSTATE `58030`. |
 | `ErrSimpleQueryCOPYUnsupported` | `protocol` | A COPY response observed during a Simple Query response. | Yes — mirrors `Transformer`'s existing COPY fail-closed behavior. |
+| `ErrUnknownSimpleQueryLifecycleEffect` | `protocol` | `State.ApplySimpleQueryLifecycleEffect` called with a value outside the three defined `SimpleQueryLifecycleEffect` constants — structurally unreachable given `SimpleQueryTracker` only ever produces a defined value. | Yes — impossible-in-correct-operation defensive category, same treatment as `ErrSimpleResponseOrderingViolation`. |
+| `ErrSimpleQueryUncleanBoundary` | `protocol` | `State.ApplySimpleQueryLifecycleEffect` called while `PendingOperationCount() != 0` or `OutstandingCycleCount() != 0` — a defensive re-verification of the clean-boundary guarantee the admission gate already provides for the whole Simple Query response. | Yes — impossible-in-correct-operation defensive category; never expected to trigger given correct Stage B wiring. |
 | `ErrMixedFrontendUnsupportedMessage` | `firewall` | `FunctionCall`, unknown message type, or COPY frontend message in `MixedFrontend`. | Yes — reuses `ExtendedFrontend`'s existing category/behavior, renamed for the new type. |
 | `ErrMixedFrontendDecodeFailed` | `firewall` | `NewSteadyStateFrontendFrameDecoder` framing failure. | Yes — mirrors `ErrExtendedFrontendDecodeFailed` exactly. |
 
@@ -2497,28 +2707,47 @@ at once.
 ### Stage A — pure protocol/state model
 
 - **Files/types**: new `internal/protocol/simple_query.go`
-  (`SimpleQueryTracker`, `SimpleQueryResult`, `ErrSimpleResponseOrderingViolation`,
-  `ErrSimpleQueryCOPYUnsupported`); additive change to
-  `internal/protocol/extended_state.go` (`ApplySimpleQueryReadyForQuery`,
-  new; rename of the existing, currently-unused
-  `ApplyAllowedSimpleQuery()` to `ApplySimpleQueryReceived()` with its
-  clearing behavior unchanged — see
+  (`SimpleQueryTracker`, `SimpleQueryResult`, `SimpleQueryLifecycleEffect`
+  and its three defined values, `classifySimpleQueryCommandTag`,
+  `ErrSimpleResponseOrderingViolation`, `ErrSimpleQueryCOPYUnsupported`);
+  additive change to `internal/protocol/extended_state.go`
+  (`ApplySimpleQueryReadyForQuery`, new; `ApplySimpleQueryLifecycleEffect`,
+  new, with `ErrUnknownSimpleQueryLifecycleEffect`/
+  `ErrSimpleQueryUncleanBoundary`; `invalidateAllStatements`, new internal
+  helper, alongside the existing `invalidateAllPortals`; rename of the
+  existing, currently-unused `ApplyAllowedSimpleQuery()` to
+  `ApplySimpleQueryReceived()` with its clearing behavior unchanged — see
   [Correct valid blocked-Query lifecycle semantics](#correct-valid-blocked-query-lifecycle-semantics-applysimplequeryreceived)
   — no OTHER existing method signature changes).
 - **Invariants introduced**: the full transition table above; "no cell/
   tag/field content retained"; "async messages checked before ordering";
   `ApplySimpleQueryReceived()` applies regardless of the eventual Allow/
-  Block verdict, for any structurally valid, clean-boundary Query.
+  Block verdict, for any structurally valid, clean-boundary Query; the
+  full [CommandComplete lifecycle-effect classification](#commandcomplete-lifecycle-effect-classification)
+  model — every lifecycle-relevant tag verified against the PostgreSQL 18
+  source, exact-match-only classification, conservative (never under-
+  invalidating) namespace-wide invalidation where a tag cannot identify
+  the exact object, and the SQL-created-object fail-closed limitation.
 - **Tests required**: `internal/protocol/simple_query_test.go` (every
-  transition table row, both directions); a fuzz target
-  (`FuzzSimpleQueryTracker`, mirroring the existing Extended fuzz
-  targets' structure); `internal/protocol/extended_state_test.go`
-  additions for `ApplySimpleQueryReadyForQuery` (status validation,
-  portal invalidation on `'I'`, no invalidation on `'T'`/`'E'`, statements
-  never invalidated) and for the renamed `ApplySimpleQueryReceived()`
-  (identical behavior to today's `ApplyAllowedSimpleQuery()`, proven by
-  porting its existing test cases to the new name with no behavior
-  change).
+  transition table row, both directions; every lifecycle-relevant
+  `CommandComplete` tag's classification, including the COMMIT-vs-COMMIT-
+  PREPARED and DISCARD-ALL-vs-DISCARD-PLANS non-confusion cases; malformed
+  and ordering-invalid `CommandComplete` both yielding
+  `SimpleQueryLifecycleNone`); a fuzz target (`FuzzSimpleQueryTracker`,
+  mirroring the existing Extended fuzz targets' structure, exercising the
+  lifecycle-tag classification path and asserting only defined
+  `SimpleQueryLifecycleEffect` values are ever produced);
+  `internal/protocol/extended_state_test.go` additions for
+  `ApplySimpleQueryReadyForQuery` (status validation, portal invalidation
+  on `'I'`, no invalidation on `'T'`/`'E'`, statements never invalidated
+  by this method specifically), for `ApplySimpleQueryLifecycleEffect`
+  (portal-only vs. statement-and-portal removal, rollback-reference
+  cleanup, unknown-effect and unclean-boundary atomicity, idempotence, no
+  transaction-status/pending/cycle side effects), for the renamed
+  `ApplySimpleQueryReceived()` (identical behavior to today's
+  `ApplyAllowedSimpleQuery()`, proven by porting its existing test cases
+  to the new name with no behavior change), and for the concrete
+  "`COMMIT; BEGIN`" and `DEALLOCATE` regressions described above.
 - **Commit boundary**: no dependency on `internal/gateway`,
   `internal/firewall`, `internal/masking`, or `cmd/gateway` — pure,
   I/O-free, independently testable, exactly like `extended_state.go`/
@@ -2526,9 +2755,15 @@ at once.
   introduced.
 - **Intentionally unsupported at this stage**: nothing is wired to a live
   connection yet; `SimpleQueryTracker`/`ApplySimpleQueryReadyForQuery`/
-  the renamed `ApplySimpleQueryReceived()` are unused by any runtime code,
-  exactly as `ApplyAllowedSimpleQuery()` is today (before its Stage A
-  rename).
+  `ApplySimpleQueryLifecycleEffect`/the renamed `ApplySimpleQueryReceived()`
+  are unused by any runtime code, exactly as `ApplyAllowedSimpleQuery()`
+  is today (before its Stage A rename). In particular, no runtime code
+  yet calls `ApplySimpleQueryLifecycleEffect` immediately after
+  classifying a `CommandComplete` mid-response — that sequencing (calling
+  it inline, in the backend-message dispatch, before the tag's bytes are
+  relayed onward) is a Stage B wiring concern, not decided by this
+  document beyond the ordering requirement stated above ("before the
+  Query's own terminating `ReadyForQuery` is ever observed").
 
 ### Stage B — unified sequencing/runtime APIs
 

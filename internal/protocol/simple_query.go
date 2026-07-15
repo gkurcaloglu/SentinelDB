@@ -95,6 +95,51 @@ const (
 	simplePhaseAwaitingReadyOnly
 )
 
+// SimpleQueryLifecycleEffect, bir dogrulanmis CommandComplete etiketinin
+// gerektirdigi, protocol.State uzerindeki sinirli (bounded), deger-iceriksiz
+// yasam-dongusu etkisinin siniflandirmasidir. SIFIR DEGERI (SimpleQueryLifecycleNone)
+// "hicbir etki yok" anlamina gelir.
+//
+// Bu KASITLI OLARAK bagimsiz bitlerin bir bitmask'i DEGILDIR - iki sifir-
+// olmayan deger, ucuncu, kendi basina ayri bir deger olarak sunulur (ör.
+// InvalidatePortals|InvalidateStatements YERINE
+// SimpleQueryInvalidateStatementsAndPortals) - boylece State'in kendi
+// uygulama metodu (bkz. extended_state.go,
+// ApplySimpleQueryLifecycleEffect) her olasi bit kombinasyonunu ayri ayri
+// yorumlamak zorunda kalmadan, TANIMSIZ HERHANGI bir degeri dogrudan
+// reddedebilir.
+//
+// PostgreSQL'in gercek CommandComplete davranisi (bkz.
+// docs/design/0002-mixed-query-routing.md, "CommandComplete lifecycle-
+// effect classification" - resmi PostgreSQL 18 kaynagina karsi dogrulanmis)
+// bu ucunu gerektirir: bazi komutlar (COMMIT/ROLLBACK/PREPARE TRANSACTION,
+// SQL cursor-close) yalnizca portallari yok eder; bazilari (DEALLOCATE,
+// DISCARD ALL) hem prepared statement'lari HEM portallari yok eder;
+// geri kalan her sey (SELECT/INSERT/UPDATE/DELETE/..., BEGIN,
+// COMMIT PREPARED/ROLLBACK PREPARED, DECLARE CURSOR, FETCH, MOVE, PREPARE,
+// EXECUTE, DISCARD PLANS/SEQUENCES/TEMP) hicbir izlenen nesneyi etkilemez.
+type SimpleQueryLifecycleEffect uint8
+
+const (
+	// SimpleQueryLifecycleNone: dogrulanmis CommandComplete etiketinin su
+	// an izlenen hicbir prepared statement ya da portal uzerinde etkisi
+	// yoktur - sifir deger.
+	SimpleQueryLifecycleNone SimpleQueryLifecycleEffect = iota
+
+	// SimpleQueryInvalidatePortals: etiket, mevcut islemin (transaction)
+	// portallarini yok eden bir PostgreSQL komutuna (islem-sonlandiran bir
+	// komut, ya da bir SQL cursor-close komutu) karsilik gelir - su an
+	// izlenen HER portal gecersiz kilinmalidir. Prepared statement'lar
+	// ETKILENMEZ.
+	SimpleQueryInvalidatePortals
+
+	// SimpleQueryInvalidateStatementsAndPortals: etiket, prepared
+	// statement'lari yok eden (DEALLOCATE) ya da tum oturumu sifirlayan
+	// (DISCARD ALL) bir PostgreSQL komutuna karsilik gelir - su an izlenen
+	// HER statement VE portal gecersiz kilinmalidir.
+	SimpleQueryInvalidateStatementsAndPortals
+)
+
 // SimpleQueryResult, tek bir backend Message'in SimpleQueryTracker.Handle
 // tarafindan islenmesinin sonucudur. YALNIZCA sinirli, deger-tipli meta
 // veri tasir - CorrelationResult ile AYNI ilke (bkz. extended_correlation.go):
@@ -120,6 +165,15 @@ type SimpleQueryResult struct {
 	// mesaj icin bu alan SIFIR DEGERINDE kalir (gecerli hicbir islem durumu
 	// degildir).
 	ReadyForQueryStatus byte
+
+	// LifecycleEffect, YALNIZCA sirasi GECERLI (ordering-valid) bir
+	// CommandComplete icin anlamlidir ve etiketin sabit, TAM (exact,
+	// prefix-olmayan) eslesmesinden turetilir - hicbir zaman satir sayisi,
+	// statement/portal adi ya da rastgele etiket metni degildir. Her diger
+	// mesaj turu icin, VE sirasi GECERSIZ (ordering-invalid) her
+	// CommandComplete icin, bu alan SIFIR DEGERINDE (SimpleQueryLifecycleNone)
+	// kalir.
+	LifecycleEffect SimpleQueryLifecycleEffect
 }
 
 // SimpleQueryTracker, PostgreSQL Simple Query Protocol'unun backend yanit
@@ -251,7 +305,7 @@ func (t *SimpleQueryTracker) Handle(m Message) (SimpleQueryResult, error) {
 		if err := validateCommandCompleteTag(body); err != nil {
 			return SimpleQueryResult{}, err
 		}
-		return t.transitionOnCommandComplete()
+		return t.transitionOnCommandComplete(classifySimpleQueryCommandTag(body))
 
 	case MsgEmptyQueryResponse:
 		if err := validateEmptyBody(body); err != nil {
@@ -338,19 +392,110 @@ func (t *SimpleQueryTracker) transitionOnDataRow() (SimpleQueryResult, error) {
 }
 
 // transitionOnCommandComplete, GOVDESI ZATEN dogrulanmis (tek NUL-
-// sonlandirmali etiket, etiket ICERIGI hic okunmadan) bir CommandComplete
-// icin faz gecisini uygular. simplePhaseAwaitingFirstMessage/
-// AwaitingGroupOrReady/InRows'un HERHANGI birinden gecerlidir (bir deyim-
-// sonucu grubunu, satir dondurup dondurmedigine bakilmaksizin, kapatir) ->
-// simplePhaseAwaitingGroupOrReady.
-func (t *SimpleQueryTracker) transitionOnCommandComplete() (SimpleQueryResult, error) {
+// sonlandirmali etiket, etiket ICERIGI hic okunmadan) VE ZATEN
+// siniflandirilmis (classifySimpleQueryCommandTag - etiket ICERIGININ
+// TEK okundugu yer) bir CommandComplete icin faz gecisini uygular.
+// simplePhaseAwaitingFirstMessage/AwaitingGroupOrReady/InRows'un HERHANGI
+// birinden gecerlidir (bir deyim-sonucu grubunu, satir dondurup
+// dondurmedigine bakilmaksizin, kapatir) -> simplePhaseAwaitingGroupOrReady.
+//
+// effect, YALNIZCA sira GECERLI (bu switch'in basarili dalinda) ise sonuca
+// dahil edilir - sira GECERSIZ (default dal) ise sonuc tamamen bos doner
+// (SimpleQueryResult{}), bu yuzden LifecycleEffect de sifir degerinde
+// (SimpleQueryLifecycleNone) kalir: "sirasi gecersiz bir CommandComplete
+// hicbir yasam-dongusu etkisi dondurmez" kuralini otomatik olarak saglar.
+func (t *SimpleQueryTracker) transitionOnCommandComplete(effect SimpleQueryLifecycleEffect) (SimpleQueryResult, error) {
 	switch t.phase {
 	case simplePhaseAwaitingFirstMessage, simplePhaseAwaitingGroupOrReady, simplePhaseInRows:
 		t.phase = simplePhaseAwaitingGroupOrReady
-		return SimpleQueryResult{MessageType: MsgCommandComplete}, nil
+		return SimpleQueryResult{MessageType: MsgCommandComplete, LifecycleEffect: effect}, nil
 	default:
 		return SimpleQueryResult{}, ErrSimpleResponseOrderingViolation
 	}
+}
+
+// simpleQueryLifecycleTags, dogrulanmis (validateCommandCompleteTag'dan
+// GECMIS) bir CommandComplete etiketinin TAM (exact, prefix-DEGIL) icerigini,
+// urettigi sinirli yasam-dongusu etkisine esler. Resmi PostgreSQL kaynagina
+// karsi dogrulanmistir (bkz.
+// docs/design/0002-mixed-query-routing.md, "CommandComplete lifecycle-
+// effect classification" - src/include/tcop/cmdtaglist.h ve
+// src/backend/tcop/utility.c'nin CreateCommandTag fonksiyonu, PostgreSQL
+// 18 kaynagi; postgresql.org/docs/current/sql-discard.html,
+// sql-commit-prepared.html, sql-prepare-transaction.html).
+//
+// Eslesme HER ZAMAN TAM string esitligidir - ASLA bir on-ek (prefix) ya da
+// alt-dizgi (substring) testi degildir - bu yuzden "COMMIT PREPARED"
+// "COMMIT" ile, "DISCARD PLANS" "DISCARD ALL" ile ASLA karistirilamaz.
+var simpleQueryLifecycleTags = map[string]SimpleQueryLifecycleEffect{
+	// Mevcut oturum islemini (transaction) sonlandiran komutlar. "ROLLBACK"
+	// etiketi AYNI ZAMANDA ROLLBACK TO SAVEPOINT icin de kullanilir
+	// (PostgreSQL kaynagi: TRANS_STMT_ROLLBACK ve TRANS_STMT_ROLLBACK_TO
+	// AYNI CMDTAG_ROLLBACK'i paylasir) - etiketin kendisi, bir savepoint'e
+	// KISMI geri alma ile TAM islem geri almasini AYIRT EDEMEZ; bu yuzden
+	// bu siniflandirma KASITLI OLARAK muhafazakardir (conservative) - bkz.
+	// gereksinim: "etiket tam etkilenen adi tanimlayamiyorsa, ilgili
+	// tum yerel-izlenen ad alanini gecersiz kilmak kabul edilen
+	// muhafazakar davranistir."
+	"COMMIT":              SimpleQueryInvalidatePortals,
+	"ROLLBACK":            SimpleQueryInvalidatePortals,
+	"PREPARE TRANSACTION": SimpleQueryInvalidatePortals,
+
+	// SQL cursor-close komutlari - etiket, kapatilan cursor'un adini ASLA
+	// tasimaz, bu yuzden (muhafazakar olarak) HANGI portal olduguna
+	// bakilmaksizin izlenen HER portal gecersiz kilinir.
+	"CLOSE CURSOR":     SimpleQueryInvalidatePortals,
+	"CLOSE CURSOR ALL": SimpleQueryInvalidatePortals,
+
+	// Prepared statement yok etme - etiket, yok edilen statement'in adini
+	// ASLA tasimaz, bu yuzden (muhafazakar olarak) izlenen HER statement
+	// (ve, gecisli olarak, ona bagli HER portal) gecersiz kilinir.
+	"DEALLOCATE":     SimpleQueryInvalidateStatementsAndPortals,
+	"DEALLOCATE ALL": SimpleQueryInvalidateStatementsAndPortals,
+
+	// DISCARD ALL, resmi olarak "CLOSE ALL; ...; DEALLOCATE ALL; ...;
+	// DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES" dizisiyle esdeger
+	// olarak belgelenmistir (sql-discard.html) - hem portallar HEM
+	// statement'lar yok olur.
+	"DISCARD ALL": SimpleQueryInvalidateStatementsAndPortals,
+
+	// KASITLI OLARAK burada YOK (SimpleQueryLifecycleNone'a duser),
+	// gerekceleriyle:
+	//   "BEGIN"/"START TRANSACTION"/"SAVEPOINT"/"RELEASE": bir islem
+	//     baslatir ya da savepoint'leri yonetir - su an izlenen hicbir
+	//     statement/portali yok etmez.
+	//   "COMMIT PREPARED"/"ROLLBACK PREPARED": mevcut oturum islemi
+	//     DEGIL, DISTAN hazirlanmis (two-phase-commit) bir islemi ADIYLA
+	//     isler - sql-commit-prepared.html: "This command cannot be
+	//     executed inside a transaction block" - bu yuzden mevcut islemin
+	//     portallari uzerinde HICBIR ZAMAN etkisi yoktur.
+	//   "DECLARE CURSOR"/"PREPARE"/"EXECUTE": daha bastan protocol.State'e
+	//     HIC aktarilmamis bir SQL-seviyesi nesne olusturur ya da kullanir
+	//     (bkz. "SQL-created-object fail-closed limitation") - izlenen
+	//     hicbir sey yok edilmez.
+	//   "FETCH"/"MOVE": var olan bir cursor'u yalnizca okur/yeniden
+	//     konumlandirir, ASLA yok etmez.
+	//   "DISCARD PLANS": sql-discard.html - "does NOT drop or destroy
+	//     prepared statements... only releases the cached query plans."
+	//   "DISCARD SEQUENCES"/"DISCARD TEMP": yalnizca sequence/temp-tablo
+	//     durumunu etkiler, statement/portallari ASLA etkilemez.
+	//   Sayili (counted) her etiket (SELECT/INSERT/UPDATE/DELETE/MERGE/
+	//     COPY, ve FETCH/MOVE'un sayili bicimleri): sIradan DML/sorgu
+	//     yurutmesi, ASLA yasam-donguSSSunu etkilemez.
+}
+
+// classifySimpleQueryCommandTag, ZATEN sekil-dogrulanmis (validateCommandCompleteTag
+// basariyla gectikten sonra) bir CommandComplete govdesinin tasidigi TEK
+// yasam-dongusu etkisini dondurur. Etiket ICERIGI yalnizca bu TEK
+// karsilastirma icin, GECICI olarak okunur - hicbir yerde saklanmaz, hicbir
+// donus degerinde (SimpleQueryResult sabit bir enum degeri tasir, etiketin
+// kendisini degil) disari sizdirilmaz, hicbir log/hata metnine yazilmaz.
+func classifySimpleQueryCommandTag(body []byte) SimpleQueryLifecycleEffect {
+	tag := body[:len(body)-1] // validateCommandCompleteTag zaten dogruladi: tam olarak bir NUL, en sonda
+	if effect, ok := simpleQueryLifecycleTags[string(tag)]; ok {
+		return effect
+	}
+	return SimpleQueryLifecycleNone
 }
 
 // transitionOnEmptyQueryResponse, GOVDESI ZATEN dogrulanmis (tamamen bos)

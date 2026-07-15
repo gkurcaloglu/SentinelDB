@@ -729,6 +729,192 @@ func TestSimpleQueryResult_NoStringOrByteSliceFields(t *testing.T) {
 	}
 }
 
+// --- CommandComplete lifecycle-effect classification ------------------------
+//
+// Verified against the official PostgreSQL 18 source
+// (src/include/tcop/cmdtaglist.h, src/backend/tcop/utility.c's
+// CreateCommandTag) and postgresql.org/docs/current/sql-discard.html,
+// sql-commit-prepared.html, sql-prepare-transaction.html - see
+// docs/design/0002-mixed-query-routing.md's "CommandComplete lifecycle-
+// effect classification" section for the full citations.
+
+func TestSimpleQueryTracker_CommandCompleteLifecycleClassification(t *testing.T) {
+	cases := []struct {
+		tag        string
+		wantEffect SimpleQueryLifecycleEffect
+	}{
+		// Ordinary counted DML/query tags - never lifecycle-affecting.
+		{"SELECT 1", SimpleQueryLifecycleNone},
+		{"INSERT 0 5", SimpleQueryLifecycleNone},
+		{"UPDATE 3", SimpleQueryLifecycleNone},
+		{"DELETE 2", SimpleQueryLifecycleNone},
+		{"MERGE 1", SimpleQueryLifecycleNone},
+		{"COPY 10", SimpleQueryLifecycleNone},
+
+		// COMMIT-family: PostgreSQL's CreateCommandTag maps COMMIT, END, and
+		// COMMIT AND CHAIN all to the single tag "COMMIT" (TRANS_STMT_COMMIT,
+		// unconditional on the chain flag) - current-transaction-ending,
+		// portal-invalidating.
+		{"COMMIT", SimpleQueryInvalidatePortals},
+
+		// ROLLBACK-family: PostgreSQL's CreateCommandTag maps ROLLBACK,
+		// ABORT, ROLLBACK AND CHAIN, AND ROLLBACK TO SAVEPOINT all to the
+		// single tag "ROLLBACK" ("case TRANS_STMT_ROLLBACK: case
+		// TRANS_STMT_ROLLBACK_TO: tag = CMDTAG_ROLLBACK;") - the tag alone
+		// cannot distinguish a savepoint-only rollback from a full
+		// transaction rollback, so this is deliberately, conservatively
+		// classified as portal-invalidating for every occurrence.
+		{"ROLLBACK", SimpleQueryInvalidatePortals},
+
+		// PREPARE TRANSACTION: "not unlike a ROLLBACK command: after
+		// executing it, there is no active current transaction"
+		// (sql-prepare-transaction.html) - portal-invalidating.
+		{"PREPARE TRANSACTION", SimpleQueryInvalidatePortals},
+
+		// COMMIT PREPARED/ROLLBACK PREPARED operate on an EXTERNALLY
+		// prepared (two-phase-commit) transaction by name, never the
+		// current session transaction - sql-commit-prepared.html: "This
+		// command cannot be executed inside a transaction block" - no
+		// effect on currently-tracked portals.
+		{"COMMIT PREPARED", SimpleQueryLifecycleNone},
+		{"ROLLBACK PREPARED", SimpleQueryLifecycleNone},
+
+		// DEALLOCATE (named or ALL): destroys prepared statement(s); the
+		// tag never carries the deallocated name, so every tracked
+		// statement AND portal is conservatively invalidated.
+		{"DEALLOCATE", SimpleQueryInvalidateStatementsAndPortals},
+		{"DEALLOCATE ALL", SimpleQueryInvalidateStatementsAndPortals},
+
+		// DISCARD ALL is documented as equivalent to "CLOSE ALL; ...;
+		// DEALLOCATE ALL; ...; DISCARD PLANS; DISCARD TEMP; DISCARD
+		// SEQUENCES" (sql-discard.html) - both statements and portals gone.
+		{"DISCARD ALL", SimpleQueryInvalidateStatementsAndPortals},
+
+		// DISCARD PLANS/SEQUENCES/TEMP do NOT drop prepared statements or
+		// portals (sql-discard.html: DISCARD PLANS "does NOT drop or
+		// destroy prepared statements... only releases the cached query
+		// plans") - no effect. Must NOT receive the ALL effect.
+		{"DISCARD PLANS", SimpleQueryLifecycleNone},
+		{"DISCARD SEQUENCES", SimpleQueryLifecycleNone},
+		{"DISCARD TEMP", SimpleQueryLifecycleNone},
+
+		// SQL cursor-close commands: CLOSE <name> -> "CLOSE CURSOR"; CLOSE
+		// ALL -> "CLOSE CURSOR ALL" (utility.c's T_ClosePortalStmt handling)
+		// - neither tag carries the closed cursor's name, so every tracked
+		// portal is conservatively invalidated; statements unaffected.
+		{"CLOSE CURSOR", SimpleQueryInvalidatePortals},
+		{"CLOSE CURSOR ALL", SimpleQueryInvalidatePortals},
+
+		// DECLARE CURSOR creates a new SQL-level cursor never imported into
+		// protocol.State (see the SQL-created-object fail-closed
+		// limitation) - nothing tracked is destroyed.
+		{"DECLARE CURSOR", SimpleQueryLifecycleNone},
+
+		// FETCH only reads rows from an existing cursor; MOVE only
+		// repositions one - neither ever destroys a cursor/portal
+		// (utility.c: stmt->ismove picks FETCH vs MOVE, no destructive
+		// dimension in the tag).
+		{"FETCH 1", SimpleQueryLifecycleNone},
+		{"MOVE 1", SimpleQueryLifecycleNone},
+
+		// Transaction-starting/savepoint-manipulating commands never
+		// destroy any currently-tracked object.
+		{"BEGIN", SimpleQueryLifecycleNone},
+		{"START TRANSACTION", SimpleQueryLifecycleNone},
+		{"SAVEPOINT", SimpleQueryLifecycleNone},
+		{"RELEASE", SimpleQueryLifecycleNone},
+
+		// SQL PREPARE/EXECUTE create/use an SQL-level prepared statement
+		// never imported into protocol.State - nothing tracked is
+		// destroyed.
+		{"PREPARE", SimpleQueryLifecycleNone},
+		{"EXECUTE", SimpleQueryLifecycleNone},
+
+		// Guard explicitly against prefix/substring-matching confusion:
+		// none of these must be classified the same as their "real" tag
+		// prefix, since classification is EXACT full-string equality only.
+		{"COMMIT PREPAREDX", SimpleQueryLifecycleNone},
+		{"DISCARD ALLX", SimpleQueryLifecycleNone},
+		{"XDISCARD ALL", SimpleQueryLifecycleNone},
+		{"COMMIT ", SimpleQueryLifecycleNone}, // trailing space is not "COMMIT"
+	}
+
+	for _, c := range cases {
+		t.Run(c.tag, func(t *testing.T) {
+			tr := newTracker()
+			res, err := tr.Handle(commandCompleteMsg(c.tag))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if res.LifecycleEffect != c.wantEffect {
+				t.Fatalf("tag %q: expected effect %v, got %v", c.tag, c.wantEffect, res.LifecycleEffect)
+			}
+		})
+	}
+}
+
+func TestSimpleQueryTracker_CommandCompleteLifecycleEffect_MalformedReturnsNone(t *testing.T) {
+	tr := newTracker()
+	malformed := backendMsg(MsgCommandComplete, []byte("COMMIT")) // no NUL terminator
+	res, err := tr.Handle(malformed)
+	if !errors.Is(err, ErrMalformedBackendMessage) {
+		t.Fatalf("expected ErrMalformedBackendMessage, got %v", err)
+	}
+	if res.LifecycleEffect != SimpleQueryLifecycleNone {
+		t.Fatalf("expected no lifecycle effect on a malformed CommandComplete, got %v", res.LifecycleEffect)
+	}
+}
+
+func TestSimpleQueryTracker_CommandCompleteLifecycleEffect_OrderingInvalidReturnsNone(t *testing.T) {
+	tr := newTracker()
+	advance(t, tr, minimalErrorResponse()) // now AwaitingReadyOnly - CommandComplete is ordering-invalid here
+	res, err := tr.Handle(commandCompleteMsg("COMMIT"))
+	if !errors.Is(err, ErrSimpleResponseOrderingViolation) {
+		t.Fatalf("expected ErrSimpleResponseOrderingViolation, got %v", err)
+	}
+	if res.LifecycleEffect != SimpleQueryLifecycleNone {
+		t.Fatalf("expected no lifecycle effect on an ordering-invalid CommandComplete, got %v", res.LifecycleEffect)
+	}
+	if _, err := tr.Handle(rfqMsg(TxStatusIdle)); err != nil {
+		t.Fatalf("expected the tracker to still recover normally: %v", err)
+	}
+}
+
+func TestSimpleQueryTracker_LifecycleEffect_NoMarkerLeakage(t *testing.T) {
+	const marker = "SECRET_LIFECYCLE_MARKER"
+	tr := newTracker()
+	res, err := tr.Handle(commandCompleteMsg("SELECT-" + marker))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.LifecycleEffect != SimpleQueryLifecycleNone {
+		t.Fatalf("expected no effect for an unrecognized tag, got %v", res.LifecycleEffect)
+	}
+	for _, format := range []string{"%v", "%+v", "%#v"} {
+		s := fmt.Sprintf(format, res)
+		if strings.Contains(s, marker) {
+			t.Fatalf("marker leaked via %s: %s", format, s)
+		}
+	}
+
+	// Also confirm a RECOGNIZED lifecycle tag's own result never contains
+	// row-count/tag/marker text - only the fixed enum value.
+	tr2 := newTracker()
+	res2, err := tr2.Handle(commandCompleteMsg("DEALLOCATE"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res2.LifecycleEffect != SimpleQueryInvalidateStatementsAndPortals {
+		t.Fatalf("expected SimpleQueryInvalidateStatementsAndPortals, got %v", res2.LifecycleEffect)
+	}
+	for _, format := range []string{"%v", "%+v", "%#v"} {
+		s := fmt.Sprintf(format, res2)
+		if strings.Contains(s, "DEALLOCATE") {
+			t.Fatalf("raw tag text leaked via %s: %s", format, s)
+		}
+	}
+}
+
 // --- Privacy: no marker-bearing payload content ever leaks ------------------
 
 func TestSimpleQueryTracker_NoMarkerLeakage(t *testing.T) {
@@ -853,7 +1039,7 @@ func FuzzSimpleQueryTracker(f *testing.F) {
 				break
 			}
 			var m Message
-			switch int(opb) % 20 {
+			switch int(opb) % 21 {
 			case 0:
 				m = rowDescMsg()
 			case 1:
@@ -909,6 +1095,26 @@ func FuzzSimpleQueryTracker(f *testing.F) {
 					continue
 				}
 				m = emptyBackendMsg(types[i])
+			case 20:
+				// Lifecycle-relevant CommandComplete tags specifically -
+				// exercises classifySimpleQueryCommandTag's exact-match
+				// table, including the deliberately-adjacent-but-distinct
+				// pairs (COMMIT vs COMMIT PREPARED, DISCARD ALL vs DISCARD
+				// PLANS) that must never be confused with each other.
+				tags := []string{
+					"COMMIT", "ROLLBACK", "PREPARE TRANSACTION",
+					"COMMIT PREPARED", "ROLLBACK PREPARED",
+					"DEALLOCATE", "DEALLOCATE ALL",
+					"DISCARD ALL", "DISCARD PLANS", "DISCARD SEQUENCES", "DISCARD TEMP",
+					"CLOSE CURSOR", "CLOSE CURSOR ALL", "DECLARE CURSOR",
+					"BEGIN", "START TRANSACTION", "SAVEPOINT", "RELEASE",
+					"PREPARE", "EXECUTE", "FETCH 1", "MOVE 1",
+				}
+				i, ok := r.pick(len(tags))
+				if !ok {
+					continue
+				}
+				m = commandCompleteMsg(tags[i])
 			}
 
 			wasIdle := tr.IsIdle()
@@ -925,6 +1131,15 @@ func FuzzSimpleQueryTracker(f *testing.F) {
 			}
 
 			checkNoMarker(fmt.Sprintf("%+v", res))
+
+			switch res.LifecycleEffect {
+			case SimpleQueryLifecycleNone, SimpleQueryInvalidatePortals, SimpleQueryInvalidateStatementsAndPortals:
+			default:
+				t.Fatalf("Handle produced an undefined LifecycleEffect value: %v", res.LifecycleEffect)
+			}
+			if res.MessageType != MsgCommandComplete && res.LifecycleEffect != SimpleQueryLifecycleNone {
+				t.Fatalf("non-CommandComplete result (%v) unexpectedly carries a non-zero LifecycleEffect %v", res.MessageType, res.LifecycleEffect)
+			}
 
 			if res.CycleCompleted {
 				if res.MessageType != MsgReadyForQuery {

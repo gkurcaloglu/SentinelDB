@@ -146,7 +146,7 @@ func FuzzExtendedStateSequence(f *testing.F) {
 			if !ok {
 				break
 			}
-			switch int(opb) % 14 {
+			switch int(opb) % 15 {
 			case 0: // CreateParse
 				i, ok := r.pick(len(stmtNames))
 				if !ok {
@@ -342,6 +342,46 @@ func FuzzExtendedStateSequence(f *testing.F) {
 				}
 				if s.CurrentCycle() != beforeCur {
 					t.Fatalf("ApplySimpleQueryReadyForQuery changed CurrentCycle: before=%d after=%d", beforeCur, s.CurrentCycle())
+				}
+			case 14: // ApplySimpleQueryLifecycleEffect with a random (possibly invalid) effect
+				effects := []SimpleQueryLifecycleEffect{
+					SimpleQueryLifecycleNone, SimpleQueryInvalidatePortals,
+					SimpleQueryInvalidateStatementsAndPortals, SimpleQueryLifecycleEffect(99),
+				}
+				i, ok := r.pick(len(effects))
+				if !ok {
+					continue
+				}
+				effect := effects[i]
+				beforeStatus := s.TransactionStatus()
+				beforePending := s.PendingOperationCount()
+				beforeCycles := s.OutstandingCycleCount()
+				beforeCur := s.CurrentCycle()
+				err := s.ApplySimpleQueryLifecycleEffect(effect)
+				if err == nil {
+					if effect == SimpleQueryInvalidatePortals || effect == SimpleQueryInvalidateStatementsAndPortals {
+						if s.PortalCount() != 0 {
+							t.Fatalf("ApplySimpleQueryLifecycleEffect(%v) left %d live portal(s)", effect, s.PortalCount())
+						}
+					}
+					if effect == SimpleQueryInvalidateStatementsAndPortals && s.StatementCount() != 0 {
+						t.Fatalf("ApplySimpleQueryLifecycleEffect(StatementsAndPortals) left %d live statement(s)", s.StatementCount())
+					}
+				}
+				// Never touches transaction status, pending count,
+				// outstanding-cycle count, or current cycle - true whether
+				// it succeeded or failed.
+				if s.TransactionStatus() != beforeStatus {
+					t.Fatalf("ApplySimpleQueryLifecycleEffect changed TransactionStatus: before=%q after=%q", beforeStatus, s.TransactionStatus())
+				}
+				if s.PendingOperationCount() != beforePending {
+					t.Fatalf("ApplySimpleQueryLifecycleEffect changed PendingOperationCount: before=%d after=%d", beforePending, s.PendingOperationCount())
+				}
+				if s.OutstandingCycleCount() != beforeCycles {
+					t.Fatalf("ApplySimpleQueryLifecycleEffect changed OutstandingCycleCount: before=%d after=%d", beforeCycles, s.OutstandingCycleCount())
+				}
+				if s.CurrentCycle() != beforeCur {
+					t.Fatalf("ApplySimpleQueryLifecycleEffect changed CurrentCycle: before=%d after=%d", beforeCur, s.CurrentCycle())
 				}
 			}
 			checkStructuralInvariants(t, s)
@@ -2528,4 +2568,383 @@ func TestState_SimpleQueryReadyForQuery_RepeatedValidCallsAreDeterministic(t *te
 	}
 	after2 := snapshotState(s)
 	assertStateUnchanged(t, after1, after2)
+}
+
+// --- ApplySimpleQueryLifecycleEffect tests -------------------------------
+//
+// These test the new State.ApplySimpleQueryLifecycleEffect method (bkz.
+// docs/design/0002-mixed-query-routing.md, "CommandComplete lifecycle-
+// effect classification" / "Apply lifecycle effects atomically to State"):
+// the atomic State-side application of a SimpleQueryLifecycleEffect value
+// classified by SimpleQueryTracker from a validated, ordering-valid
+// CommandComplete tag.
+
+// namedStatementAndPortal builds a State with one named, committed
+// statement ("s1") and one named, committed portal ("p1") bound to it -
+// the "named statement + named portal exist" precondition required by
+// every test below.
+func namedStatementAndPortal(t *testing.T) (*State, GenerationID, GenerationID) {
+	t.Helper()
+	s := NewState()
+	sop, sgen, err := s.CreateParse("s1", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyParseComplete(sop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bop, pgen, err := s.CreateBind("p1", "s1", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyBindComplete(bop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return s, sgen.ID, pgen.ID
+}
+
+func TestState_SimpleQueryLifecycleEffect_None_IsNoOp(t *testing.T) {
+	s, _, _ := namedStatementAndPortal(t)
+	before := snapshotState(s)
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryLifecycleNone); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertStateUnchanged(t, before, snapshotState(s))
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected statement to remain resolvable")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected portal to remain resolvable")
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_InvalidatePortals_RemovesPortalsPreservesStatements(t *testing.T) {
+	s, sid, pid := namedStatementAndPortal(t)
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidatePortals); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if s.PortalCount() != 0 {
+		t.Fatalf("expected zero live portals, got %d", s.PortalCount())
+	}
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("expected named portal to be invalidated")
+	}
+	if _, ok := s.Portal(pid); ok {
+		t.Fatal("expected portal generation to be fully removed")
+	}
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected named statement to be preserved")
+	}
+	if _, ok := s.Statement(sid); !ok {
+		t.Fatal("expected statement generation to be preserved")
+	}
+	if s.StatementCount() != 1 {
+		t.Fatalf("expected exactly one live statement, got %d", s.StatementCount())
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_PortalOnly_ClearsRollbackReferences(t *testing.T) {
+	s := NewState()
+	sop, _, err := s.CreateParse("s1", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyParseComplete(sop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Unnamed portal - populates unnamedPortalRollback at creation.
+	bop, pgen, err := s.CreateBind("", "s1", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyBindComplete(bop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidatePortals); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := s.unnamedPortalRollback[pgen.ID]; ok {
+		t.Fatalf("expected the rollback reference for removed portal generation %d to be cleared", pgen.ID)
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_InvalidateStatementsAndPortals_RemovesEverything(t *testing.T) {
+	s, sid, pid := namedStatementAndPortal(t)
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidateStatementsAndPortals); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if s.PortalCount() != 0 {
+		t.Fatalf("expected zero live portals, got %d", s.PortalCount())
+	}
+	if s.StatementCount() != 0 {
+		t.Fatalf("expected zero live statements, got %d", s.StatementCount())
+	}
+	if _, ok := s.CommittedStatement("s1"); ok {
+		t.Fatal("expected named statement mapping to be cleared")
+	}
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("expected named portal mapping to be cleared")
+	}
+	if _, ok := s.Statement(sid); ok {
+		t.Fatal("expected statement generation to be fully removed")
+	}
+	if _, ok := s.Portal(pid); ok {
+		t.Fatal("expected portal generation to be fully removed")
+	}
+	// No portal may be left referring to a removed statement - trivially
+	// true here since ALL portals are gone, but assert PortalCount()==0
+	// again explicitly as the exact requirement this proves.
+	if s.PortalCount() != 0 {
+		t.Fatal("expected no portal to remain, referring to a removed statement or otherwise")
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_StatementAndPortal_ClearsAllRollbackReferences(t *testing.T) {
+	s := NewState()
+	// Unnamed statement AND unnamed portal - populates both rollback maps.
+	sop, sgen, err := s.CreateParse("", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyParseComplete(sop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bop, pgen, err := s.CreateBind("", "", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyBindComplete(bop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidateStatementsAndPortals); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, ok := s.unnamedStatementRollback[sgen.ID]; ok {
+		t.Fatalf("expected the rollback reference for removed statement generation %d to be cleared", sgen.ID)
+	}
+	if _, ok := s.unnamedPortalRollback[pgen.ID]; ok {
+		t.Fatalf("expected the rollback reference for removed portal generation %d to be cleared", pgen.ID)
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_UnknownValueIsFullyAtomic(t *testing.T) {
+	s, _, _ := namedStatementAndPortal(t)
+	before := snapshotState(s)
+
+	const bogus SimpleQueryLifecycleEffect = 200
+	if err := s.ApplySimpleQueryLifecycleEffect(bogus); !errors.Is(err, ErrUnknownSimpleQueryLifecycleEffect) {
+		t.Fatalf("expected ErrUnknownSimpleQueryLifecycleEffect, got %v", err)
+	}
+
+	assertStateUnchanged(t, before, snapshotState(s))
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected statement to survive an unknown-effect call")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected portal to survive an unknown-effect call")
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_UncleanBoundary_PendingOperationIsFullyAtomic(t *testing.T) {
+	s, _, _ := namedStatementAndPortal(t)
+	// Leave an additional, unresolved pending operation - unclean boundary.
+	if _, _, err := s.CreateBind("p2", "s1", nil, nil, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	before := snapshotState(s)
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidateStatementsAndPortals); !errors.Is(err, ErrSimpleQueryUncleanBoundary) {
+		t.Fatalf("expected ErrSimpleQueryUncleanBoundary, got %v", err)
+	}
+
+	assertStateUnchanged(t, before, snapshotState(s))
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected statement to survive a rejected unclean-boundary call")
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected portal to survive a rejected unclean-boundary call - no partial deletion")
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_UncleanBoundary_OutstandingCycleIsFullyAtomic(t *testing.T) {
+	s, _, _ := namedStatementAndPortal(t)
+	// Register a Sync without its matching ReadyForQuery - an outstanding
+	// cycle, also an unclean boundary.
+	if _, err := s.CreateSync(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	before := snapshotState(s)
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidatePortals); !errors.Is(err, ErrSimpleQueryUncleanBoundary) {
+		t.Fatalf("expected ErrSimpleQueryUncleanBoundary, got %v", err)
+	}
+
+	assertStateUnchanged(t, before, snapshotState(s))
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("expected portal to survive a rejected unclean-boundary call - no partial deletion")
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_DoesNotChangeTxOrCycleCounters(t *testing.T) {
+	s, _, _ := namedStatementAndPortal(t)
+	beforeStatus := s.TransactionStatus()
+	beforePending := s.PendingOperationCount()
+	beforeCycles := s.OutstandingCycleCount()
+	beforeCurrent := s.CurrentCycle()
+
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidateStatementsAndPortals); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if s.TransactionStatus() != beforeStatus {
+		t.Fatalf("expected TransactionStatus unchanged: before=%q after=%q", beforeStatus, s.TransactionStatus())
+	}
+	if s.PendingOperationCount() != beforePending {
+		t.Fatalf("expected PendingOperationCount unchanged: before=%d after=%d", beforePending, s.PendingOperationCount())
+	}
+	if s.OutstandingCycleCount() != beforeCycles {
+		t.Fatalf("expected OutstandingCycleCount unchanged: before=%d after=%d", beforeCycles, s.OutstandingCycleCount())
+	}
+	if s.CurrentCycle() != beforeCurrent {
+		t.Fatalf("expected CurrentCycle unchanged: before=%d after=%d", beforeCurrent, s.CurrentCycle())
+	}
+}
+
+func TestState_SimpleQueryLifecycleEffect_RepeatedCallsAreDeterministic(t *testing.T) {
+	s, _, _ := namedStatementAndPortal(t)
+
+	// Repeating the SAME effect (SimpleQueryInvalidatePortals) is
+	// idempotent: the second call has nothing left to remove.
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidatePortals); err != nil {
+		t.Fatalf("first call: unexpected error: %v", err)
+	}
+	after1 := snapshotState(s)
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidatePortals); err != nil {
+		t.Fatalf("second call: unexpected error: %v", err)
+	}
+	after2 := snapshotState(s)
+	assertStateUnchanged(t, after1, after2)
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected statement to still be resolvable after repeated portal-only effects")
+	}
+
+	// A subsequent, STRONGER effect (SimpleQueryInvalidateStatementsAndPortals)
+	// still has the statement to remove the first time...
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidateStatementsAndPortals); err != nil {
+		t.Fatalf("third call: unexpected error: %v", err)
+	}
+	if _, ok := s.CommittedStatement("s1"); ok {
+		t.Fatal("expected the statement to be removed by the statement-and-portal effect")
+	}
+	after3 := snapshotState(s)
+
+	// ...and repeating THAT same effect again is, in turn, idempotent too.
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidateStatementsAndPortals); err != nil {
+		t.Fatalf("fourth call: unexpected error: %v", err)
+	}
+	after4 := snapshotState(s)
+	assertStateUnchanged(t, after3, after4)
+}
+
+// TestState_MultiStatementLifecycleModel_CommitThenBegin is the concrete
+// regression from the task: a multi-statement Simple Query executing
+// "COMMIT; BEGIN" must destroy the OLD transaction's portal even though the
+// FINAL ReadyForQuery status is 'T' (the new, just-begun transaction) -
+// proving that ApplySimpleQueryReadyForQuery's own "preserve everything on
+// T/E" rule is correct ONLY because the earlier CommandComplete's own
+// lifecycle effect (applied via ApplySimpleQueryLifecycleEffect) already
+// ran first, before the final ReadyForQuery is ever observed.
+func TestState_MultiStatementLifecycleModel_CommitThenBegin(t *testing.T) {
+	s := NewState()
+	// Start in 'T' (an already-open transaction, e.g. from an earlier
+	// Extended BEGIN).
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusInTransaction); err != nil {
+		t.Fatalf("setup: unexpected error: %v", err)
+	}
+
+	// Create a named statement and named portal inside transaction A.
+	sop, _, err := s.CreateParse("s1", "SELECT 1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyParseComplete(sop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bop, _, err := s.CreateBind("p1", "s1", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.ApplyBindComplete(bop.ID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := s.CommittedPortal("p1"); !ok {
+		t.Fatal("setup: expected p1 to exist before COMMIT")
+	}
+
+	// Simulate the tracker having just processed CommandComplete("COMMIT")
+	// mid-Query: apply its classified lifecycle effect immediately.
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidatePortals); err != nil {
+		t.Fatalf("applying COMMIT's lifecycle effect: unexpected error: %v", err)
+	}
+
+	// The old portal must already be gone, well before the Query's own
+	// final ReadyForQuery is ever seen.
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("expected the old transaction's portal to be gone immediately after COMMIT's lifecycle effect")
+	}
+
+	// The rest of the Query text is "BEGIN" - CommandComplete("BEGIN")
+	// itself classifies as SimpleQueryLifecycleNone (nothing to apply).
+
+	// The Query's own final ReadyForQuery reports 'T' - the NEW
+	// transaction BEGIN just opened, not the old one.
+	if err := s.ApplySimpleQueryReadyForQuery(TxStatusInTransaction); err != nil {
+		t.Fatalf("final ReadyForQuery: unexpected error: %v", err)
+	}
+
+	if s.TransactionStatus() != TxStatusInTransaction {
+		t.Fatalf("expected final TransactionStatus 'T', got %q", s.TransactionStatus())
+	}
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("expected the old portal to remain gone after the final ReadyForQuery('T')")
+	}
+	if _, ok := s.CommittedStatement("s1"); !ok {
+		t.Fatal("expected the prepared statement to remain (COMMIT's effect only invalidates portals, never statements)")
+	}
+}
+
+// TestState_DeallocateRegression is the concrete DEALLOCATE regression from
+// the task: a successful SQL DEALLOCATE CommandComplete must remove a
+// protocol-created named prepared statement (and any portal depending on
+// it) from State, even though DEALLOCATE's own tag never carries the
+// deallocated statement's name.
+func TestState_DeallocateRegression(t *testing.T) {
+	s, _, _ := namedStatementAndPortal(t) // named statement "s1" + named portal "p1" bound to it
+
+	// Simulate the tracker having just processed
+	// CommandComplete("DEALLOCATE") mid-Query (or as the Query's only
+	// statement).
+	if err := s.ApplySimpleQueryLifecycleEffect(SimpleQueryInvalidateStatementsAndPortals); err != nil {
+		t.Fatalf("applying DEALLOCATE's lifecycle effect: unexpected error: %v", err)
+	}
+
+	if _, ok := s.CommittedStatement("s1"); ok {
+		t.Fatal("expected the deallocated statement to no longer be resolvable")
+	}
+	if _, ok := s.CommittedPortal("p1"); ok {
+		t.Fatal("expected the portal depending on the deallocated statement to no longer be resolvable")
+	}
+	if s.StatementCount() != 0 || s.PortalCount() != 0 {
+		t.Fatalf("expected zero live statements/portals, got statements=%d portals=%d", s.StatementCount(), s.PortalCount())
+	}
 }
